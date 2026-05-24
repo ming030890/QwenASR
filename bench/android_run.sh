@@ -18,8 +18,8 @@ NDK_BIN="${NDK_BIN:-$NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin}"
 RUST_TOOLCHAIN_BIN="${RUST_TOOLCHAIN_BIN:-/Users/tony/.rustup/toolchains/stable-aarch64-apple-darwin/bin}"
 RUSTFLAGS_EXTRA="${RUSTFLAGS_EXTRA:-}"
 CARGO_FEATURES_EXTRA="${CARGO_FEATURES_EXTRA:-}"
-BENCH_LANGUAGE="${BENCH_LANGUAGE:-Cantonese}"
-BENCH_PROMPT="${BENCH_PROMPT:-Transcribe Hong Kong Cantonese. Preserve English words, code-switching, names, and loanwords as spoken; do not translate English into Chinese.}"
+BENCH_LANGUAGE="${BENCH_LANGUAGE:-Auto}"
+BENCH_PROMPT="${BENCH_PROMPT:-音频是粤语，可能夹杂英语}"
 OPENBLAS_ANDROID_LIB_DIR="${OPENBLAS_ANDROID_LIB_DIR:-}"
 OPENBLAS_ANDROID_STATIC="${OPENBLAS_ANDROID_STATIC:-}"
 OPENBLAS_ANDROID_RUNTIME_LIB="${OPENBLAS_ANDROID_RUNTIME_LIB:-}"
@@ -40,8 +40,8 @@ Usage: bench/android_run.sh [options]
 Set RUSTFLAGS_EXTRA for experiments, e.g. RUSTFLAGS_EXTRA="-C target-cpu=cortex-a76 -C target-feature=+dotprod".
 Set NDK_HOME or NDK_BIN to override the Android NDK. Default NDK is 29.0.14206865 because this install's NDK 30 clang shim drops compiler arguments.
 Set CARGO_FEATURES_EXTRA for opt-in benchmark features, e.g. CARGO_FEATURES_EXTRA="android-blas".
-Set BENCH_LANGUAGE to force the benchmark language (default: Cantonese for the fixed Yue assets; empty disables forcing).
-Set BENCH_PROMPT to bias transcription (default preserves Hong Kong Cantonese code-switching; empty disables prompt).
+Set BENCH_LANGUAGE to force the benchmark language (default: Auto; empty also disables forcing).
+Set BENCH_PROMPT to bias transcription (default: 音频是粤语，可能夹杂英语; empty disables prompt).
 For Android BLAS, set OPENBLAS_ANDROID_LIB_DIR to the directory containing libopenblas.so or libopenblas.a.
 Set OPENBLAS_ANDROID_STATIC=1 when linking libopenblas.a.
 If using a shared library, optionally set OPENBLAS_ANDROID_RUNTIME_LIB to the exact .so path to push beside the benchmark binary.

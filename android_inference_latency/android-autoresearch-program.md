@@ -111,7 +111,9 @@ Prompt/language policy:
   to English.
 - For fixed Yue Android assets, use concise Simplified Chinese context when
   testing code-switching behavior, for example:
-  `音频是粤语，可能夹杂英语词或短语`.
+  `音频是粤语，可能夹杂英语`.
+- `bench/android_run.sh` defaults to `BENCH_LANGUAGE=Auto` and
+  `BENCH_PROMPT='音频是粤语，可能夹杂英语'`.
 
 Canonical results files:
 - Summary TSV: `results-android.tsv`
