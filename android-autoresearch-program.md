@@ -110,38 +110,45 @@ Default practice:
 - Keep the screen state consistent.
 - Do not run unrelated apps or background workloads.
 - Run a short warmup only if every arm gets the same warmup.
-- Cool down between build-feature arms and long thread sweeps.
+- Do not block routine Stage 1/Stage 2 iteration on tightly matched
+  temperatures. `Thermal Status: 0` is still required for normal comparable
+  runs; relax only the skin/soc matching and cooldown strictness.
+- Cool down before long acceptance/thread-sweep arms, or when `Thermal Status`
+  is nonzero.
 - Record device temperature and battery/thermal state before each arm.
 - Compare arms in alternating order when possible, for example baseline,
   dotprod, baseline, dotprod, instead of running all of one arm first.
 
-Use the same labels and snapshots for every arm:
+Use the same labels and snapshots for every arm. Prefer the helper script so
+snapshot capture is one command:
 
 ```bash
 LABEL=android-exp-name
-SNAP_DIR="bench/android-results/$LABEL/thermal"
-mkdir -p "$SNAP_DIR"
 
-adb shell dumpsys battery > "$SNAP_DIR/battery-before.txt"
-adb shell dumpsys thermalservice > "$SNAP_DIR/thermal-before.txt"
-adb shell 'for f in /sys/class/thermal/thermal_zone*/temp; do echo "$f=$(cat "$f" 2>/dev/null)"; done' \
-  > "$SNAP_DIR/thermal-zones-before.txt"
-adb shell 'for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq; do echo "$f=$(cat "$f" 2>/dev/null)"; done' \
-  > "$SNAP_DIR/cpu-freq-before.txt"
+bench/android_snapshot.sh --label "$LABEL" --phase before
 
 PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" \
 RUSTFLAGS_EXTRA="" \
 bench/android_run.sh --label "$LABEL" --threads "1" --runs 3
 
-adb shell dumpsys battery > "$SNAP_DIR/battery-after.txt"
-adb shell dumpsys thermalservice > "$SNAP_DIR/thermal-after.txt"
-adb shell 'for f in /sys/class/thermal/thermal_zone*/temp; do echo "$f=$(cat "$f" 2>/dev/null)"; done' \
-  > "$SNAP_DIR/thermal-zones-after.txt"
-adb shell 'for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq; do echo "$f=$(cat "$f" 2>/dev/null)"; done' \
-  > "$SNAP_DIR/cpu-freq-after.txt"
+bench/android_snapshot.sh --label "$LABEL" --phase after
 ```
 
-Cooldown gate before starting an arm:
+Fast readiness check before starting a routine Stage 1/Stage 2 arm:
+
+```bash
+adb shell dumpsys thermalservice | grep 'Thermal Status'
+```
+
+For Stage 1/Stage 2:
+- Start only when `Thermal Status: 0`.
+- If status is nonzero, wait or run a diagnostic only and mark it as thermally
+  contaminated.
+- Do not wait for exact skin/soc matching. Record the snapshot and interpret
+  close results conservatively.
+
+Stricter cooldown check before acceptance runs, thread sweeps, or when a result
+will decide the default build/thread policy:
 
 ```bash
 while true; do
@@ -152,10 +159,10 @@ while true; do
 done
 ```
 
-Start the next arm only when:
-- `Thermal Status` is back to `0`, or at least matches the previous arm's
-  starting status.
-- Skin/soc readings are close to the previous arm's starting readings.
+Start long decision-making arms when:
+- `Thermal Status` is `0`.
+- Skin/soc readings are not obviously hotter than the previous arm. They do not
+  need to be exact.
 - CPU frequency readings are not obviously clamped lower than the previous arm.
 
 Controlled build-feature comparison:

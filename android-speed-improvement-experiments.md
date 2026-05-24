@@ -34,8 +34,10 @@ Resume checklist:
 - Recreate fast/candidate asset subsets if missing:
   `/Volumes/SSD/qwen-asr-android-fast-assets` and
   `/Volumes/SSD/qwen-asr-android-candidate-assets`.
-- Start only when `dumpsys thermalservice` reports `Thermal Status: 0` or a
-  comparable clean starting state.
+- Start normal comparable runs only when `dumpsys thermalservice` reports
+  `Thermal Status: 0`.
+- Do not wait for exact skin/soc matching during Stage 1/Stage 2. Snapshot the
+  state with `bench/android_snapshot.sh` and record any warmer-start caveat.
 - Record every run here, even if it is rejected or thermally contaminated.
 - Only promote an experiment to the full acceptance gate if the staged gate
   justifies it.
