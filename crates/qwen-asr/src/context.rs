@@ -178,7 +178,7 @@ impl QwenCtx {
     /// string for auto-detection. Returns `Err(())` if the language is not recognized.
     #[allow(clippy::result_unit_err)]
     pub fn set_force_language(&mut self, language: &str) -> Result<(), ()> {
-        if language.is_empty() {
+        if language.trim().is_empty() || language.trim().eq_ignore_ascii_case("auto") {
             self.force_language = None;
             self.prompt_tokens_ready = false;
             return Ok(());
@@ -224,8 +224,6 @@ impl QwenCtx {
                     return false;
                 }
             }
-        } else {
-            self.force_prompt_tokens = Some(vec![11528, 6364, TOKEN_ASR_TEXT]);
         }
 
         self.prompt_tokens_ready = true;

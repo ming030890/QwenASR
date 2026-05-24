@@ -104,6 +104,15 @@ The harness is separate from production JNI code:
   median inference timing, RTF, transcript, optimization flags, target arch,
   per-run details, and optional profiling counters.
 
+Prompt/language policy:
+- Match upstream Qwen3-ASR semantics: only append `language {Language}` when a
+  language is explicitly forced.
+- Unset language and `Auto` mean auto language detection; they must not default
+  to English.
+- For fixed Yue Android assets, use concise Simplified Chinese context when
+  testing code-switching behavior, for example:
+  `音频是粤语，可能夹杂英语词或短语`.
+
 Canonical results files:
 - Summary TSV: `results-android.tsv`
 - Full JSON: `bench/android-results/<label>/*.json`

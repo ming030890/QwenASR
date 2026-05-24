@@ -18,6 +18,8 @@ NDK_BIN="${NDK_BIN:-$NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin}"
 RUST_TOOLCHAIN_BIN="${RUST_TOOLCHAIN_BIN:-/Users/tony/.rustup/toolchains/stable-aarch64-apple-darwin/bin}"
 RUSTFLAGS_EXTRA="${RUSTFLAGS_EXTRA:-}"
 CARGO_FEATURES_EXTRA="${CARGO_FEATURES_EXTRA:-}"
+BENCH_LANGUAGE="${BENCH_LANGUAGE:-Cantonese}"
+BENCH_PROMPT="${BENCH_PROMPT:-Transcribe Hong Kong Cantonese. Preserve English words, code-switching, names, and loanwords as spoken; do not translate English into Chinese.}"
 OPENBLAS_ANDROID_LIB_DIR="${OPENBLAS_ANDROID_LIB_DIR:-}"
 OPENBLAS_ANDROID_STATIC="${OPENBLAS_ANDROID_STATIC:-}"
 OPENBLAS_ANDROID_RUNTIME_LIB="${OPENBLAS_ANDROID_RUNTIME_LIB:-}"
@@ -38,11 +40,17 @@ Usage: bench/android_run.sh [options]
 Set RUSTFLAGS_EXTRA for experiments, e.g. RUSTFLAGS_EXTRA="-C target-cpu=cortex-a76 -C target-feature=+dotprod".
 Set NDK_HOME or NDK_BIN to override the Android NDK. Default NDK is 29.0.14206865 because this install's NDK 30 clang shim drops compiler arguments.
 Set CARGO_FEATURES_EXTRA for opt-in benchmark features, e.g. CARGO_FEATURES_EXTRA="android-blas".
+Set BENCH_LANGUAGE to force the benchmark language (default: Cantonese for the fixed Yue assets; empty disables forcing).
+Set BENCH_PROMPT to bias transcription (default preserves Hong Kong Cantonese code-switching; empty disables prompt).
 For Android BLAS, set OPENBLAS_ANDROID_LIB_DIR to the directory containing libopenblas.so or libopenblas.a.
 Set OPENBLAS_ANDROID_STATIC=1 when linking libopenblas.a.
 If using a shared library, optionally set OPENBLAS_ANDROID_RUNTIME_LIB to the exact .so path to push beside the benchmark binary.
 EOF
     exit 1
+}
+
+shell_quote() {
+    printf "'%s'" "$(printf "%s" "$1" | sed "s/'/'\\\\''/g")"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -127,7 +135,14 @@ for threads in $THREADS; do
         fi
 
         json_path="$OUT_DIR/${input_name}-t${threads}.json"
-        "$ADB" shell "'$REMOTE_BIN' --model-dir '$REMOTE_MODEL' --input '$remote_input' --runs '$RUNS' --threads '$threads'" >"$json_path"
+        remote_cmd="$(shell_quote "$REMOTE_BIN") --model-dir $(shell_quote "$REMOTE_MODEL") --input $(shell_quote "$remote_input") --runs $(shell_quote "$RUNS") --threads $(shell_quote "$threads")"
+        if [[ -n "$BENCH_LANGUAGE" ]]; then
+            remote_cmd="$remote_cmd --language $(shell_quote "$BENCH_LANGUAGE")"
+        fi
+        if [[ -n "$BENCH_PROMPT" ]]; then
+            remote_cmd="$remote_cmd --prompt $(shell_quote "$BENCH_PROMPT")"
+        fi
+        "$ADB" shell "$remote_cmd" >"$json_path"
 
         python3 - "$json_path" "$RESULTS_TSV" "$TIMESTAMP" "$LABEL" "$threads" "$input_name" <<'PY'
 import json

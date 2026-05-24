@@ -20,6 +20,10 @@ Current benchmark protocol:
 - Common Voice metric: median `inference_ms` across five fixed Yue clips.
 - Guardrail: `ptt_guardrail.wav` must transcribe exactly
   `Hello,你好吗？已经坐低咗啦。`
+- Prompt/language policy: upstream-style auto language means no `language ...`
+  suffix. Rust now treats unset language and `"Auto"` as auto instead of
+  defaulting to English. For Yue benchmark prompts, prefer concise Simplified
+  Chinese context such as `音频是粤语，可能夹杂英语词或短语`.
 - Standard run: `bench/android_run.sh --runs 3 --threads "1 2 4 6 8"`
 - Controlled build-feature check: compare arms with identical `--runs` and
   `--threads`, preferably after cooldown.
@@ -577,10 +581,12 @@ Quality caveat:
   transcript drift is resolved or the quality policy is clarified.
 
 Next action:
-- Re-run the OpenBLAS acceptance arm once more after cooldown to check whether
-  the `cv_yue_004.wav` wording is deterministic.
-- If the wording remains changed, decide whether this English paraphrase on an
-  already-wrong clip is an acceptable CER exception. Otherwise inspect whether
-  OpenBLAS numerical differences change decoder token selection on this clip.
+- Re-run the OpenBLAS acceptance arm with `BENCH_LANGUAGE=Auto` and
+  `BENCH_PROMPT='音频是粤语，可能夹杂英语词或短语'`. A fast-gate check after fixing
+  the Rust default produced `Hello，你好吗？已经坐低咗啦。` for the guardrail and
+  `你睇下呢部劇。` for `cv_yue_003.wav`.
+- If the wording remains stable, update the guardrail comparison to tolerate
+  ASCII/comma punctuation normalization if needed, or set the exact guardrail
+  to the new prompt policy output.
 - If quality is accepted, make Android OpenBLAS the default benchmark arm and
   then run B9 thread/core policy for the BLAS build.

@@ -46,7 +46,7 @@ where
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: qwen-asr-bench-android --model-dir DIR --input WAV_OR_DIR [--runs N] [--threads N] [--profile]\n\
+        "Usage: qwen-asr-bench-android --model-dir DIR --input WAV_OR_DIR [--runs N] [--threads N] [--language LANG] [--prompt TEXT] [--profile]\n\
          Backward-compatible positional form: qwen-asr-bench-android <model_dir> <audio.wav|dir> [runs] [threads]"
     );
     std::process::exit(2);
@@ -87,7 +87,7 @@ fn collect_wavs(input: &Path) -> Vec<PathBuf> {
     wavs
 }
 
-fn parse_args() -> (String, PathBuf, usize, i32, bool) {
+fn parse_args() -> (String, PathBuf, usize, i32, Option<String>, Option<String>, bool) {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         usage();
@@ -98,13 +98,15 @@ fn parse_args() -> (String, PathBuf, usize, i32, bool) {
         let input = PathBuf::from(&args[2]);
         let runs = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
         let threads = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
-        return (model_dir, input, runs, threads, false);
+        return (model_dir, input, runs, threads, None, None, false);
     }
 
     let mut model_dir = None;
     let mut input = None;
     let mut runs = 3usize;
     let mut threads = 0i32;
+    let mut language = None;
+    let mut prompt = None;
     let mut profile = false;
     let mut i = 1;
     while i < args.len() {
@@ -125,6 +127,14 @@ fn parse_args() -> (String, PathBuf, usize, i32, bool) {
                 i += 1;
                 threads = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
             }
+            "--language" => {
+                i += 1;
+                language = args.get(i).cloned();
+            }
+            "--prompt" => {
+                i += 1;
+                prompt = args.get(i).cloned();
+            }
             "--profile" => {
                 profile = true;
             }
@@ -139,7 +149,7 @@ fn parse_args() -> (String, PathBuf, usize, i32, bool) {
 
     let model_dir = model_dir.unwrap_or_else(|| usage());
     let input = input.unwrap_or_else(|| usage());
-    (model_dir, input, runs, threads, profile)
+    (model_dir, input, runs, threads, language, prompt, profile)
 }
 
 fn profile_json(counters: &[kernels::ProfileCounterSnapshot]) -> String {
@@ -179,7 +189,7 @@ fn run_details_json(runs: &[RunResult]) -> String {
 }
 
 fn main() {
-    let (model_dir, input, runs, mut n_threads, profile) = parse_args();
+    let (model_dir, input, runs, mut n_threads, language, prompt, profile) = parse_args();
     if runs == 0 {
         eprintln!("--runs must be greater than zero");
         std::process::exit(2);
@@ -203,6 +213,18 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if let Some(ref language) = language {
+        if ctx.set_force_language(language).is_err() {
+            eprintln!("unsupported language: {}", language);
+            std::process::exit(2);
+        }
+    }
+    if let Some(ref prompt) = prompt {
+        if ctx.set_prompt(prompt).is_err() {
+            eprintln!("failed to set prompt");
+            std::process::exit(2);
+        }
+    }
     let model_load_ms = elapsed_ms(t0);
     let startup_ms = elapsed_ms(process_start);
 
@@ -297,11 +319,19 @@ fn main() {
     }
 
     println!(
-        "{{\"model_dir\":\"{}\",\"input\":\"{}\",\"runs\":{},\"threads\":{},\"setup_ms\":{:.3},\"model_load_ms\":{:.3},\"startup_ms\":{:.3},\"optimization_flags\":[{}],\"target_arch\":\"{}\",\"profile_enabled\":{},\"files\":[{}]}}",
+        "{{\"model_dir\":\"{}\",\"input\":\"{}\",\"runs\":{},\"threads\":{},\"language\":{},\"prompt\":{},\"setup_ms\":{:.3},\"model_load_ms\":{:.3},\"startup_ms\":{:.3},\"optimization_flags\":[{}],\"target_arch\":\"{}\",\"profile_enabled\":{},\"files\":[{}]}}",
         json_escape(&model_dir),
         json_escape(&input.to_string_lossy()),
         runs,
         n_threads,
+        language
+            .as_ref()
+            .map(|lang| format!("\"{}\"", json_escape(lang)))
+            .unwrap_or_else(|| "null".to_string()),
+        prompt
+            .as_ref()
+            .map(|prompt| format!("\"{}\"", json_escape(prompt)))
+            .unwrap_or_else(|| "null".to_string()),
         setup_ms,
         model_load_ms,
         startup_ms,
