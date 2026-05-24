@@ -120,6 +120,21 @@ Caveats:
 - The first Common Voice file includes a slower cold inference run, but the
   recorded file result is the median of three runs.
 
+Updated prompt-correct host reference:
+- Label/path: `bench/host-results/host-osx-auto-zhprompt-t1-r3-20260524-1910`.
+- Prompt/language: `--language Auto --prompt '音频是粤语，可能夹杂英语词或短语'`.
+- Platform flags: `["vDSP/Accelerate", "NEON", "DotProd"]`, target arch
+  `aarch64`.
+- Threads/runs: `1` thread, `3` runs.
+- Common Voice median inference: `262.911 ms`; median encode `39.634 ms`;
+  median decode `224.362 ms`.
+- Per-clip inference: `cv_yue_000.wav` `247.033 ms`, `cv_yue_001.wav`
+  `308.042 ms`, `cv_yue_002.wav` `304.156 ms`, `cv_yue_003.wav`
+  `241.333 ms`, `cv_yue_004.wav` `262.911 ms`.
+- Guardrail: `378.397 ms`, transcript `哈喽，你好吗？已经坐低咗啦。`.
+- Common Voice average CER under the current strict script/punctuation metric:
+  `0.19168`.
+
 ## A1: legal no-dotprod Android baseline build
 
 Change:
@@ -590,3 +605,37 @@ Next action:
   to the new prompt policy output.
 - If quality is accepted, make Android OpenBLAS the default benchmark arm and
   then run B9 thread/core policy for the BLAS build.
+
+Prompt-correct acceptance rerun:
+- Android label:
+  `android-accept-openblas-static-dotprod-auto-zhprompt-t1-r3-20260524-1909`
+  (`bench/android-results/android-accept-openblas-static-dotprod-auto-zhprompt-t1-r3-20260524-1909`).
+- Prompt/language: `BENCH_LANGUAGE=Auto`,
+  `BENCH_PROMPT='音频是粤语，可能夹杂英语词或短语'`.
+- Thermal status after run: `0`.
+- Flags: `["BLAS", "NEON", "DotProd"]`; threads/runs: `1` / `3`.
+- Common Voice median inference: `1789.114 ms`; median encode `398.294 ms`;
+  median decode `1397.684 ms`.
+- Per-clip inference: `cv_yue_000.wav` `1622.743 ms`, `cv_yue_001.wav`
+  `2016.026 ms`, `cv_yue_002.wav` `2032.570 ms`, `cv_yue_003.wav`
+  `1611.078 ms`, `cv_yue_004.wav` `1789.114 ms`.
+- Transcripts: `我急求方法啊！`; `唔做嘢嘅佔多數咯。`; `證據嘅話，真係冇啊！`;
+  `你睇下呢部劇。`; `仲要提供乜嘢資料？`.
+- Guardrail: `2724.594 ms`, transcript `Hello，你好吗？已经坐低咗啦。`.
+- Common Voice average CER under the current strict script/punctuation metric:
+  `0.19168`.
+- Compared with the prompt-correct macOS host reference
+  `host-osx-auto-zhprompt-t1-r3-20260524-1910`, Android OpenBLAS is about
+  `6.81x` slower on Common Voice median (`1789.114 ms` vs `262.911 ms`) and
+  about `7.20x` slower on the guardrail (`2724.594 ms` vs `378.397 ms`).
+- Compared with the old Android dotprod/no-BLAS acceptance median
+  `26761.235 ms`, prompt-correct OpenBLAS is about `14.96x` faster. This ratio
+  is not a perfectly isolated comparison because the prompt policy changed, but
+  it reflects the current intended benchmark behavior.
+
+Decision:
+- OpenBLAS remains the clear Android performance path.
+- The old exact guardrail string is too strict for prompt-policy comparisons
+  because punctuation and `Hello`/`哈喽` rendering vary while the utterance is
+  semantically and phonetically acceptable. Add normalized guardrail comparison
+  before treating future Auto-language runs as failing on punctuation alone.
