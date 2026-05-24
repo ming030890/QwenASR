@@ -8,7 +8,7 @@ rustflags = ["-C", "target-cpu=apple-a14"]
 # Android targets
 [target.aarch64-linux-android]
 # Set linker via environment: CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=aarch64-linux-android28-clang
-rustflags = []
+rustflags = ["-C", "target-feature=+dotprod"]
 
 [target.armv7-linux-androideabi]
 rustflags = ["-C", "target-cpu=cortex-a53"]

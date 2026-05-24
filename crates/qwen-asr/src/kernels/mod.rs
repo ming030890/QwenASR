@@ -85,6 +85,14 @@ pub fn is_profiling() -> bool {
     PROFILE_ENABLED.load(Ordering::Relaxed)
 }
 
+#[derive(Debug, Clone)]
+pub struct ProfileCounterSnapshot {
+    pub name: &'static str,
+    pub total_ms: f64,
+    pub calls: u64,
+    pub avg_ms: f64,
+}
+
 macro_rules! define_profile_counters {
     ($($name:ident),+) => {
         pub struct ProfileCounters {
@@ -124,6 +132,23 @@ macro_rules! define_profile_counters {
                                   stringify!($name), ms, calls, avg);
                     }
                 )+
+            }
+
+            pub fn snapshot(&self) -> Vec<ProfileCounterSnapshot> {
+                let mut v = Vec::new();
+                $(
+                    let ns = self.$name.0.load(Ordering::Relaxed);
+                    let calls = self.$name.1.load(Ordering::Relaxed);
+                    let ms = ns as f64 / 1_000_000.0;
+                    let avg = if calls > 0 { ms / calls as f64 } else { 0.0 };
+                    v.push(ProfileCounterSnapshot {
+                        name: stringify!($name),
+                        total_ms: ms,
+                        calls,
+                        avg_ms: avg,
+                    });
+                )+
+                v
             }
         }
     }
@@ -166,6 +191,10 @@ impl Drop for ProfileGuard {
 
 pub fn profile_reset() { PROF.reset(); }
 pub fn profile_report() { PROF.report(); }
+
+pub fn profile_snapshot() -> Vec<ProfileCounterSnapshot> {
+    PROF.snapshot()
+}
 
 pub fn set_verbose(v: i32) {
     VERBOSE.store(v, Ordering::Relaxed);
@@ -318,7 +347,7 @@ fn parallel_for<F: Fn(usize, usize) + Send + Sync>(f: F) {
     // Publish dispatch data via atomics (Relaxed OK: gen_atomic Release provides ordering)
     pool.done_atomic.store(0, Ordering::Relaxed);
     pool.fn_ptr_atomic.store(&f as *const F as *const () as usize, Ordering::Relaxed);
-    pool.fn_call_atomic.store(trampoline::<F> as usize, Ordering::Relaxed);
+    pool.fn_call_atomic.store(trampoline::<F> as *const () as usize, Ordering::Relaxed);
     pool.n_threads_atomic.store(n_threads, Ordering::Relaxed);
     // Release: ensures all stores above are visible to workers that Acquire gen_atomic
     pool.gen_atomic.fetch_add(1, Ordering::Release);
