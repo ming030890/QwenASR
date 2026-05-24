@@ -16,6 +16,10 @@
 
 set -euo pipefail
 
+# Ensure cargo/rustup are on PATH (handles cases where the script is run
+# outside of an interactive shell that sources ~/.zshrc / ~/.bashrc)
+export PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
+
 NDK_VERSION="29.0.14206865"
 NDK_ROOT="$HOME/Library/Android/sdk/ndk/$NDK_VERSION"
 NDK_BIN="$NDK_ROOT/toolchains/llvm/prebuilt/darwin-x86_64/bin"
