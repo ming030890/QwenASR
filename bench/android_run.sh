@@ -80,7 +80,7 @@ REMOTE_MODEL="$REMOTE_DIR/model"
 REMOTE_ASSETS="$REMOTE_DIR/assets"
 REMOTE_CV="$REMOTE_DIR/common_voice"
 
-"$ADB" shell "mkdir -p '$REMOTE_DIR' '$REMOTE_ASSETS' '$REMOTE_CV'"
+"$ADB" shell "mkdir -p '$REMOTE_DIR' && rm -rf '$REMOTE_ASSETS' '$REMOTE_CV' && mkdir -p '$REMOTE_ASSETS' '$REMOTE_CV'"
 "$ADB" push "$BIN" "$REMOTE_BIN" >/dev/null
 "$ADB" shell "chmod 755 '$REMOTE_BIN'"
 "$ADB" push "$MODEL_DIR/." "$REMOTE_MODEL" >/dev/null

@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /Users/tony/Library/Android/sdk/ndk/30.0.14904198/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang-21 --target=aarch64-linux-android35 -B /Users/tony/Documents/keyboard/QwenASR "$@"

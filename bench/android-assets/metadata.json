@@ -1,0 +1,59 @@
+{
+  "ptt_guardrail": {
+    "name": "ptt_guardrail.wav",
+    "reference": "Hello,你好吗？已经坐低咗啦。",
+    "source": "/Users/tony/Downloads/PTT-20241208-WA0011.opus"
+  },
+  "common_voice": [
+    {
+      "name": "cv_yue_000.wav",
+      "reference": "我急求方法啊",
+      "dataset": "ming030890/common_voice_21_0_yue",
+      "config": "default",
+      "split": "validation",
+      "transcript_split": "dev",
+      "source_key": "yue_dev_0/common_voice_yue_31172853",
+      "source_url": "hf://datasets/ming030890/common_voice_21_0_yue@e09415a10a5aced0be938c15e9d2249b6b3cd696/audio/yue/dev/yue_dev_0.tar"
+    },
+    {
+      "name": "cv_yue_001.wav",
+      "reference": "唔做嘢嘅佔多數囉",
+      "dataset": "ming030890/common_voice_21_0_yue",
+      "config": "default",
+      "split": "validation",
+      "transcript_split": "dev",
+      "source_key": "yue_dev_0/common_voice_yue_31179380",
+      "source_url": "hf://datasets/ming030890/common_voice_21_0_yue@e09415a10a5aced0be938c15e9d2249b6b3cd696/audio/yue/dev/yue_dev_0.tar"
+    },
+    {
+      "name": "cv_yue_002.wav",
+      "reference": "證據嘅話真係冇呀",
+      "dataset": "ming030890/common_voice_21_0_yue",
+      "config": "default",
+      "split": "validation",
+      "transcript_split": "dev",
+      "source_key": "yue_dev_0/common_voice_yue_31179381",
+      "source_url": "hf://datasets/ming030890/common_voice_21_0_yue@e09415a10a5aced0be938c15e9d2249b6b3cd696/audio/yue/dev/yue_dev_0.tar"
+    },
+    {
+      "name": "cv_yue_003.wav",
+      "reference": "你睇下呢部劇",
+      "dataset": "ming030890/common_voice_21_0_yue",
+      "config": "default",
+      "split": "validation",
+      "transcript_split": "dev",
+      "source_key": "yue_dev_0/common_voice_yue_31179382",
+      "source_url": "hf://datasets/ming030890/common_voice_21_0_yue@e09415a10a5aced0be938c15e9d2249b6b3cd696/audio/yue/dev/yue_dev_0.tar"
+    },
+    {
+      "name": "cv_yue_004.wav",
+      "reference": "仲要提供乜嘢資料？",
+      "dataset": "ming030890/common_voice_21_0_yue",
+      "config": "default",
+      "split": "validation",
+      "transcript_split": "dev",
+      "source_key": "yue_dev_0/common_voice_yue_31179383",
+      "source_url": "hf://datasets/ming030890/common_voice_21_0_yue@e09415a10a5aced0be938c15e9d2249b6b3cd696/audio/yue/dev/yue_dev_0.tar"
+    }
+  ]
+}
