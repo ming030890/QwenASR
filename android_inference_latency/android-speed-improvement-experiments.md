@@ -27,6 +27,10 @@ Current benchmark protocol:
   Chinese context: `BENCH_LANGUAGE=Auto`,
   `BENCH_PROMPT='音频是粤语，可能夹杂英语'`.
 - Standard run: `bench/android_run.sh --runs 3 --threads "1 2 4 6 8"`
+- Device pre-run setup is now built into `bench/android_run.sh`:
+  it wakes the device, enables `svc power stayon true`, enables fixed
+  performance mode, then restores fixed performance mode and the original
+  `stay_on_while_plugged_in` setting on exit.
 - Controlled build-feature check: compare arms with identical `--runs` and
   `--threads`, preferably after cooldown.
 
@@ -57,8 +61,8 @@ Current state summary:
   language prompt policy.
 - Dotprod remains the chosen Android build flag for non-BLAS runs, but OpenBLAS
   is the clear performance path.
-- Prompt-correct Android OpenBLAS median is `1789.114 ms`; prompt-correct macOS
-  host median is `262.911 ms`, leaving about a `6.81x` Android/macOS gap.
+- Fixed-performance Android OpenBLAS median is `1677.491 ms`; prompt-correct macOS
+  host median is `262.911 ms`, leaving about a `6.38x` Android/macOS gap.
 - The active work is now post-OpenBLAS profiling and tuning, not no-BLAS scalar
   fallback work.
 
@@ -79,13 +83,14 @@ file for each completed experiment.
 | B2 | Candidate gate found dotprod `7.8%` faster; acceptance follow-up confirmed `8.66%` speedup. | Dotprod passes acceptance. | [B2 details](android-speed-results/b2-candidate-gate-baseline-vs-dotprod.md) |
 | B11 | Android OpenBLAS static reduced prompt-correct median to `1789.114 ms`, about `14.96x` faster than old Android dotprod/no-BLAS and `6.81x` slower than macOS. | OpenBLAS is the Android performance path; continue with post-OpenBLAS plan. | [B11 details](android-speed-results/b11-android-openblas-static-benchmark-arm.md) |
 | C1 | Profiled corrected Android/OpenBLAS static build: `sgemm` was about `62-66%` of profiled time, followed by `bf16_matvec` at about `20-24%`. | Run C2 OpenBLAS/thread sweep next; keep static OpenBLAS as primary Android packaging path. | [C1 details](android-speed-results/c1-profile-corrected-openblas-build.md) |
+| C2 | Fixed-performance baseline reached `1677.491 ms`; engine `threads=2` regressed to `92916.558 ms` and empty Common Voice transcripts. | Reject engine thread counts above `1`; keep `threads=1` and move to C3 OpenBLAS rebuild tuning. | [C2 details](android-speed-results/c2-openblas-engine-thread-sweep-fixedperf.md) |
 
 ## Current Post-OpenBLAS Performance Plan
 
 Use this section as the active backlog, sorted by expected ROI. The current
-prompt-correct Android/OpenBLAS median is `1789.114 ms` versus macOS
-`262.911 ms`, so the remaining gap is about `6.81x`, split roughly as Android
-encode `398.294 ms` versus macOS `39.634 ms`, and Android decode `1397.684 ms`
+fixed-performance Android/OpenBLAS median is `1677.491 ms` versus macOS
+`262.911 ms`, so the remaining gap is about `6.38x`, split roughly as Android
+encode `383.011 ms` versus macOS `39.634 ms`, and Android decode `1305.652 ms`
 versus macOS `224.362 ms`.
 
 C1 changed the shape of the plan: the corrected static OpenBLAS profile is
@@ -110,6 +115,10 @@ Dropped from the active plan:
   bucket after BLAS and BF16 matvec work.
 
 ### C2: current static OpenBLAS thread sweep
+
+Status:
+- Rejected. Engine-level `threads=2` caused a massive decode regression and
+  empty transcripts on the candidate gate. Keep `threads=1`.
 
 ROI:
 - Highest active item. It is the cheapest way to learn whether the current

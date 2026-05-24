@@ -23,6 +23,7 @@ BENCH_PROMPT="${BENCH_PROMPT:-音频是粤语，可能夹杂英语}"
 OPENBLAS_ANDROID_LIB_DIR="${OPENBLAS_ANDROID_LIB_DIR:-}"
 OPENBLAS_ANDROID_STATIC="${OPENBLAS_ANDROID_STATIC:-}"
 OPENBLAS_ANDROID_RUNTIME_LIB="${OPENBLAS_ANDROID_RUNTIME_LIB:-}"
+ORIGINAL_STAY_ON_WHILE_PLUGGED_IN=""
 PROFILE=0
 
 usage() {
@@ -55,6 +56,22 @@ shell_quote() {
     printf "'%s'" "$(printf "%s" "$1" | sed "s/'/'\\\\''/g")"
 }
 
+prepare_device() {
+    ORIGINAL_STAY_ON_WHILE_PLUGGED_IN="$("$ADB" shell settings get global stay_on_while_plugged_in 2>/dev/null | tr -d '\r' || true)"
+    "$ADB" shell input keyevent KEYCODE_WAKEUP
+    "$ADB" shell svc power stayon true
+    "$ADB" shell cmd power set-fixed-performance-mode-enabled true
+}
+
+cleanup_device() {
+    "$ADB" shell cmd power set-fixed-performance-mode-enabled false >/dev/null 2>&1 || true
+    if [[ -n "$ORIGINAL_STAY_ON_WHILE_PLUGGED_IN" && "$ORIGINAL_STAY_ON_WHILE_PLUGGED_IN" != "null" ]]; then
+        "$ADB" shell settings put global stay_on_while_plugged_in "$ORIGINAL_STAY_ON_WHILE_PLUGGED_IN" >/dev/null 2>&1 || true
+    else
+        "$ADB" shell settings delete global stay_on_while_plugged_in >/dev/null 2>&1 || true
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --model-dir) MODEL_DIR="$2"; shift 2;;
@@ -83,6 +100,9 @@ if [[ ! -d "$ASSETS_DIR" ]]; then
     echo "Run: bench/android_prepare_assets.py" >&2
     exit 1
 fi
+
+prepare_device
+trap cleanup_device EXIT
 
 cd "$PROJECT_DIR"
 
@@ -148,6 +168,7 @@ for threads in $THREADS; do
         if [[ -n "$BENCH_PROMPT" ]]; then
             remote_cmd="$remote_cmd --prompt $(shell_quote "$BENCH_PROMPT")"
         fi
+        "$ADB" shell input keyevent KEYCODE_WAKEUP
         "$ADB" shell "$remote_cmd" >"$json_path"
 
         python3 - "$json_path" "$RESULTS_TSV" "$TIMESTAMP" "$LABEL" "$threads" "$input_name" <<'PY'
