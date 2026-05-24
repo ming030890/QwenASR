@@ -10,7 +10,7 @@ license = "MIT"
 
 [workspace.dependencies]
 # x-release-please-version
-qwen-asr = { version = "0.7.0", path = "crates/qwen-asr" }
+qwen-asr = { version = "0.7.0", path = "crates/qwen-asr", default-features = false }
 
 [profile.release]
 opt-level = 3

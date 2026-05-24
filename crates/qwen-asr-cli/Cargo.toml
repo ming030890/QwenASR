@@ -14,10 +14,19 @@ readme = "README.md"
 name = "qwen-asr"
 path = "src/main.rs"
 
+[[bin]]
+name = "qwen-asr-bench-android"
+path = "src/bin/bench_android.rs"
+
 [dependencies]
-qwen-asr = { workspace = true }
 ureq = "2"
 ctrlc = "3"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+qwen-asr = { workspace = true, features = ["blas", "vdsp"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+qwen-asr = { workspace = true, default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-sys = "0.2"
