@@ -7,6 +7,9 @@ Current benchmark protocol:
 - Model: `/Volumes/SSD/qwen3-asr-0.6b`
 - Device workspace: `/data/local/tmp/qwen-asr-bench`
 - Assets: `bench/android-assets`
+- NDK: `bench/android_run.sh` defaults to
+  `/Users/tony/Library/Android/sdk/ndk/29.0.14206865`; override with
+  `NDK_HOME`, `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, or `NDK_BIN` if needed.
 - Fast-gate asset subset: `/Volumes/SSD/qwen-asr-android-fast-assets`
   contains `cv_yue_003.wav`, `cv_yue_003.txt`, `ptt_guardrail.wav`, and
   `ptt_guardrail.txt`.
@@ -519,8 +522,9 @@ Build/setup notes:
   `clang` shim (`clang-19` / `clang-21`) that fails the stdin compile test with
   `error: no input files`; NDK `29.0.14206865` has a real Mach-O `clang` binary
   and both `aarch64-linux-android30-clang` and `aarch64-linux-android35-clang`
-  pass the same test. Prefer NDK 29 for future OpenBLAS rebuilds, or keep using
-  the direct `clang-21 --target=...` workaround with NDK 30.
+  pass the same test. `bench/android_run.sh` now defaults to NDK 29. Prefer NDK
+  29 for future OpenBLAS rebuilds, or keep using the direct
+  `clang-21 --target=...` workaround with NDK 30.
 - The shared-library build step failed, but the static archive
   `/private/tmp/OpenBLAS/libopenblas.a` was created and linked successfully.
 

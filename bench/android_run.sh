@@ -13,7 +13,8 @@ THREADS="1 2 4 6 8"
 LABEL="android-baseline-$(date -u +%Y%m%d-%H%M%S)"
 ADB="${ADB:-/Users/tony/Library/Android/sdk/platform-tools/adb}"
 LINKER="${CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER:-$PROJECT_DIR/android-aarch64-clang}"
-NDK_BIN="/Users/tony/Library/Android/sdk/ndk/30.0.14904198/toolchains/llvm/prebuilt/darwin-x86_64/bin"
+NDK_HOME="${NDK_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-/Users/tony/Library/Android/sdk/ndk/29.0.14206865}}}"
+NDK_BIN="${NDK_BIN:-$NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin}"
 RUST_TOOLCHAIN_BIN="${RUST_TOOLCHAIN_BIN:-/Users/tony/.rustup/toolchains/stable-aarch64-apple-darwin/bin}"
 RUSTFLAGS_EXTRA="${RUSTFLAGS_EXTRA:-}"
 CARGO_FEATURES_EXTRA="${CARGO_FEATURES_EXTRA:-}"
@@ -35,6 +36,7 @@ Usage: bench/android_run.sh [options]
   -h, --help          Show this help
 
 Set RUSTFLAGS_EXTRA for experiments, e.g. RUSTFLAGS_EXTRA="-C target-cpu=cortex-a76 -C target-feature=+dotprod".
+Set NDK_HOME or NDK_BIN to override the Android NDK. Default NDK is 29.0.14206865 because this install's NDK 30 clang shim drops compiler arguments.
 Set CARGO_FEATURES_EXTRA for opt-in benchmark features, e.g. CARGO_FEATURES_EXTRA="android-blas".
 For Android BLAS, set OPENBLAS_ANDROID_LIB_DIR to the directory containing libopenblas.so or libopenblas.a.
 Set OPENBLAS_ANDROID_STATIC=1 when linking libopenblas.a.

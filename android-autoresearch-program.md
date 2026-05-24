@@ -84,9 +84,18 @@ Standard environment for every run:
 ```bash
 export ADB=/Users/tony/Library/Android/sdk/platform-tools/adb
 export MODEL_DIR=/Volumes/SSD/qwen3-asr-0.6b
+export NDK_HOME=/Users/tony/Library/Android/sdk/ndk/29.0.14206865
 export PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$PWD/android-aarch64-clang"
 ```
+
+NDK note:
+- Prefer NDK `29.0.14206865` for Android benchmark builds and OpenBLAS
+  rebuilds on this machine. The installed NDK `30.0.14904198` has a text
+  `clang` shim that drops compiler arguments when OpenBLAS invokes the standard
+  `aarch64-linux-android*-clang` wrapper. `bench/android_run.sh` defaults to
+  NDK 29 but still honors `NDK_HOME`, `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, or
+  `NDK_BIN` overrides.
 
 The harness is separate from production JNI code:
 - Source: `crates/qwen-asr-cli/src/bin/bench_android.rs`
