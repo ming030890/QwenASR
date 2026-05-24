@@ -23,6 +23,7 @@ BENCH_PROMPT="${BENCH_PROMPT:-音频是粤语，可能夹杂英语}"
 OPENBLAS_ANDROID_LIB_DIR="${OPENBLAS_ANDROID_LIB_DIR:-}"
 OPENBLAS_ANDROID_STATIC="${OPENBLAS_ANDROID_STATIC:-}"
 OPENBLAS_ANDROID_RUNTIME_LIB="${OPENBLAS_ANDROID_RUNTIME_LIB:-}"
+PROFILE=0
 
 usage() {
     cat >&2 <<EOF
@@ -35,6 +36,7 @@ Usage: bench/android_run.sh [options]
   --threads LIST      Quoted space-separated thread counts (default: "1 2 4 6 8")
   --remote-dir DIR    Device directory (default: /data/local/tmp/qwen-asr-bench)
   --adb PATH          adb path
+  --profile           Enable benchmark kernel profiling counters
   -h, --help          Show this help
 
 Set RUSTFLAGS_EXTRA for experiments, e.g. RUSTFLAGS_EXTRA="-C target-cpu=cortex-a76 -C target-feature=+dotprod".
@@ -62,6 +64,7 @@ while [[ $# -gt 0 ]]; do
         --threads) THREADS="$2"; shift 2;;
         --remote-dir) REMOTE_DIR="$2"; shift 2;;
         --adb) ADB="$2"; shift 2;;
+        --profile) PROFILE=1; shift;;
         -h|--help) usage;;
         *) echo "Unknown option: $1" >&2; usage;;
     esac
@@ -136,6 +139,9 @@ for threads in $THREADS; do
 
         json_path="$OUT_DIR/${input_name}-t${threads}.json"
         remote_cmd="$(shell_quote "$REMOTE_BIN") --model-dir $(shell_quote "$REMOTE_MODEL") --input $(shell_quote "$remote_input") --runs $(shell_quote "$RUNS") --threads $(shell_quote "$threads")"
+        if [[ "$PROFILE" == "1" ]]; then
+            remote_cmd="$remote_cmd --profile"
+        fi
         if [[ -n "$BENCH_LANGUAGE" ]]; then
             remote_cmd="$remote_cmd --language $(shell_quote "$BENCH_LANGUAGE")"
         fi
