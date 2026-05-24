@@ -16,6 +16,10 @@ LINKER="${CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER:-$PROJECT_DIR/android-aarch6
 NDK_BIN="/Users/tony/Library/Android/sdk/ndk/30.0.14904198/toolchains/llvm/prebuilt/darwin-x86_64/bin"
 RUST_TOOLCHAIN_BIN="${RUST_TOOLCHAIN_BIN:-/Users/tony/.rustup/toolchains/stable-aarch64-apple-darwin/bin}"
 RUSTFLAGS_EXTRA="${RUSTFLAGS_EXTRA:-}"
+CARGO_FEATURES_EXTRA="${CARGO_FEATURES_EXTRA:-}"
+OPENBLAS_ANDROID_LIB_DIR="${OPENBLAS_ANDROID_LIB_DIR:-}"
+OPENBLAS_ANDROID_STATIC="${OPENBLAS_ANDROID_STATIC:-}"
+OPENBLAS_ANDROID_RUNTIME_LIB="${OPENBLAS_ANDROID_RUNTIME_LIB:-}"
 
 usage() {
     cat >&2 <<EOF
@@ -31,6 +35,10 @@ Usage: bench/android_run.sh [options]
   -h, --help          Show this help
 
 Set RUSTFLAGS_EXTRA for experiments, e.g. RUSTFLAGS_EXTRA="-C target-cpu=cortex-a76 -C target-feature=+dotprod".
+Set CARGO_FEATURES_EXTRA for opt-in benchmark features, e.g. CARGO_FEATURES_EXTRA="android-blas".
+For Android BLAS, set OPENBLAS_ANDROID_LIB_DIR to the directory containing libopenblas.so or libopenblas.a.
+Set OPENBLAS_ANDROID_STATIC=1 when linking libopenblas.a.
+If using a shared library, optionally set OPENBLAS_ANDROID_RUNTIME_LIB to the exact .so path to push beside the benchmark binary.
 EOF
     exit 1
 }
@@ -71,8 +79,18 @@ export AR_aarch64_linux_android="${AR_aarch64_linux_android:-$NDK_BIN/llvm-ar}"
 export RANLIB_aarch64_linux_android="${RANLIB_aarch64_linux_android:-$NDK_BIN/llvm-ranlib}"
 export RUSTFLAGS="${RUSTFLAGS_EXTRA}"
 export PATH="$RUST_TOOLCHAIN_BIN:$NDK_BIN:$PATH"
+if [[ -n "$OPENBLAS_ANDROID_LIB_DIR" ]]; then
+    export OPENBLAS_ANDROID_LIB_DIR
+fi
+if [[ -n "$OPENBLAS_ANDROID_STATIC" ]]; then
+    export OPENBLAS_ANDROID_STATIC
+fi
 
-cargo build --release --target aarch64-linux-android -p qwen-asr-cli --bin qwen-asr-bench-android
+build_args=(build --release --target aarch64-linux-android -p qwen-asr-cli --bin qwen-asr-bench-android)
+if [[ -n "$CARGO_FEATURES_EXTRA" ]]; then
+    build_args+=(--features "$CARGO_FEATURES_EXTRA")
+fi
+cargo "${build_args[@]}"
 
 BIN="$PROJECT_DIR/target/aarch64-linux-android/release/qwen-asr-bench-android"
 REMOTE_BIN="$REMOTE_DIR/qwen-asr-bench-android"
@@ -83,6 +101,9 @@ REMOTE_CV="$REMOTE_DIR/common_voice"
 "$ADB" shell "mkdir -p '$REMOTE_DIR' && rm -rf '$REMOTE_ASSETS' '$REMOTE_CV' && mkdir -p '$REMOTE_ASSETS' '$REMOTE_CV'"
 "$ADB" push "$BIN" "$REMOTE_BIN" >/dev/null
 "$ADB" shell "chmod 755 '$REMOTE_BIN'"
+if [[ -n "$OPENBLAS_ANDROID_RUNTIME_LIB" ]]; then
+    "$ADB" push "$OPENBLAS_ANDROID_RUNTIME_LIB" "$REMOTE_DIR/" >/dev/null
+fi
 "$ADB" push "$MODEL_DIR/." "$REMOTE_MODEL" >/dev/null
 "$ADB" push "$ASSETS_DIR/." "$REMOTE_ASSETS" >/dev/null
 "$ADB" shell "rm -rf '$REMOTE_CV' && mkdir -p '$REMOTE_CV' && cp '$REMOTE_ASSETS'/cv_yue_*.wav '$REMOTE_CV'/"

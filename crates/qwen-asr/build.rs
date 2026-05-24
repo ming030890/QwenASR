@@ -10,6 +10,16 @@ fn main() {
             "linux" => {
                 println!("cargo:rustc-link-lib=openblas");
             }
+            "android" => {
+                if let Ok(dir) = std::env::var("OPENBLAS_ANDROID_LIB_DIR") {
+                    println!("cargo:rustc-link-search=native={dir}");
+                }
+                if std::env::var("OPENBLAS_ANDROID_STATIC").ok().as_deref() == Some("1") {
+                    println!("cargo:rustc-link-lib=static=openblas");
+                } else {
+                    println!("cargo:rustc-link-lib=openblas");
+                }
+            }
             _ => {
                 // No BLAS available, will use fallback matmul
             }

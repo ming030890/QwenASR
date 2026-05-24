@@ -62,6 +62,57 @@ Change:
 Status:
 - Kept as infrastructure.
 
+## H1: macOS host baseline reference
+
+Purpose:
+- Run the same fixed benchmark inputs on this macOS host as a reference point
+  for Android results. Do not mix these rows into `results-android.tsv`;
+  host JSON is stored separately under `bench/host-results`.
+
+Command shape:
+
+```bash
+PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" \
+cargo build --release -p qwen-asr-cli --bin qwen-asr-bench-android
+
+target/release/qwen-asr-bench-android \
+  --model-dir /Volumes/SSD/qwen3-asr-0.6b \
+  --input /private/tmp/qwen-asr-host-common-voice \
+  --runs 3 \
+  --threads 1 \
+  > bench/host-results/host-osx-baseline-t1-r3-20260524-1520/common_voice-t1.json
+
+target/release/qwen-asr-bench-android \
+  --model-dir /Volumes/SSD/qwen3-asr-0.6b \
+  --input bench/android-assets/ptt_guardrail.wav \
+  --runs 3 \
+  --threads 1 \
+  > bench/host-results/host-osx-baseline-t1-r3-20260524-1520/ptt_guardrail-t1.json
+```
+
+Result:
+- Label/path: `bench/host-results/host-osx-baseline-t1-r3-20260524-1520`.
+- Platform flags: `["vDSP/Accelerate", "NEON", "DotProd"]`, target arch
+  `aarch64`.
+- Threads/runs: `1` thread, `3` runs.
+- Common Voice median inference: `196.125 ms`.
+- Per-clip inference: `cv_yue_000.wav` `188.842 ms`, `cv_yue_001.wav`
+  `246.790 ms`, `cv_yue_002.wav` `252.131 ms`, `cv_yue_003.wav`
+  `196.125 ms`, `cv_yue_004.wav` `187.569 ms`.
+- Guardrail: `319.319 ms`, exact transcript
+  `Hello,你好吗？已经坐低咗啦。`
+- Compared with accepted Android dotprod
+  `android-accept-dotprod-t1-r3-20260524-1348`, host Common Voice median is
+  about `136.45x` faster (`26761.235 ms` Android vs `196.125 ms` host), and
+  host guardrail is about `159.37x` faster (`50890.267 ms` Android vs
+  `319.319 ms` host).
+
+Caveats:
+- This is a host reference, not an Android acceptance comparator. macOS uses
+  Accelerate/vDSP and a very different memory/CPU stack.
+- The first Common Voice file includes a slower cold inference run, but the
+  recorded file result is the median of three runs.
+
 ## A1: legal no-dotprod Android baseline build
 
 Change:
@@ -445,7 +496,87 @@ Decision:
 - Keep harness improvements if they do not alter benchmark semantics and make
   the staged loop faster or more reproducible.
 
-### Deferred: Android OpenBLAS
+### B11: Android OpenBLAS static benchmark arm
 
-Try only if focused no-BLAS fallback work does not produce wins. Treat it as
-separate because it changes runtime dependencies and package complexity.
+Purpose:
+- Directly test the biggest suspected Android/macOS gap: Android was using
+  scalar fallback loops for BLAS-shaped f32 work while macOS used
+  Accelerate/vDSP.
+
+Build/setup notes:
+- Added benchmark-only `qwen-asr-cli` feature `android-blas`, which forwards
+  `qwen-asr/blas` for Android without changing the Flutter/JNI dependency.
+- Added Android OpenBLAS link env support:
+  `OPENBLAS_ANDROID_LIB_DIR=/private/tmp/OpenBLAS` and
+  `OPENBLAS_ANDROID_STATIC=1`.
+- Built OpenBLAS from `/private/tmp/OpenBLAS` for Android arm64 using the
+  OpenBLAS Android wiki guidance. The NDK 30 wrapper in this environment drops
+  arguments through its `clang` shim, so the working target compiler was:
+  `CC='/Users/tony/Library/Android/sdk/ndk/30.0.14904198/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang-21 --target=aarch64-linux-android35'`
+  with `HOSTCC=/usr/bin/clang`, `TARGET=ARMV8`, `ONLY_CBLAS=1`,
+  `NOFORTRAN=1`, `USE_THREAD=0`, and `NUM_THREADS=1`.
+- Follow-up wrapper check: NDK `28.2.13676358` and `30.0.14904198` have a text
+  `clang` shim (`clang-19` / `clang-21`) that fails the stdin compile test with
+  `error: no input files`; NDK `29.0.14206865` has a real Mach-O `clang` binary
+  and both `aarch64-linux-android30-clang` and `aarch64-linux-android35-clang`
+  pass the same test. Prefer NDK 29 for future OpenBLAS rebuilds, or keep using
+  the direct `clang-21 --target=...` workaround with NDK 30.
+- The shared-library build step failed, but the static archive
+  `/private/tmp/OpenBLAS/libopenblas.a` was created and linked successfully.
+
+Fast gate:
+- Label: `android-fast-openblas-static-dotprod-t1-r1-20260524-1544`
+  (`bench/android-results/android-fast-openblas-static-dotprod-t1-r1-20260524-1544`).
+- Flags: `["BLAS", "NEON", "DotProd"]`; threads/runs: `1` / `1`.
+- `cv_yue_003.wav`: `1222.881 ms` inference, `293.981 ms` encode,
+  `928.755 ms` decode.
+- Guardrail: `2356.684 ms`, exact transcript.
+- Compared with prior fast dotprod `cv_yue_003.wav` at `20627.996 ms`, this is
+  about `16.87x` faster.
+
+Candidate gate:
+- Label: `android-candidate-openblas-static-dotprod-t1-r1-20260524-1546`
+  (`bench/android-results/android-candidate-openblas-static-dotprod-t1-r1-20260524-1546`).
+- Median Common Voice inference over `cv_yue_001.wav` and `cv_yue_003.wav`:
+  `1480.571 ms`.
+- Per-clip inference: `cv_yue_001.wav` `1751.388 ms`, `cv_yue_003.wav`
+  `1209.754 ms`.
+- Guardrail: `2317.934 ms`, exact transcript.
+- Compared with prior candidate dotprod median `23635.609 ms`, this is about
+  `15.96x` faster.
+
+Acceptance gate:
+- Label: `android-accept-openblas-static-dotprod-t1-r3-20260524-1551`
+  (`bench/android-results/android-accept-openblas-static-dotprod-t1-r3-20260524-1551`).
+- Thermal status after run: `0`.
+- Median Common Voice inference: `1342.469 ms`.
+- Per-clip inference: `cv_yue_000.wav` `1281.776 ms`, `cv_yue_001.wav`
+  `1758.571 ms`, `cv_yue_002.wav` `1671.465 ms`, `cv_yue_003.wav`
+  `1276.666 ms`, `cv_yue_004.wav` `1342.469 ms`.
+- Guardrail: `2434.938 ms`, exact transcript.
+- Compared with accepted dotprod median `26761.235 ms`, OpenBLAS static is
+  about `19.93x` faster (`94.98%` lower median inference). Guardrail is about
+  `20.90x` faster than dotprod.
+- Per-clip speedups versus accepted dotprod: `17.26x`, `16.35x`, `16.01x`,
+  `15.30x`, and `20.09x`.
+
+Quality caveat:
+- The exact guardrail passed.
+- Common Voice transcripts were unchanged for the first four clips under the
+  current CER script, but `cv_yue_004.wav` changed from
+  `Need to provide what information.` to
+  `What information should I provide?`.
+- With the current strict reference text, average Common Voice CER changes from
+  `0.9500` for accepted dotprod to `0.9722` for OpenBLAS static. Therefore this
+  is the clear performance winner but should be marked "performance-promising,
+  quality-caveated" rather than fully accepted until the `cv_yue_004.wav`
+  transcript drift is resolved or the quality policy is clarified.
+
+Next action:
+- Re-run the OpenBLAS acceptance arm once more after cooldown to check whether
+  the `cv_yue_004.wav` wording is deterministic.
+- If the wording remains changed, decide whether this English paraphrase on an
+  already-wrong clip is an acceptable CER exception. Otherwise inspect whether
+  OpenBLAS numerical differences change decoder token selection on this clip.
+- If quality is accepted, make Android OpenBLAS the default benchmark arm and
+  then run B9 thread/core policy for the BLAS build.
