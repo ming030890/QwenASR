@@ -84,6 +84,7 @@ file for each completed experiment.
 | B11 | Android OpenBLAS static reduced prompt-correct median to `1789.114 ms`, about `14.96x` faster than old Android dotprod/no-BLAS and `6.81x` slower than macOS. | OpenBLAS is the Android performance path; continue with post-OpenBLAS plan. | [B11 details](android-speed-results/b11-android-openblas-static-benchmark-arm.md) |
 | C1 | Profiled corrected Android/OpenBLAS static build: `sgemm` was about `62-66%` of profiled time, followed by `bf16_matvec` at about `20-24%`. | Run C2 OpenBLAS/thread sweep next; keep static OpenBLAS as primary Android packaging path. | [C1 details](android-speed-results/c1-profile-corrected-openblas-build.md) |
 | C2 | Fixed-performance baseline reached `1677.491 ms`; engine `threads=2` regressed to `92916.558 ms` and empty Common Voice transcripts. | Reject engine thread counts above `1`; keep `threads=1` and move to C3 OpenBLAS rebuild tuning. | [C2 details](android-speed-results/c2-openblas-engine-thread-sweep-fixedperf.md) |
+| C3 | NDK 29 generic `ARMV8` static OpenBLAS reached `1602.726 ms` Common Voice; `DYNAMIC_ARCH=1`, `USE_THREAD=1`, `NUM_THREADS=8`, API 33 reached `2466.708 ms`. Both were slower than the prompt-correct fast baseline. | Reject NDK-version-only and threaded dynamic-arch rebuilds at Stage 1; next isolate `DYNAMIC_ARCH=1` with single-threaded OpenBLAS. | [C3 details](android-speed-results/c3-openblas-ndk29-armv8-rebuild.md) |
 
 ## Current Post-OpenBLAS Performance Plan
 
@@ -175,6 +176,15 @@ Decision:
 
 ### C3: OpenBLAS static rebuild tuning
 
+Status:
+- In progress. The NDK 29 generic `ARMV8`, `USE_THREAD=0`, `NUM_THREADS=1`
+  rebuild was rejected at Stage 1 because it was slower than the comparable
+  prompt-correct fast-gate baseline. The `DYNAMIC_ARCH=1`, `USE_THREAD=1`,
+  `NUM_THREADS=8`, API 33 follow-up was also rejected because it was much
+  slower on the fast Common Voice clip. Next C3 step is `TARGET=ARMV8`,
+  `DYNAMIC_ARCH=1`, `USE_THREAD=0`, `NUM_THREADS=1`, so dynamic arch can be
+  separated from OpenBLAS internal threading.
+
 ROI:
 - High. C1 says `sgemm` is the largest measured bucket, and the current static
   library was a first working generic `ARMV8`, `USE_THREAD=0`, `NUM_THREADS=1`
@@ -186,13 +196,21 @@ Purpose:
   behavior or introducing a runtime `.so` dependency.
 
 Experiments, in this order:
-- Rebuild static OpenBLAS with NDK 29 and confirm the selected AArch64 kernels
-  in the build log. Keep `ONLY_CBLAS=1`, `NOFORTRAN=1`, and static output.
+- Done/rejected: rebuild static OpenBLAS with NDK 29 and confirm the selected
+  AArch64 kernels in the build log. Keep `ONLY_CBLAS=1`, `NOFORTRAN=1`, and
+  static output.
+- Done/rejected: rebuild OpenBLAS `v0.3.33` with `DYNAMIC_ARCH=1`,
+  `USE_THREAD=1`, `NUM_THREADS=8`, `ONLY_CBLAS=1`, and Android API 33. It was
+  `60.67%` slower than the prompt-correct fast-gate baseline on Common Voice.
+- Next: rebuild OpenBLAS `v0.3.33` with `TARGET=ARMV8`, `DYNAMIC_ARCH=1`,
+  `USE_THREAD=0`, `NUM_THREADS=1`, `ONLY_CBLAS=1`, and Android API 33. Benchmark
+  it with the same fast gate to isolate dynamic-arch dispatch from OpenBLAS
+  internal threading.
 - Check whether OpenBLAS has a better ARMv8/AArch64 target for Pixel 9 than
   generic `TARGET=ARMV8`; benchmark any candidate with the same C2 Stage 1 gate.
-- Try static OpenBLAS internal threading only after C2 establishes the best
-  engine thread count for `USE_THREAD=0`. Compare `USE_THREAD=1` with
-  `NUM_THREADS=2` and `NUM_THREADS=4`, but avoid unmeasured oversubscription.
+- Do not continue OpenBLAS internal threading unless the single-threaded
+  dynamic-arch result is promising or a later profile shows a clear single large
+  BLAS call that can amortize its overhead.
 
 Decision:
 - Keep a rebuilt library only if it improves prompt-correct median inference on
