@@ -49,6 +49,7 @@ file for each completed experiment.
 | M2 | Lazy/dynamic KV cache allocation: start `KvCache` at `128` tokens and grow on demand instead of constructing `2048` tokens up front. Stage 3 was neutral: Common Voice median `1718.5 ms` vs M1 `1722.5 ms`, load RSS `1567760 KB` vs `1567828 KB`, peak RSS `2135716 KB` vs `2136024 KB`. | Reject and revert. The untouched zeroed KV pages do not appear to commit into Android RSS, so the smaller logical capacity does not improve measured memory metrics and adds a future long-input growth/copy event. | [M2 details](android-speed-results/m2-lazy-kv-cache.md) |
 | M3 | Transient BF16 encoder weight conversion: tested all encoder projection weights transient, then transformer-layer-only transient with stem/final projections kept F32. Stage 3 reached `507756-558156 KB` load RSS and `149.5-185.6 ms` model load, but full Common Voice median regressed `+3.5-3.7%`. | Implement M3 A as a memory-prioritized tradeoff. It misses the speed-first `+2%` inference regression limit, but saves the most RSS and may improve low-memory robustness. | [M3 details](android-speed-results/m3-transient-bf16-encoder.md) |
 | M4 | Tied `lm_head` host-side pre-quantization: emits an I8 mmap-backed `thinker.lm_head.weight` while keeping BF16 token embeddings for lookup. Stage 3 reached `27.5 ms` model load, `52700 KB` load RSS, `1147644 KB` peak RSS, and `1771.6 ms` full Common Voice median. | Accept. Meets model-load, load-RSS, and peak-RSS thresholds with neutral/slightly faster full Common Voice median versus M3 A. | [M4 details](android-speed-results/m4-tied-lm-head-int8.md) |
+| P0 | Phase-split benchmark timing: bench_android JSON now emits `mel_ms`, `encoder_ms`, `prefill_ms`, `decode_loop_ms`, `decode_loop_ms_per_token`, and `median_tokens` per file/run. Fast-gate cv_yue_003 split: mel `3.3` / encoder `403.9` / prefill `893.2` / decode_loop `371.9` ms over `7` tokens (`53.1` ms/token), total `1672.5` ms — neutral vs `1677.5` baseline. | Accept as infrastructure. Confirms prefill (`70%` of decode_ms) is the largest decode-side slice, not the autoregressive token loop. | [P0 details](android-speed-results/p0-phase-split-benchmark-timing.md) |
 
 ## Current Android Experiment Plan
 
@@ -79,6 +80,17 @@ ROI scoring:
 - `5`: likely large user-visible win, low to moderate implementation risk.
 - `3`: useful diagnostic or medium-size win, moderate risk.
 - `1`: uncertain payoff or high product/format risk.
+
+P0 phase-split findings (2026-05-25):
+- Mel is `<1%` of total inference (~3-5 ms). Encoder forward is `~25%`.
+  Prefill is `~50-53%` of total inference (`70%` of legacy `decode_ms`).
+  The autoregressive token loop is `~22%` of total inference at `46-53`
+  ms/token over typically `7-13` tokens for these clips.
+- Kernel work that touches the BF16 GEMM call surface (encoder + prefill)
+  attacks `~75%` of total inference; pure token-loop work attacks `~22%`.
+- These shares come from cv_yue_003 and ptt_guardrail fast-gate runs; rerun
+  the phase split on a longer clip if a future experiment is specifically
+  about long-utterance behavior.
 
 Reranking notes (after M4 acceptance, 2026-05-25):
 - Memory is largely solved: peak RSS `1.15 GB`, load RSS `52.7 MB`, model load
@@ -111,16 +123,15 @@ Gate scripts: `bench/android_run.py` (collect numbers, waits for thermal interna
 
 | Rank | ID | ROI | Experiment | Main metrics |
 | --- | --- | ---: | --- | --- |
-| 1 | P0 | 5 | Phase-split benchmark timing. | `mel_ms`, `encoder_ms`, `prefill_ms`, `decode_loop_ms/token` |
-| 2 | K1 | 5 | NEON `BFDOT`/`BFMMLA` BF16 matvec/matmul kernel for the bf16_matvec hotpath. | `bf16_matvec` profile share, encode/decode latency |
-| 3 | K3 | 4 | True packed GEMM path for prefill/encoder (replace matvec-in-a-loop matmat). | encoder/prefill latency, sgemm share |
-| 4 | P3 | 4 | Android SGEMM shape microbench across candidate kernels (K1/K3 vs OpenBLAS vs KleidiAI). | per-shape Android/macOS gap |
-| 5 | P1 | 3 | Isolate threaded OpenBLAS runtime settings. | encode/decode split and fast-gate latency |
-| 6 | K2 | 3 | KleidiAI (Arm) GEMM library probe for top shapes from P3. | per-shape latency vs OpenBLAS/K1 |
-| 7 | E1 | 3 | Encoder INT8 weights + native INT8 GEMM kernel (replaces Q3). | encoder timing, RSS, CER |
-| 8 | P4 | 3 | Decoder token-loop matvec work after phase split. | `decode_loop_ms/token` |
-| 9 | C1K | 2 | Replace `conv2d_op` with im2col+GEMM through the K1/K3 path. | `conv2d_op` profile share, encode_ms |
-| 10 | P2 | 2 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. | fast-gate and acceptance latency |
+| 1 | K1 | 5 | NEON `BFDOT`/`BFMMLA` BF16 matvec/matmul kernel for the bf16_matvec hotpath. | `bf16_matvec` profile share, `encoder_ms`/`prefill_ms` |
+| 2 | K3 | 4 | True packed GEMM path for prefill/encoder (replace matvec-in-a-loop matmat). | `encoder_ms`/`prefill_ms`, sgemm share |
+| 3 | P3 | 4 | Android SGEMM shape microbench across candidate kernels (K1/K3 vs OpenBLAS vs KleidiAI). | per-shape Android/macOS gap |
+| 4 | P1 | 3 | Isolate threaded OpenBLAS runtime settings. | `encoder_ms`/`prefill_ms` split, fast-gate latency |
+| 5 | K2 | 3 | KleidiAI (Arm) GEMM library probe for top shapes from P3. | per-shape latency vs OpenBLAS/K1 |
+| 6 | E1 | 3 | Encoder INT8 weights + native INT8 GEMM kernel (replaces Q3). | `encoder_ms`, RSS, CER |
+| 7 | P4 | 2 | Decoder token-loop matvec work — demoted by P0: token loop is only ~22% of total inference. | `decode_loop_ms_per_token` |
+| 8 | C1K | 2 | Replace `conv2d_op` with im2col+GEMM through the K1/K3 path. | `conv2d_op` profile share, `encoder_ms` |
+| 9 | P2 | 2 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. | fast-gate and acceptance latency |
 
 Removed from backlog:
 - **Q3** — reformulated as E1 (the probe form was too loose; we need a real INT8
@@ -440,7 +451,14 @@ Dropped from the active plan:
 ### P0: phase-split benchmark timing
 
 Status:
-- Next (promoted to rank 1 after Q2 rejection).
+- Done. Accepted as infrastructure. See
+  [P0 details](android-speed-results/p0-phase-split-benchmark-timing.md).
+
+Key finding:
+- Prefill is `~70%` of `decode_ms`; the autoregressive token loop is only
+  `~22%` of total inference at `46-53` ms/token. Encoder forward is `~25%`
+  of total inference; mel is `<1%`. K1/K3 (which touch both encoder and
+  prefill BF16 GEMM) remain the highest-leverage next item; P4 stays demoted.
 
 Purpose:
 - Split the current coarse `encode_ms` and `decode_ms` into actionable buckets:

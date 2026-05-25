@@ -346,6 +346,9 @@ pub fn forced_align(
     ctx.perf_total_ms += elapsed_ms(seg_t0);
     ctx.perf_encode_ms += mel_ms + enc_ms;
     ctx.perf_decode_ms += prefill_ms;
+    ctx.perf_mel_ms += mel_ms;
+    ctx.perf_encoder_ms += enc_ms;
+    ctx.perf_prefill_ms += prefill_ms;
 
     Some(results)
 }

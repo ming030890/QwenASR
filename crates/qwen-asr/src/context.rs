@@ -71,6 +71,11 @@ pub struct QwenCtx {
     /// Mel spectrogram + encoder forward pass time combined.
     pub perf_encode_ms: f64,
     pub perf_decode_ms: f64,
+    /// Phase-split timings (P0). Accumulated alongside perf_encode_ms/perf_decode_ms.
+    pub perf_mel_ms: f64,
+    pub perf_encoder_ms: f64,
+    pub perf_prefill_ms: f64,
+    pub perf_decode_loop_ms: f64,
 }
 
 impl QwenCtx {
@@ -159,6 +164,10 @@ impl QwenCtx {
             perf_audio_ms: 0.0,
             perf_encode_ms: 0.0,
             perf_decode_ms: 0.0,
+            perf_mel_ms: 0.0,
+            perf_encoder_ms: 0.0,
+            perf_prefill_ms: 0.0,
+            perf_decode_loop_ms: 0.0,
         })
     }
 
@@ -236,5 +245,9 @@ impl QwenCtx {
         self.perf_audio_ms = 0.0;
         self.perf_encode_ms = 0.0;
         self.perf_decode_ms = 0.0;
+        self.perf_mel_ms = 0.0;
+        self.perf_encoder_ms = 0.0;
+        self.perf_prefill_ms = 0.0;
+        self.perf_decode_loop_ms = 0.0;
     }
 }

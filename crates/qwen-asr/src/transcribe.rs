@@ -362,6 +362,10 @@ fn transcribe_segment(
     ctx.perf_text_tokens += n_text_tokens;
     ctx.perf_encode_ms += mel_ms + enc_ms;
     ctx.perf_decode_ms += prefill_ms + decode_ms;
+    ctx.perf_mel_ms += mel_ms;
+    ctx.perf_encoder_ms += enc_ms;
+    ctx.perf_prefill_ms += prefill_ms;
+    ctx.perf_decode_loop_ms += decode_ms;
 
     Some((trimmed, n_text_tokens))
 }
@@ -667,16 +671,22 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 
         // Encoder
         let t0 = get_time_ms();
+        let mut chunk_mel_ms = 0.0f64;
+        let mut chunk_enc_only_ms = 0.0f64;
         let full_end = (audio_cursor / enc_window_samples) * enc_window_samples;
 
         // Cache completed windows (base offset accounts for windows cleared on re-anchor)
         while (enc_cache_base_windows + enc_cache.len()) * enc_window_samples < full_end {
             let ws = (enc_cache_base_windows + enc_cache.len()) * enc_window_samples;
+            let mel_t = get_time_ms();
             let (mel, mel_frames) =
                 audio::mel_spectrogram(&audio_samples[ws..ws + enc_window_samples])?;
+            chunk_mel_ms += elapsed_ms(mel_t);
+            let enc_t = get_time_ms();
             let (win_enc, win_seq) =
                 ctx.encoder
                     .forward(&cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))?;
+            chunk_enc_only_ms += elapsed_ms(enc_t);
             let row_keys = prefill_embed_keys(&win_enc, win_seq, dim);
             enc_cached_seq_total += win_seq;
             enc_cache.push(EncWindow {
@@ -692,13 +702,17 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         let mut partial_keys: Vec<PrefillRowKey> = Vec::new();
         if is_final && full_end < audio_cursor {
             let _partial_samples = audio_cursor - full_end;
+            let mel_t = get_time_ms();
             if let Some((mel, mel_frames)) =
                 audio::mel_spectrogram(&audio_samples[full_end..audio_cursor])
             {
+                chunk_mel_ms += elapsed_ms(mel_t);
+                let enc_t = get_time_ms();
                 if let Some((enc, seq)) =
                     ctx.encoder
                         .forward(&cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))
                 {
+                    chunk_enc_only_ms += elapsed_ms(enc_t);
                     partial_seq = seq;
                     partial_keys = prefill_embed_keys(&enc, seq, dim);
                     partial_enc = enc;
@@ -714,6 +728,8 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 
         let enc_ms = elapsed_ms(t0);
         ctx.perf_encode_ms += enc_ms;
+        ctx.perf_mel_ms += chunk_mel_ms;
+        ctx.perf_encoder_ms += chunk_enc_only_ms;
 
         if !is_final && chunk_idx < unfixed_chunks {
             prev_prefill_keys.clear();
@@ -874,6 +890,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 
         let prefill_ms = elapsed_ms(t0);
         ctx.perf_decode_ms += prefill_ms;
+        ctx.perf_prefill_ms += prefill_ms;
 
         let last_embed = &input_embeds[prefill_len * dim..(prefill_len + 1) * dim];
         let mut token = decoder::decoder_forward(
@@ -911,6 +928,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 
         let decode_ms = elapsed_ms(t0);
         ctx.perf_decode_ms += decode_ms;
+        ctx.perf_decode_loop_ms += decode_ms;
 
         // Update raw token history
         raw_tokens.truncate(n_prefix_tokens);
@@ -1191,16 +1209,22 @@ pub fn stream_push_audio(
 
     // ---- Encoder: only encode new windows ----
     let t0 = get_time_ms();
+    let mut chunk_mel_ms = 0.0f64;
+    let mut chunk_enc_only_ms = 0.0f64;
     let full_end = (state.audio_cursor / enc_window_samples) * enc_window_samples;
 
     // Cache newly completed windows (base offset accounts for windows cleared on re-anchor)
         while (state.enc_cache_base_windows + state.enc_cache.len()) * enc_window_samples < full_end
         {
         let ws = (state.enc_cache_base_windows + state.enc_cache.len()) * enc_window_samples;
+        let mel_t = get_time_ms();
         let (mel, mel_frames) = audio::mel_spectrogram(&samples[ws..ws + enc_window_samples])?;
+        chunk_mel_ms += elapsed_ms(mel_t);
+        let enc_t = get_time_ms();
             let (win_enc, win_seq) =
                 ctx.encoder
                     .forward(&cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))?;
+        chunk_enc_only_ms += elapsed_ms(enc_t);
             let row_keys = prefill_embed_keys(&win_enc, win_seq, dim);
         state.enc_cached_seq_total += win_seq;
             state.enc_cache.push(EncWindow {
@@ -1223,13 +1247,17 @@ pub fn stream_push_audio(
     let partial_enc;
         let partial_keys;
     if need_encode && full_end < state.audio_cursor {
+            let mel_t = get_time_ms();
             if let Some((mel, mel_frames)) =
                 audio::mel_spectrogram(&samples[full_end..state.audio_cursor])
             {
+                chunk_mel_ms += elapsed_ms(mel_t);
+                let enc_t = get_time_ms();
                 if let Some((enc, seq)) =
                     ctx.encoder
                         .forward(&cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))
                 {
+                chunk_enc_only_ms += elapsed_ms(enc_t);
                 partial_seq = seq;
                     partial_keys = prefill_embed_keys(&enc, seq, dim);
                 partial_enc = enc;
@@ -1266,6 +1294,8 @@ pub fn stream_push_audio(
 
     let enc_ms = elapsed_ms(t0);
     ctx.perf_encode_ms += enc_ms;
+    ctx.perf_mel_ms += chunk_mel_ms;
+    ctx.perf_encoder_ms += chunk_enc_only_ms;
 
     // ---- Prefix rollback ----
     let n_prefix_tokens = if ctx.past_text_conditioning
@@ -1431,6 +1461,7 @@ pub fn stream_push_audio(
 
     let prefill_ms = elapsed_ms(t0);
     ctx.perf_decode_ms += prefill_ms;
+    ctx.perf_prefill_ms += prefill_ms;
 
     if kernels::verbose() >= 2 {
         eprintln!(
@@ -1465,6 +1496,7 @@ pub fn stream_push_audio(
 
     let decode_ms = elapsed_ms(t0);
     ctx.perf_decode_ms += decode_ms;
+    ctx.perf_decode_loop_ms += decode_ms;
 
     // ---- Detect speech end (decoder produced EOT on silence) ----
     // When chunk_tokens is empty, the decoder saw silence/end-of-speech.

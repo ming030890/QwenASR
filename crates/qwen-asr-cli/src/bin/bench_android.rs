@@ -15,6 +15,10 @@ struct RunResult {
     wall_inference_ms: f64,
     encode_ms: f64,
     decode_ms: f64,
+    mel_ms: f64,
+    encoder_ms: f64,
+    prefill_ms: f64,
+    decode_loop_ms: f64,
     rss_before_kb: u64,
     rss_after_kb: u64,
     peak_rss_kb: u64,
@@ -225,13 +229,23 @@ fn profile_json(counters: &[kernels::ProfileCounterSnapshot]) -> String {
 fn run_details_json(runs: &[RunResult]) -> String {
     runs.iter()
         .map(|run| {
+            let decode_loop_ms_per_token = if run.tokens > 0 {
+                run.decode_loop_ms / run.tokens as f64
+            } else {
+                0.0
+            };
             format!(
-                "{{\"run\":{},\"inference_ms\":{:.3},\"wall_inference_ms\":{:.3},\"encode_ms\":{:.3},\"decode_ms\":{:.3},\"rss_before_kb\":{},\"rss_after_kb\":{},\"peak_rss_kb\":{},\"tokens\":{},\"rtf\":{:.6},\"transcript\":\"{}\",\"profile\":[{}]}}",
+                "{{\"run\":{},\"inference_ms\":{:.3},\"wall_inference_ms\":{:.3},\"encode_ms\":{:.3},\"decode_ms\":{:.3},\"mel_ms\":{:.3},\"encoder_ms\":{:.3},\"prefill_ms\":{:.3},\"decode_loop_ms\":{:.3},\"decode_loop_ms_per_token\":{:.6},\"rss_before_kb\":{},\"rss_after_kb\":{},\"peak_rss_kb\":{},\"tokens\":{},\"rtf\":{:.6},\"transcript\":\"{}\",\"profile\":[{}]}}",
                 run.run,
                 run.inference_ms,
                 run.wall_inference_ms,
                 run.encode_ms,
                 run.decode_ms,
+                run.mel_ms,
+                run.encoder_ms,
+                run.prefill_ms,
+                run.decode_loop_ms,
+                decode_loop_ms_per_token,
                 run.rss_before_kb,
                 run.rss_after_kb,
                 run.peak_rss_kb,
@@ -346,6 +360,10 @@ fn main() {
                 wall_inference_ms,
                 encode_ms: ctx.perf_encode_ms,
                 decode_ms: ctx.perf_decode_ms,
+                mel_ms: ctx.perf_mel_ms,
+                encoder_ms: ctx.perf_encoder_ms,
+                prefill_ms: ctx.perf_prefill_ms,
+                decode_loop_ms: ctx.perf_decode_loop_ms,
                 rss_before_kb,
                 rss_after_kb,
                 peak_rss_kb,
@@ -362,6 +380,16 @@ fn main() {
         let median_inference_ms = median_by(&file_runs, |run| run.inference_ms);
         let median_encode_ms = median_by(&file_runs, |run| run.encode_ms);
         let median_decode_ms = median_by(&file_runs, |run| run.decode_ms);
+        let median_mel_ms = median_by(&file_runs, |run| run.mel_ms);
+        let median_encoder_ms = median_by(&file_runs, |run| run.encoder_ms);
+        let median_prefill_ms = median_by(&file_runs, |run| run.prefill_ms);
+        let median_decode_loop_ms = median_by(&file_runs, |run| run.decode_loop_ms);
+        let median_tokens = median_by(&file_runs, |run| run.tokens as f64);
+        let median_decode_loop_ms_per_token = if median_tokens > 0.0 {
+            median_decode_loop_ms / median_tokens
+        } else {
+            0.0
+        };
         let median_rtf = if median_inference_ms > 0.0 {
             audio_s / (median_inference_ms / 1000.0)
         } else {
@@ -369,7 +397,7 @@ fn main() {
         };
 
         file_json.push(format!(
-            "{{\"audio_path\":\"{}\",\"audio_load_ms\":{:.3},\"audio_s\":{:.6},\"median_run\":{},\"inference_ms\":{:.3},\"encode_ms\":{:.3},\"decode_ms\":{:.3},\"rtf\":{:.6},\"transcript\":\"{}\",\"run_details\":[{}]}}",
+            "{{\"audio_path\":\"{}\",\"audio_load_ms\":{:.3},\"audio_s\":{:.6},\"median_run\":{},\"inference_ms\":{:.3},\"encode_ms\":{:.3},\"decode_ms\":{:.3},\"mel_ms\":{:.3},\"encoder_ms\":{:.3},\"prefill_ms\":{:.3},\"decode_loop_ms\":{:.3},\"decode_loop_ms_per_token\":{:.6},\"median_tokens\":{:.1},\"rtf\":{:.6},\"transcript\":\"{}\",\"run_details\":[{}]}}",
             json_escape(&audio_path),
             audio_load_ms,
             audio_s,
@@ -377,6 +405,12 @@ fn main() {
             median_inference_ms,
             median_encode_ms,
             median_decode_ms,
+            median_mel_ms,
+            median_encoder_ms,
+            median_prefill_ms,
+            median_decode_loop_ms,
+            median_decode_loop_ms_per_token,
+            median_tokens,
             median_rtf,
             json_escape(&median_run.transcript),
             run_details_json(&file_runs)
