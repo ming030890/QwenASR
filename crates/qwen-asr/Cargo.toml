@@ -16,6 +16,7 @@ name = "qwen_asr"
 
 [dependencies]
 libc = "0.2"
+jni = { version = "0.21.1", optional = true }
 
 [package.metadata.docs.rs]
 no-default-features = true
@@ -25,5 +26,6 @@ default = ["blas", "vdsp"]
 blas = []
 vdsp = []
 ios = []
-android = []
+android = ["jni"]
 macos-ffi = []
+

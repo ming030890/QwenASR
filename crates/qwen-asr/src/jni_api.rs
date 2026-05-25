@@ -3,177 +3,140 @@
 ///
 /// Java class: com.qwenasr.QAsrEngine
 ///
-/// ```java
-/// public class QAsrEngine {
-///     static { System.loadLibrary("qwen_asr"); }
-///     private long nativeHandle;
-///     public native boolean loadModel(String modelDir, int nThreads);
-///     public native String transcribePcm(float[] samples);
-///     public native String transcribeWav(byte[] wavData);
-///     public native void setSegmentSec(float sec);
-///     public native void setLanguage(String language);
-///     public native void free();
-/// }
-/// ```
 
-use std::os::raw::{c_char, c_void};
+use std::ffi::{CStr, CString};
+use jni::JNIEnv;
+use jni::objects::{JClass, JString, JByteBuffer};
+use jni::sys::{jlong, jint, jfloat, jstring};
 
-// JNI types
-type JNIEnv = *mut c_void;
-type JClass = *mut c_void;
-type JString = *mut c_void;
-type JObject = *mut c_void;
-type JFloatArray = *mut c_void;
-type JByteArray = *mut c_void;
-type JLong = i64;
-type JInt = i32;
-type JFloat = f32;
-type JBoolean = u8;
-
-// JNI function signatures we need
-extern "C" {
-    fn __android_log_write(prio: i32, tag: *const c_char, text: *const c_char) -> i32;
-}
-
-// JNI string helpers (accessed via function pointers in JNIEnv)
-// These are simplified - a real implementation would use jni-rs or manual vtable access.
-// For now, we use the C-FFI API underneath.
-
-/// Load model. Returns native handle as jlong.
+/// Load model. Returns native handle as jlong (pointer to QwenAsrEngine).
 #[no_mangle]
-pub unsafe extern "C" fn Java_com_qwenasr_QAsrEngine_nativeLoadModel(
-    env: JNIEnv,
-    _obj: JObject,
+pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeLoadModel(
+    mut env: JNIEnv,
+    _class: JClass,
     model_dir: JString,
-    n_threads: JInt,
-) -> JLong {
-    // Use the C-FFI API for the actual implementation
-    let c_api_engine = crate::c_api::qwen_asr_load_model(
-        jstring_to_cstr(env, model_dir),
-        n_threads,
-        0, // silent
-    );
-    c_api_engine as JLong
+    n_threads: jint,
+) -> jlong {
+    let dir_str: String = match env.get_string(&model_dir) {
+        Ok(s) => s.into(),
+        Err(_) => return 0,
+    };
+
+    let dir_c = match CString::new(dir_str) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+
+    let engine_ptr = crate::c_api::qwen_asr_load_model(dir_c.as_ptr(), n_threads, 0);
+    engine_ptr as jlong
 }
 
-/// Transcribe PCM float array.
+/// Transcribe direct byte buffer contents without copying memory (zero-copy).
+/// The direct buffer is expected to contain 16kHz mono float PCM samples.
 #[no_mangle]
-pub unsafe extern "C" fn Java_com_qwenasr_QAsrEngine_nativeTranscribePcm(
+pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeTranscribePcmDirect(
     env: JNIEnv,
-    _obj: JObject,
-    handle: JLong,
-    samples: JFloatArray,
-    n_samples: JInt,
-) -> JString {
-    if handle == 0 {
+    _class: JClass,
+    handle: jlong,
+    buffer: JByteBuffer,
+    size_in_samples: jint,
+) -> jstring {
+    if handle == 0 || size_in_samples <= 0 {
         return std::ptr::null_mut();
     }
 
-    let samples_ptr = jfloat_array_get(env, samples);
-    if samples_ptr.is_null() {
+    let address_ptr = match env.get_direct_buffer_address(&buffer) {
+        Ok(ptr) => ptr,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    if address_ptr.is_null() {
         return std::ptr::null_mut();
     }
 
-    let result = crate::c_api::qwen_asr_transcribe_pcm(
+    // Cast the raw byte buffer pointer to a float PCM sample pointer
+    let samples_ptr = address_ptr as *const f32;
+
+    let result_c = crate::c_api::qwen_asr_transcribe_pcm(
         handle as *mut crate::c_api::QwenAsrEngine,
         samples_ptr,
-        n_samples,
+        size_in_samples,
     );
 
-    jfloat_array_release(env, samples, samples_ptr);
-
-    if result.is_null() {
+    if result_c.is_null() {
         return std::ptr::null_mut();
     }
 
-    let jstr = new_jstring(env, result);
-    crate::c_api::qwen_asr_free_string(result);
+    let result_cstr = CStr::from_ptr(result_c);
+    let result_str = match result_cstr.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            crate::c_api::qwen_asr_free_string(result_c);
+            return std::ptr::null_mut();
+        }
+    };
+
+    let jstr = match env.new_string(result_str) {
+        Ok(js) => js.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    };
+
+    crate::c_api::qwen_asr_free_string(result_c);
     jstr
 }
 
-/// Transcribe WAV byte array.
+/// Set transcription language configuration.
 #[no_mangle]
-pub unsafe extern "C" fn Java_com_qwenasr_QAsrEngine_nativeTranscribeWav(
-    env: JNIEnv,
-    _obj: JObject,
-    handle: JLong,
-    wav_data: JByteArray,
-    wav_len: JInt,
-) -> JString {
+pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeSetLanguage(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    language: JString,
+) {
     if handle == 0 {
-        return std::ptr::null_mut();
+        return;
     }
 
-    let data_ptr = jbyte_array_get(env, wav_data);
-    if data_ptr.is_null() {
-        return std::ptr::null_mut();
-    }
+    let lang_str: String = match env.get_string(&language) {
+        Ok(s) => s.into(),
+        Err(_) => return,
+    };
 
-    let result = crate::c_api::qwen_asr_transcribe_wav_buffer(
+    let lang_c = match CString::new(lang_str) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    crate::c_api::qwen_asr_set_language(
         handle as *mut crate::c_api::QwenAsrEngine,
-        data_ptr as *const u8,
-        wav_len,
+        lang_c.as_ptr(),
     );
-
-    jbyte_array_release(env, wav_data, data_ptr);
-
-    if result.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    let jstr = new_jstring(env, result);
-    crate::c_api::qwen_asr_free_string(result);
-    jstr
 }
 
-/// Free engine.
+/// Set transcription segment seconds.
 #[no_mangle]
-pub unsafe extern "C" fn Java_com_qwenasr_QAsrEngine_nativeFree(
+pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeSetSegmentSec(
     _env: JNIEnv,
-    _obj: JObject,
-    handle: JLong,
+    _class: JClass,
+    handle: jlong,
+    sec: jfloat,
+) {
+    if handle != 0 {
+        crate::c_api::qwen_asr_set_segment_sec(
+            handle as *mut crate::c_api::QwenAsrEngine,
+            sec,
+        );
+    }
+}
+
+/// Free the native model allocation and release memory.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeFree(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
 ) {
     if handle != 0 {
         crate::c_api::qwen_asr_free(handle as *mut crate::c_api::QwenAsrEngine);
     }
-}
-
-/// Set segment seconds.
-#[no_mangle]
-pub unsafe extern "C" fn Java_com_qwenasr_QAsrEngine_nativeSetSegmentSec(
-    _env: JNIEnv,
-    _obj: JObject,
-    handle: JLong,
-    sec: JFloat,
-) {
-    if handle != 0 {
-        crate::c_api::qwen_asr_set_segment_sec(handle as *mut crate::c_api::QwenAsrEngine, sec);
-    }
-}
-
-// ========================================================================
-// JNI helper stubs - these use raw JNIEnv vtable access
-// In production, use the `jni` crate. These are minimal stubs for compilation.
-// ========================================================================
-
-unsafe fn jstring_to_cstr(_env: JNIEnv, _jstr: JString) -> *const c_char {
-    // Real implementation: (*(*env)).GetStringUTFChars(env, jstr, null)
-    // Stub returns null - will need jni crate for real Android builds
-    std::ptr::null()
-}
-
-unsafe fn jfloat_array_get(_env: JNIEnv, _arr: JFloatArray) -> *const f32 {
-    std::ptr::null()
-}
-
-unsafe fn jfloat_array_release(_env: JNIEnv, _arr: JFloatArray, _ptr: *const f32) {}
-
-unsafe fn jbyte_array_get(_env: JNIEnv, _arr: JByteArray) -> *const i8 {
-    std::ptr::null()
-}
-
-unsafe fn jbyte_array_release(_env: JNIEnv, _arr: JByteArray, _ptr: *const i8) {}
-
-unsafe fn new_jstring(_env: JNIEnv, _cstr: *const c_char) -> JString {
-    std::ptr::null_mut()
 }
