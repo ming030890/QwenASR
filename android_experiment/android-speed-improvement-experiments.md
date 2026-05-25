@@ -64,15 +64,10 @@ Current state summary:
   language prompt policy.
 - Dotprod remains the chosen Android build flag for non-BLAS runs, but OpenBLAS
   is the clear performance path.
-- Best accepted Android baseline so far:
-  `android-baseline-openblas-fixedperf-t1-r3-20260524-215914`, with static
-  OpenBLAS, `android-blas`, `-C target-feature=+dotprod`, fixed-performance
-  mode, and engine `threads=1`.
-- `bench/android_run.sh` now defaults to that best baseline config:
-  `/private/tmp/OpenBLAS`, static link, `android-blas`, dotprod, and
-  `threads=1`.
-- Fixed-performance Android OpenBLAS median is `1677.491 ms`; prompt-correct macOS
-  host median is `262.911 ms`, leaving about a `6.38x` Android/macOS gap.
+- Best accepted Android baseline, rebuild steps, and latest rerun comparison
+  live in [android-best-baseline.md](android-best-baseline.md).
+- Prompt-correct macOS host median is `262.911 ms`; compare current Android
+  baseline numbers against the Android baseline reference above.
 - The latest OpenBLAS `DYNAMIC_ARCH=1`, `USE_THREAD=1`, `NUM_THREADS=8` run
   regressed badly. On `cv_yue_003`, inference moved from `1481.111 ms`
   baseline to `2466.708 ms`; encode moved from `292.986 ms` to `881.855 ms`,

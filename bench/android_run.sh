@@ -103,7 +103,8 @@ if [[ ! -d "$ASSETS_DIR" ]]; then
 fi
 if [[ -n "$OPENBLAS_ANDROID_LIB_DIR" && ! -e "$OPENBLAS_ANDROID_LIB_DIR/libopenblas.a" && ! -e "$OPENBLAS_ANDROID_LIB_DIR/libopenblas.so" ]]; then
     echo "OpenBLAS baseline library not found in: $OPENBLAS_ANDROID_LIB_DIR" >&2
-    echo "Rebuild the accepted baseline with the command in android_experiment/android-autoresearch-program.md, or set OPENBLAS_ANDROID_LIB_DIR to a compatible static ARMV8 USE_THREAD=0 NUM_THREADS=1 build." >&2
+    echo "Rebuild the accepted baseline with: bench/build-openblas-android-baseline.sh --force" >&2
+    echo "Or set OPENBLAS_ANDROID_LIB_DIR to a compatible static ARMV8 USE_THREAD=0 NUM_THREADS=1 build." >&2
     exit 1
 fi
 
