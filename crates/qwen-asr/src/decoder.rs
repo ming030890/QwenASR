@@ -20,12 +20,20 @@ unsafe impl Sync for Int8Buf {}
 
 impl Int8Buf {
     fn from_mmap(ptr: *const i8, len: usize) -> Self {
-        Int8Buf { ptr, len, _owned: Vec::new() }
+        Int8Buf {
+            ptr,
+            len,
+            _owned: Vec::new(),
+        }
     }
     fn from_owned(v: Vec<i8>) -> Self {
         let ptr = v.as_ptr();
         let len = v.len();
-        Int8Buf { ptr, len, _owned: v }
+        Int8Buf {
+            ptr,
+            len,
+            _owned: v,
+        }
     }
 }
 
@@ -133,12 +141,21 @@ fn load_i8_mmap(ms: &MultiSafetensors, name: &str) -> Option<Int8Buf> {
     }
 }
 
-fn dequantize_int8_to_f32(int8: &[i8], scales: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; out_dim * in_dim];
+fn dequantize_int8_to_f32_scratch<'a>(
+    int8: &[i8],
+    scales: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+    scratch: &'a mut [f32],
+) -> &'a [f32] {
+    let n = out_dim * in_dim;
+    debug_assert!(scratch.len() >= n);
+    let out = &mut scratch[..n];
     for row in 0..out_dim {
         let s = scales[row];
+        let row_off = row * in_dim;
         for col in 0..in_dim {
-            out[row * in_dim + col] = (int8[row * in_dim + col] as f32) * s;
+            out[row_off + col] = (int8[row_off + col] as f32) * s;
         }
     }
     out
@@ -161,7 +178,9 @@ impl Decoder {
         if use_int8_weights {
             #[cfg(not(target_arch = "aarch64"))]
             {
-                eprintln!("decoder: INT8 pre-quantized model is not supported on this architecture");
+                eprintln!(
+                    "decoder: INT8 pre-quantized model is not supported on this architecture"
+                );
                 return None;
             }
         }
@@ -185,38 +204,36 @@ impl Decoder {
                 // Zero-copy: raw pointers point directly into the mmap region — no heap copies.
                 // gate_up_fused is pre-interleaved by prepare_int8_model.py, so no runtime fusion.
                 let wq_int8 = load_i8_mmap(ms, &format!("{}.self_attn.q_proj.weight", lp))?;
-                let wq_int8_scales = load_f32(ms, &format!("{}.self_attn.q_proj.weight_int8_scale", lp))?;
+                let wq_int8_scales =
+                    load_f32(ms, &format!("{}.self_attn.q_proj.weight_int8_scale", lp))?;
                 let wk_int8 = load_i8_mmap(ms, &format!("{}.self_attn.k_proj.weight", lp))?;
-                let wk_int8_scales = load_f32(ms, &format!("{}.self_attn.k_proj.weight_int8_scale", lp))?;
+                let wk_int8_scales =
+                    load_f32(ms, &format!("{}.self_attn.k_proj.weight_int8_scale", lp))?;
                 let wv_int8 = load_i8_mmap(ms, &format!("{}.self_attn.v_proj.weight", lp))?;
-                let wv_int8_scales = load_f32(ms, &format!("{}.self_attn.v_proj.weight_int8_scale", lp))?;
+                let wv_int8_scales =
+                    load_f32(ms, &format!("{}.self_attn.v_proj.weight_int8_scale", lp))?;
                 let wo_int8 = load_i8_mmap(ms, &format!("{}.self_attn.o_proj.weight", lp))?;
-                let wo_int8_scales = load_f32(ms, &format!("{}.self_attn.o_proj.weight_int8_scale", lp))?;
+                let wo_int8_scales =
+                    load_f32(ms, &format!("{}.self_attn.o_proj.weight_int8_scale", lp))?;
 
                 // Pre-fused gate+up from model file (no runtime interleaving needed)
                 let gate_up_int8 = load_i8_mmap(ms, &format!("{}.mlp.gate_up_fused.weight", lp))?;
-                let gate_up_int8_scales = load_f32(ms, &format!("{}.mlp.gate_up_fused.weight_int8_scale", lp))?;
+                let gate_up_int8_scales =
+                    load_f32(ms, &format!("{}.mlp.gate_up_fused.weight_int8_scale", lp))?;
 
                 let down_int8 = load_i8_mmap(ms, &format!("{}.mlp.down_proj.weight", lp))?;
-                let down_int8_scales = load_f32(ms, &format!("{}.mlp.down_proj.weight_int8_scale", lp))?;
-
-                // Dequantize INT8 → F32 for prefill paths
-                let wq_weight_f32_prefill = dequantize_int8_to_f32(&wq_int8, &wq_int8_scales, q_dim, hidden);
-                let wk_weight_f32_prefill = dequantize_int8_to_f32(&wk_int8, &wk_int8_scales, kv_dim, hidden);
-                let wv_weight_f32_prefill = dequantize_int8_to_f32(&wv_int8, &wv_int8_scales, kv_dim, hidden);
-                let wo_weight_f32_prefill = dequantize_int8_to_f32(&wo_int8, &wo_int8_scales, hidden, q_dim);
-                let gate_up_fused_f32_prefill = dequantize_int8_to_f32(&gate_up_int8, &gate_up_int8_scales, 2 * inter, hidden);
-                let down_weight_f32_prefill = dequantize_int8_to_f32(&down_int8, &down_int8_scales, hidden, inter);
+                let down_int8_scales =
+                    load_f32(ms, &format!("{}.mlp.down_proj.weight_int8_scale", lp))?;
 
                 layers.push(DecLayer {
                     wq_weight_bf16: std::ptr::null(),
                     wk_weight_bf16: std::ptr::null(),
                     wv_weight_bf16: std::ptr::null(),
                     wo_weight_bf16: std::ptr::null(),
-                    wq_weight_f32_prefill,
-                    wk_weight_f32_prefill,
-                    wv_weight_f32_prefill,
-                    wo_weight_f32_prefill,
+                    wq_weight_f32_prefill: Vec::new(),
+                    wk_weight_f32_prefill: Vec::new(),
+                    wv_weight_f32_prefill: Vec::new(),
+                    wo_weight_f32_prefill: Vec::new(),
                     q_norm_weight: q_norm,
                     k_norm_weight: k_norm,
                     input_norm,
@@ -225,8 +242,8 @@ impl Decoder {
                     up_weight_bf16: std::ptr::null(),
                     down_weight_bf16: std::ptr::null(),
                     gate_up_fused_bf16: Vec::new(),
-                    gate_up_fused_f32_prefill,
-                    down_weight_f32_prefill,
+                    gate_up_fused_f32_prefill: Vec::new(),
+                    down_weight_f32_prefill: Vec::new(),
                     wq_int8,
                     wq_int8_scales,
                     wk_int8,
@@ -306,8 +323,11 @@ impl Decoder {
                 let (wo_i8, wo_int8_scales) =
                     kernels::quantize_bf16_weights_to_int8(wo, hidden, q_dim);
                 let wo_int8 = Int8Buf::from_owned(wo_i8);
-                let (gate_up_i8, gate_up_int8_scales) =
-                    kernels::quantize_bf16_weights_to_int8(gate_up_fused.as_ptr(), 2 * inter, hidden);
+                let (gate_up_i8, gate_up_int8_scales) = kernels::quantize_bf16_weights_to_int8(
+                    gate_up_fused.as_ptr(),
+                    2 * inter,
+                    hidden,
+                );
                 let gate_up_int8 = Int8Buf::from_owned(gate_up_i8);
                 let (down_i8, down_int8_scales) =
                     kernels::quantize_bf16_weights_to_int8(down_bf16, hidden, inter);
@@ -718,23 +738,50 @@ pub fn decoder_prefill(
         let k = &mut bufs.pref_k[..seq_len * kv_dim];
         let v = &mut bufs.pref_v[..seq_len * kv_dim];
 
-        kernels::linear_nobias(q, x_norm, &layer.wq_weight_f32_prefill, seq_len, dim, q_dim);
-        kernels::linear_nobias(
-            k,
-            x_norm,
-            &layer.wk_weight_f32_prefill,
-            seq_len,
-            dim,
-            kv_dim,
-        );
-        kernels::linear_nobias(
-            v,
-            x_norm,
-            &layer.wv_weight_f32_prefill,
-            seq_len,
-            dim,
-            kv_dim,
-        );
+        if layer.wq_weight_f32_prefill.is_empty() {
+            let wq = dequantize_int8_to_f32_scratch(
+                &layer.wq_int8,
+                &layer.wq_int8_scales,
+                q_dim,
+                dim,
+                &mut bufs.bf16_scratch,
+            );
+            kernels::linear_nobias(q, x_norm, wq, seq_len, dim, q_dim);
+            let wk = dequantize_int8_to_f32_scratch(
+                &layer.wk_int8,
+                &layer.wk_int8_scales,
+                kv_dim,
+                dim,
+                &mut bufs.bf16_scratch,
+            );
+            kernels::linear_nobias(k, x_norm, wk, seq_len, dim, kv_dim);
+            let wv = dequantize_int8_to_f32_scratch(
+                &layer.wv_int8,
+                &layer.wv_int8_scales,
+                kv_dim,
+                dim,
+                &mut bufs.bf16_scratch,
+            );
+            kernels::linear_nobias(v, x_norm, wv, seq_len, dim, kv_dim);
+        } else {
+            kernels::linear_nobias(q, x_norm, &layer.wq_weight_f32_prefill, seq_len, dim, q_dim);
+            kernels::linear_nobias(
+                k,
+                x_norm,
+                &layer.wk_weight_f32_prefill,
+                seq_len,
+                dim,
+                kv_dim,
+            );
+            kernels::linear_nobias(
+                v,
+                x_norm,
+                &layer.wv_weight_f32_prefill,
+                seq_len,
+                dim,
+                kv_dim,
+            );
+        }
 
         kernels::rms_norm_per_head(q, &layer.q_norm_weight, seq_len, n_heads, head_dim, eps);
         kernels::rms_norm_per_head(k, &layer.k_norm_weight, seq_len, n_kv_heads, head_dim, eps);
@@ -778,14 +825,25 @@ pub fn decoder_prefill(
         );
 
         let proj_out = &mut bufs.pref_proj_out[..seq_len * dim];
-        kernels::linear_nobias(
-            proj_out,
-            attn_out,
-            &layer.wo_weight_f32_prefill,
-            seq_len,
-            q_dim,
-            dim,
-        );
+        if layer.wo_weight_f32_prefill.is_empty() {
+            let wo = dequantize_int8_to_f32_scratch(
+                &layer.wo_int8,
+                &layer.wo_int8_scales,
+                dim,
+                q_dim,
+                &mut bufs.bf16_scratch,
+            );
+            kernels::linear_nobias(proj_out, attn_out, wo, seq_len, q_dim, dim);
+        } else {
+            kernels::linear_nobias(
+                proj_out,
+                attn_out,
+                &layer.wo_weight_f32_prefill,
+                seq_len,
+                q_dim,
+                dim,
+            );
+        }
         kernels::add_inplace(&mut bufs.pref_x[..seq_len * dim], proj_out, seq_len * dim);
 
         // Post-attention RMSNorm + SwiGLU MLP
@@ -800,27 +858,56 @@ pub fn decoder_prefill(
         );
 
         let gate_up = &mut bufs.pref_gate_up[..seq_len * 2 * intermediate];
-        kernels::linear_nobias(
-            gate_up,
-            x_norm2,
-            &layer.gate_up_fused_f32_prefill,
-            seq_len,
-            dim,
-            2 * intermediate,
-        );
+        if layer.gate_up_fused_f32_prefill.is_empty() {
+            let gate_up_weight = dequantize_int8_to_f32_scratch(
+                &layer.gate_up_int8,
+                &layer.gate_up_int8_scales,
+                2 * intermediate,
+                dim,
+                &mut bufs.bf16_scratch,
+            );
+            kernels::linear_nobias(
+                gate_up,
+                x_norm2,
+                gate_up_weight,
+                seq_len,
+                dim,
+                2 * intermediate,
+            );
+        } else {
+            kernels::linear_nobias(
+                gate_up,
+                x_norm2,
+                &layer.gate_up_fused_f32_prefill,
+                seq_len,
+                dim,
+                2 * intermediate,
+            );
+        }
 
         let gate = &mut bufs.pref_gate[..seq_len * intermediate];
         kernels::swiglu_multiply(gate, gate_up, seq_len, intermediate);
 
         let ffn_out = &mut bufs.pref_ffn_out[..seq_len * dim];
-        kernels::linear_nobias(
-            ffn_out,
-            gate,
-            &layer.down_weight_f32_prefill,
-            seq_len,
-            intermediate,
-            dim,
-        );
+        if layer.down_weight_f32_prefill.is_empty() {
+            let down = dequantize_int8_to_f32_scratch(
+                &layer.down_int8,
+                &layer.down_int8_scales,
+                dim,
+                intermediate,
+                &mut bufs.bf16_scratch,
+            );
+            kernels::linear_nobias(ffn_out, gate, down, seq_len, intermediate, dim);
+        } else {
+            kernels::linear_nobias(
+                ffn_out,
+                gate,
+                &layer.down_weight_f32_prefill,
+                seq_len,
+                intermediate,
+                dim,
+            );
+        }
         kernels::add_inplace(&mut bufs.pref_x[..seq_len * dim], ffn_out, seq_len * dim);
     }
 
@@ -889,9 +976,30 @@ pub fn decoder_forward(
         );
         #[cfg(not(target_arch = "aarch64"))]
         unsafe {
-            kernels::linear_nobias_bf16(&mut bufs.q[..q_dim], &bufs.x_norm[..dim], layer.wq_weight_bf16, 1, dim, q_dim);
-            kernels::linear_nobias_bf16(&mut bufs.k[..kv_dim], &bufs.x_norm[..dim], layer.wk_weight_bf16, 1, dim, kv_dim);
-            kernels::linear_nobias_bf16(&mut bufs.v[..kv_dim], &bufs.x_norm[..dim], layer.wv_weight_bf16, 1, dim, kv_dim);
+            kernels::linear_nobias_bf16(
+                &mut bufs.q[..q_dim],
+                &bufs.x_norm[..dim],
+                layer.wq_weight_bf16,
+                1,
+                dim,
+                q_dim,
+            );
+            kernels::linear_nobias_bf16(
+                &mut bufs.k[..kv_dim],
+                &bufs.x_norm[..dim],
+                layer.wk_weight_bf16,
+                1,
+                dim,
+                kv_dim,
+            );
+            kernels::linear_nobias_bf16(
+                &mut bufs.v[..kv_dim],
+                &bufs.x_norm[..dim],
+                layer.wv_weight_bf16,
+                1,
+                dim,
+                kv_dim,
+            );
         }
 
         kernels::rms_norm_per_head(

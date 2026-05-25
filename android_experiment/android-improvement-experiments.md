@@ -38,6 +38,7 @@ file for each completed experiment.
 | C3 | NDK 29 generic `ARMV8` static OpenBLAS reached `1602.726 ms` Common Voice; `DYNAMIC_ARCH=1`, `USE_THREAD=1`, `NUM_THREADS=8`, API 33 reached `2466.708 ms`. Both were slower than the prompt-correct fast baseline. | Reject NDK-version-only and threaded dynamic-arch rebuilds at Stage 1. Stop broad OpenBLAS rebuild guessing until phase-split and shape-level measurements isolate the failure mode. | [C3 details](android-speed-results/c3-openblas-ndk29-armv8-rebuild.md) |
 | Q2 | Pre-quantize decoder weights to INT8 on host; replace BF16 tensors in model file. Model file `419 MB` smaller (`1370 MB` vs `1789 MB`). Fast gate: neutral — `model_load_ms` unchanged at `1361 ms`, inference within cross-session noise, RSS `~0.9%` lower. | Reject (neutral). Smaller file does not reduce load or inference time; on-device BF16→INT8 quantization rides free on already-paged mmap data; load is CPU/alloc bound, not I/O bound. | [Q2 details](android-speed-results/q2-decoder-int8-weights.md) |
 | Q2B | Zero-copy mmap INT8 decoder weights: read INT8 model weights directly via zero-copy mmap pointers rather than allocating and copying to the heap. Fuses gate+up projections in model file. | Accept. Achieves ~31.4% faster model load (935 ms vs 1364 ms) and ~24.5% lower memory footprint (3.71 GB vs 4.91 GB RSS) with neutral/slightly faster inference. | [Q2B details](android-speed-results/q2b-int8-mmap-zero-copy.md) |
+| M1 | Transient prefill dequantization: INT8 decoder prefill weights dequantize into a shared F32 scratch buffer instead of permanent per-layer F32 heap copies. Stage 3 reached `404.7 ms` model load, `1567828 KB` load RSS, and `2136024 KB` peak RSS. | Accept. Model load improved `56.7%`, load RSS improved `57.7%`, peak RSS improved `44.3%`, and Common Voice median was `1.1%` faster versus Q2B. | [M1 details](android-speed-results/m1-transient-prefill-dequant.md) |
 
 ## Current Android Experiment Plan
 
@@ -73,22 +74,21 @@ Gate scripts: `bench/android_run.py` (collect numbers, waits for thermal interna
 
 | Rank | ID | ROI | Experiment | Main metrics |
 | --- | --- | ---: | --- | --- |
-| 1 | M1 | 5 | Transient layer-by-layer dequantization of F32 prefill weights. | `memory_kb`, `peak_rss_kb`, `model_load_ms` |
-| 2 | M2 | 5 | Lazy/Dynamic KV Cache scaling starting at 128 tokens. | `memory_kb`, `peak_rss_kb`, `inference_ms` |
-| 3 | M3 | 4 | Transient layer-by-layer conversion of BF16 encoder weights. | `memory_kb`, `peak_rss_kb`, `encoder_ms` |
-| 4 | M4 | 4 | Host-side pre-quantization of the tied LM head. | `memory_kb`, `peak_rss_kb`, `model_load_ms` |
-| 5 | P0 | 5 | Phase-split benchmark timing. | `mel_ms`, `encoder_ms`, `prefill_ms`, `decode_loop_ms/token` |
-| 6 | P1 | 4 | Isolate threaded OpenBLAS runtime settings. | encode/decode split and fast-gate latency |
-| 7 | P3 | 4 | Android SGEMM shape microbench. | per-shape Android/macOS gap |
-| 8 | Q3 | 3 | Encoder weight quantization feasibility probe. | encoder timing, RSS, CER |
-| 9 | P2 | 3 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. | fast-gate and acceptance latency |
-| 10 | P4 | 3 | Decoder token-loop matvec work after phase split. | `decode_loop_ms/token` |
-| 11 | Q4 | 1 | Whole-model quantized file format. | package size, startup, fallback complexity |
+| 1 | M2 | 5 | Lazy/Dynamic KV Cache scaling starting at 128 tokens. | `memory_kb`, `peak_rss_kb`, `inference_ms` |
+| 2 | M3 | 4 | Transient layer-by-layer conversion of BF16 encoder weights. | `memory_kb`, `peak_rss_kb`, `encoder_ms` |
+| 3 | M4 | 4 | Host-side pre-quantization of the tied LM head. | `memory_kb`, `peak_rss_kb`, `model_load_ms` |
+| 4 | P0 | 5 | Phase-split benchmark timing. | `mel_ms`, `encoder_ms`, `prefill_ms`, `decode_loop_ms/token` |
+| 5 | P1 | 4 | Isolate threaded OpenBLAS runtime settings. | encode/decode split and fast-gate latency |
+| 6 | P3 | 4 | Android SGEMM shape microbench. | per-shape Android/macOS gap |
+| 7 | Q3 | 3 | Encoder weight quantization feasibility probe. | encoder timing, RSS, CER |
+| 8 | P2 | 3 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. | fast-gate and acceptance latency |
+| 9 | P4 | 3 | Decoder token-loop matvec work after phase split. | `decode_loop_ms/token` |
+| 10 | Q4 | 1 | Whole-model quantized file format. | package size, startup, fallback complexity |
 
 ### M1: Transient layer-by-layer dequantization of F32 prefill weights
 
 Status:
-- Proposed. High ROI memory-saver.
+- Done. Accepted.
 
 ROI:
 - 5/5.
