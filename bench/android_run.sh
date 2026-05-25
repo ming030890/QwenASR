@@ -9,19 +9,19 @@ ASSETS_DIR="$PROJECT_DIR/bench/android-assets"
 RESULTS_TSV="$PROJECT_DIR/results-android.tsv"
 REMOTE_DIR="/data/local/tmp/qwen-asr-bench"
 RUNS=3
-THREADS="1 2 4 6 8"
+THREADS="1"
 LABEL="android-baseline-$(date -u +%Y%m%d-%H%M%S)"
 ADB="${ADB:-/Users/tony/Library/Android/sdk/platform-tools/adb}"
 LINKER="${CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER:-$PROJECT_DIR/android-aarch64-clang}"
 NDK_HOME="${NDK_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-/Users/tony/Library/Android/sdk/ndk/29.0.14206865}}}"
 NDK_BIN="${NDK_BIN:-$NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin}"
 RUST_TOOLCHAIN_BIN="${RUST_TOOLCHAIN_BIN:-/Users/tony/.rustup/toolchains/stable-aarch64-apple-darwin/bin}"
-RUSTFLAGS_EXTRA="${RUSTFLAGS_EXTRA:-}"
-CARGO_FEATURES_EXTRA="${CARGO_FEATURES_EXTRA:-}"
+RUSTFLAGS_EXTRA="${RUSTFLAGS_EXTRA:--C target-feature=+dotprod}"
+CARGO_FEATURES_EXTRA="${CARGO_FEATURES_EXTRA:-android-blas}"
 BENCH_LANGUAGE="${BENCH_LANGUAGE:-Auto}"
 BENCH_PROMPT="${BENCH_PROMPT:-音频是粤语，可能夹杂英语}"
-OPENBLAS_ANDROID_LIB_DIR="${OPENBLAS_ANDROID_LIB_DIR:-}"
-OPENBLAS_ANDROID_STATIC="${OPENBLAS_ANDROID_STATIC:-}"
+OPENBLAS_ANDROID_LIB_DIR="${OPENBLAS_ANDROID_LIB_DIR:-/private/tmp/OpenBLAS}"
+OPENBLAS_ANDROID_STATIC="${OPENBLAS_ANDROID_STATIC:-1}"
 OPENBLAS_ANDROID_RUNTIME_LIB="${OPENBLAS_ANDROID_RUNTIME_LIB:-}"
 ORIGINAL_STAY_ON_WHILE_PLUGGED_IN=""
 PROFILE=0
@@ -34,19 +34,20 @@ Usage: bench/android_run.sh [options]
   --assets-dir DIR    Host WAV assets directory (default: bench/android-assets)
   --label NAME        Label for results-android.tsv
   --runs N            Runs per file inside the device harness (default: 3)
-  --threads LIST      Quoted space-separated thread counts (default: "1 2 4 6 8")
+  --threads LIST      Quoted space-separated thread counts (default: "1")
   --remote-dir DIR    Device directory (default: /data/local/tmp/qwen-asr-bench)
   --adb PATH          adb path
   --profile           Enable benchmark kernel profiling counters
   -h, --help          Show this help
 
+Default build matches the best accepted Android baseline: static OpenBLAS from /private/tmp/OpenBLAS, android-blas, -C target-feature=+dotprod, threads=1.
 Set RUSTFLAGS_EXTRA for experiments, e.g. RUSTFLAGS_EXTRA="-C target-cpu=cortex-a76 -C target-feature=+dotprod".
 Set NDK_HOME or NDK_BIN to override the Android NDK. Default NDK is 29.0.14206865 because this install's NDK 30 clang shim drops compiler arguments.
-Set CARGO_FEATURES_EXTRA for opt-in benchmark features, e.g. CARGO_FEATURES_EXTRA="android-blas".
+Set CARGO_FEATURES_EXTRA for opt-in benchmark features (default: android-blas).
 Set BENCH_LANGUAGE to force the benchmark language (default: Auto; empty also disables forcing).
 Set BENCH_PROMPT to bias transcription (default: 音频是粤语，可能夹杂英语; empty disables prompt).
-For Android BLAS, set OPENBLAS_ANDROID_LIB_DIR to the directory containing libopenblas.so or libopenblas.a.
-Set OPENBLAS_ANDROID_STATIC=1 when linking libopenblas.a.
+For Android BLAS, set OPENBLAS_ANDROID_LIB_DIR to the directory containing libopenblas.so or libopenblas.a (default: /private/tmp/OpenBLAS).
+Set OPENBLAS_ANDROID_STATIC=1 when linking libopenblas.a (default: 1).
 If using a shared library, optionally set OPENBLAS_ANDROID_RUNTIME_LIB to the exact .so path to push beside the benchmark binary.
 EOF
     exit 1
@@ -100,6 +101,11 @@ if [[ ! -d "$ASSETS_DIR" ]]; then
     echo "Run: bench/android_prepare_assets.py" >&2
     exit 1
 fi
+if [[ -n "$OPENBLAS_ANDROID_LIB_DIR" && ! -e "$OPENBLAS_ANDROID_LIB_DIR/libopenblas.a" && ! -e "$OPENBLAS_ANDROID_LIB_DIR/libopenblas.so" ]]; then
+    echo "OpenBLAS baseline library not found in: $OPENBLAS_ANDROID_LIB_DIR" >&2
+    echo "Rebuild the accepted baseline with the command in android_experiment/android-autoresearch-program.md, or set OPENBLAS_ANDROID_LIB_DIR to a compatible static ARMV8 USE_THREAD=0 NUM_THREADS=1 build." >&2
+    exit 1
+fi
 
 prepare_device
 trap cleanup_device EXIT
@@ -141,8 +147,16 @@ fi
 "$ADB" push "$ASSETS_DIR/." "$REMOTE_ASSETS" >/dev/null
 "$ADB" shell "rm -rf '$REMOTE_CV' && mkdir -p '$REMOTE_CV' && cp '$REMOTE_ASSETS'/cv_yue_*.wav '$REMOTE_CV'/"
 
+RESULTS_HEADER='timestamp	label	threads	input	model_load_ms	memory_after_model_load_kb	peak_inference_rss_kb	median_inference_ms	median_encode_ms	median_decode_ms	rtf	guardrail_ok	json_path'
 if [[ ! -f "$RESULTS_TSV" ]]; then
-    printf 'timestamp\tlabel\tthreads\tinput\tmedian_inference_ms\tmedian_encode_ms\tmedian_decode_ms\trtf\tguardrail_ok\tjson_path\n' >"$RESULTS_TSV"
+    printf '%s\n' "$RESULTS_HEADER" >"$RESULTS_TSV"
+elif ! head -n 1 "$RESULTS_TSV" | grep -q 'memory_after_model_load_kb'; then
+    tmp_tsv="$(mktemp)"
+    {
+        printf '%s\n' "$RESULTS_HEADER"
+        tail -n +2 "$RESULTS_TSV"
+    } >"$tmp_tsv"
+    mv "$tmp_tsv" "$RESULTS_TSV"
 fi
 
 OUT_DIR="$PROJECT_DIR/bench/android-results/$LABEL"
@@ -179,6 +193,13 @@ import sys
 json_path, results_tsv, timestamp, label, threads, input_name = sys.argv[1:]
 payload = json.load(open(json_path, "r", encoding="utf-8"))
 files = payload["files"]
+model_load_ms = payload.get("model_load_ms", 0.0)
+memory_after_model_load_kb = payload.get("memory_after_model_load_kb", 0)
+peak_inference_rss_kb = max(
+    run.get("peak_rss_kb", 0)
+    for item in files
+    for run in item.get("run_details", [])
+)
 median_infer = statistics.median(item["inference_ms"] for item in files)
 median_encode = statistics.median(item["encode_ms"] for item in files)
 median_decode = statistics.median(item["decode_ms"] for item in files)
@@ -189,6 +210,8 @@ if input_name == "ptt_guardrail":
 with open(results_tsv, "a", encoding="utf-8") as fh:
     fh.write(
         f"{timestamp}\t{label}\t{threads}\t{input_name}\t"
+        f"{model_load_ms:.3f}\t{memory_after_model_load_kb}\t"
+        f"{peak_inference_rss_kb}\t"
         f"{median_infer:.3f}\t{median_encode:.3f}\t{median_decode:.3f}\t"
         f"{median_rtf:.6f}\t{guardrail_ok}\t{json_path}\n"
     )

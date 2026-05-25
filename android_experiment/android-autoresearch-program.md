@@ -12,6 +12,12 @@ transcript quality.
 Primary metric:
 - Median `inference_ms` over the five fixed Common Voice Yue clips.
 
+Secondary metrics:
+- `model_load_ms`: elapsed time inside `QwenCtx::load()`.
+- `memory_after_model_load_kb`: process RSS immediately after model load and
+  prompt/language setup.
+- `peak_rss_kb`: sampled peak process RSS during each inference run.
+
 Guardrails:
 - `ptt_guardrail.wav` transcript must remain exactly:
   `Hello,你好吗？已经坐低咗啦。`
@@ -76,7 +82,7 @@ Android benchmark binary:
 
 ```bash
 PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" \
-bench/android_run.sh --label android-baseline --runs 3 --threads "1 2 4 6 8"
+bench/android_run.sh --label android-baseline --runs 3 --threads "1"
 ```
 
 Standard environment for every run:
@@ -101,8 +107,9 @@ The harness is separate from production JNI code:
 - Source: `crates/qwen-asr-cli/src/bin/bench_android.rs`
 - Target: `aarch64-linux-android`
 - Output JSON fields include setup/model/audio timing, encode/decode timing,
-  median inference timing, RTF, transcript, optimization flags, target arch,
-  per-run details, and optional profiling counters.
+  model-load RSS, sampled inference peak RSS, median inference timing, RTF,
+  transcript, optimization flags, target arch, per-run details, and optional
+  profiling counters.
 
 Prompt/language policy:
 - Match upstream Qwen3-ASR semantics: only append `language {Language}` when a
@@ -118,6 +125,50 @@ Prompt/language policy:
 Canonical results files:
 - Summary TSV: `results-android.tsv`
 - Full JSON: `bench/android-results/<label>/*.json`
+- New TSV rows include `model_load_ms`, `memory_after_model_load_kb`, and
+  `peak_inference_rss_kb`. Older rows may not have these fields.
+
+Best accepted Android baseline so far:
+- `android-baseline-openblas-fixedperf-t1-r3-20260524-215914`
+- Config: OpenBLAS static archive, `android-blas`, `-C target-feature=+dotprod`,
+  engine `threads=1`, fixed-performance mode.
+- `bench/android_run.sh` defaults to this baseline config. Override defaults
+  only for a named experiment.
+- Common Voice median: `1677.491 ms`, encode `383.011 ms`, decode
+  `1305.652 ms`.
+- Result JSON:
+  `bench/android-results/android-baseline-openblas-fixedperf-t1-r3-20260524-215914/common_voice-t1.json`.
+
+Accepted OpenBLAS baseline archive:
+- Expected local path: `/private/tmp/OpenBLAS/libopenblas.a`.
+- Build kind: static Android arm64 OpenBLAS, `TARGET=ARMV8`,
+  `ONLY_CBLAS=1`, `NOFORTRAN=1`, `USE_THREAD=0`, `NUM_THREADS=1`.
+- Rebuild from scratch if the archive is missing:
+
+```bash
+rm -rf /private/tmp/OpenBLAS
+git clone https://github.com/OpenMathLib/OpenBLAS.git /private/tmp/OpenBLAS
+cd /private/tmp/OpenBLAS
+
+make -j10 \
+  TARGET=ARMV8 \
+  OSNAME=Android \
+  BINARY=64 \
+  CC=/Users/tony/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android35-clang \
+  HOSTCC=clang \
+  AR=/Users/tony/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar \
+  RANLIB=/Users/tony/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ranlib \
+  NOFORTRAN=1 \
+  ONLY_CBLAS=1 \
+  USE_THREAD=0 \
+  NUM_THREADS=1
+```
+
+Rejected configs that must not be defaults:
+- Engine thread counts above `1`.
+- OpenBLAS `DYNAMIC_ARCH=1`, `USE_THREAD=1`, `NUM_THREADS=8` dynamic-arch
+  threaded build.
+- NDK-version-only OpenBLAS rebuilds.
 
 ## Thermal Control
 
@@ -252,7 +303,6 @@ PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:
 cargo test --release --test kernels --test audio
 
 PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" \
-RUSTFLAGS_EXTRA="${RUSTFLAGS_EXTRA:-}" \
 bench/android_run.sh \
   --label android-build-smoke \
   --assets-dir /Volumes/SSD/qwen-asr-android-fast-assets \
@@ -271,7 +321,6 @@ Run for every experiment idea that passes Stage 0:
 
 ```bash
 LABEL=android-fast-<idea>-$(date -u +%Y%m%d-%H%M%S)
-RUSTFLAGS_EXTRA="${RUSTFLAGS_EXTRA:-}" \
 bench/android_run.sh \
   --label "$LABEL" \
   --assets-dir /Volumes/SSD/qwen-asr-android-fast-assets \
@@ -295,7 +344,6 @@ Run only for ideas that pass Stage 1:
 
 ```bash
 LABEL=android-candidate-<idea>-$(date -u +%Y%m%d-%H%M%S)
-RUSTFLAGS_EXTRA="${RUSTFLAGS_EXTRA:-}" \
 bench/android_run.sh \
   --label "$LABEL" \
   --assets-dir /Volumes/SSD/qwen-asr-android-candidate-assets \
@@ -320,7 +368,6 @@ Run only for candidates worth keeping:
 
 ```bash
 LABEL=android-accept-<idea>-$(date -u +%Y%m%d-%H%M%S)
-RUSTFLAGS_EXTRA="${RUSTFLAGS_EXTRA:-}" \
 bench/android_run.sh \
   --label "$LABEL" \
   --assets-dir bench/android-assets \
@@ -334,7 +381,8 @@ Inputs:
 
 Decision:
 - Keep only if Common Voice median inference improves by at least 5%, or
-  startup/model load improves by at least 5% without inference regression.
+  startup/model load improves by at least 5%, or memory after model load or
+  peak inference RSS improves by at least 10%, without inference regression.
 - Reject if build/tests fail, guardrail changes, Common Voice CER worsens, or
   median inference regresses.
 
@@ -345,7 +393,6 @@ after an accepted build-feature/kernel change needs a new default thread count:
 
 ```bash
 LABEL=android-thread-sweep-<idea>-$(date -u +%Y%m%d-%H%M%S)
-RUSTFLAGS_EXTRA="${RUSTFLAGS_EXTRA:-}" \
 bench/android_run.sh \
   --label "$LABEL" \
   --assets-dir bench/android-assets \
@@ -372,6 +419,84 @@ Resume source of truth:
   from the first unresolved item in that backlog.
 
 ## Initial Priorities
+
+Rank by expected ROI: impact on Android user experience divided by
+implementation risk and validation cost.
+
+### Q1: Decoder INT8 Sidecar Cache
+
+ROI: very high.
+
+Add an optional generated cache beside the official BF16 model containing the
+existing decoder INT8 payloads and per-row scales. First load creates the cache;
+later loads verify a model hash/schema version and skip BF16-to-INT8
+quantization.
+
+Reason:
+- The current decoder already uses load-time INT8 on `aarch64`, so this reuses
+  proven kernels instead of inventing a model format.
+- Expected win is lower `model_load_ms`, lower temporary load pressure, and
+  smaller app-prepackaged assets if the cache is shipped.
+- Risk is contained because the BF16 model remains the source of truth and
+  cache miss/failure can fall back to current behavior.
+
+Metrics:
+- `model_load_ms`
+- `memory_after_model_load_kb`
+- `peak_rss_kb`
+- unchanged inference latency and transcript quality
+
+### Q2: Decoder INT8 Sidecar Packaging
+
+ROI: high.
+
+Pre-generate the Q1 sidecar on host and push/package it with the Android model
+assets so device cold start does not pay cache creation.
+
+Reason:
+- This tests the product-level question: whether file-level quantization helps
+  Android packaging and first-run startup without breaking upstream model
+  compatibility.
+- It is safer than replacing `model.safetensors` because old deployments and
+  non-`aarch64` paths can ignore the sidecar.
+
+Metrics:
+- model asset bytes on device
+- `model_load_ms`
+- `memory_after_model_load_kb`
+- app/package integration complexity
+
+### Q3: Encoder Weight Quantization Feasibility
+
+ROI: medium.
+
+Prototype quantizing one encoder projection family and benchmark it against the
+current F32/OpenBLAS path.
+
+Reason:
+- Encoder weights are currently expanded to F32 and executed through BLAS-like
+  paths. Quantization could reduce RSS, but may lose OpenBLAS throughput or add
+  dequantization cost.
+- Run this only after Q1/Q2 because it has higher correctness and kernel risk.
+
+Metrics:
+- encoder phase timing
+- `memory_after_model_load_kb`
+- `peak_rss_kb`
+- CER and guardrail stability
+
+### Q4: Whole-Model Quantized File Format
+
+ROI: low until Q1-Q3 prove value.
+
+Design a native quantized model file or GGUF-like export only after the sidecar
+and encoder experiments show measurable Android value.
+
+Reason:
+- A replacement model file introduces schema/versioning, conversion tooling,
+  platform fallback, and accuracy-debug complexity.
+- Current x86 paths and decoder prefill still need BF16/F32-compatible data, so
+  an INT8-only model is not yet a clean runtime contract.
 
 ### A1: Android Build-Feature Tuning
 

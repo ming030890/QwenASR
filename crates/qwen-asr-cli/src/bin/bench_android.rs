@@ -1,5 +1,11 @@
 use qwen_asr::{audio, context::QwenCtx, kernels, transcribe};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread;
+use std::time::Duration;
 use std::time::Instant;
 
 #[derive(Clone)]
@@ -9,6 +15,9 @@ struct RunResult {
     wall_inference_ms: f64,
     encode_ms: f64,
     decode_ms: f64,
+    rss_before_kb: u64,
+    rss_after_kb: u64,
+    peak_rss_kb: u64,
     tokens: i32,
     rtf: f64,
     transcript: String,
@@ -33,6 +42,43 @@ fn json_escape(s: &str) -> String {
 
 fn elapsed_ms(t0: Instant) -> f64 {
     t0.elapsed().as_secs_f64() * 1000.0
+}
+
+fn proc_status_kb(field: &str) -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix(field) {
+            let mut parts = rest.split_whitespace();
+            return parts.next()?.parse().ok();
+        }
+    }
+    None
+}
+
+fn current_rss_kb() -> u64 {
+    proc_status_kb("VmRSS:").unwrap_or(0)
+}
+
+fn peak_rss_during<F, R>(operation: F) -> (R, u64)
+where
+    F: FnOnce() -> R,
+{
+    let running = Arc::new(AtomicBool::new(true));
+    let sampler_running = Arc::clone(&running);
+    let initial_rss = current_rss_kb();
+    let sampler = thread::spawn(move || {
+        let mut peak = initial_rss;
+        while sampler_running.load(Ordering::Relaxed) {
+            peak = peak.max(current_rss_kb());
+            thread::sleep(Duration::from_millis(2));
+        }
+        peak.max(current_rss_kb())
+    });
+
+    let result = operation();
+    running.store(false, Ordering::Relaxed);
+    let peak_rss = sampler.join().unwrap_or(initial_rss);
+    (result, peak_rss)
 }
 
 fn median_by<F>(runs: &[RunResult], value: F) -> f64
@@ -87,7 +133,15 @@ fn collect_wavs(input: &Path) -> Vec<PathBuf> {
     wavs
 }
 
-fn parse_args() -> (String, PathBuf, usize, i32, Option<String>, Option<String>, bool) {
+fn parse_args() -> (
+    String,
+    PathBuf,
+    usize,
+    i32,
+    Option<String>,
+    Option<String>,
+    bool,
+) {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         usage();
@@ -172,12 +226,15 @@ fn run_details_json(runs: &[RunResult]) -> String {
     runs.iter()
         .map(|run| {
             format!(
-                "{{\"run\":{},\"inference_ms\":{:.3},\"wall_inference_ms\":{:.3},\"encode_ms\":{:.3},\"decode_ms\":{:.3},\"tokens\":{},\"rtf\":{:.6},\"transcript\":\"{}\",\"profile\":[{}]}}",
+                "{{\"run\":{},\"inference_ms\":{:.3},\"wall_inference_ms\":{:.3},\"encode_ms\":{:.3},\"decode_ms\":{:.3},\"rss_before_kb\":{},\"rss_after_kb\":{},\"peak_rss_kb\":{},\"tokens\":{},\"rtf\":{:.6},\"transcript\":\"{}\",\"profile\":[{}]}}",
                 run.run,
                 run.inference_ms,
                 run.wall_inference_ms,
                 run.encode_ms,
                 run.decode_ms,
+                run.rss_before_kb,
+                run.rss_after_kb,
+                run.peak_rss_kb,
                 run.tokens,
                 run.rtf,
                 json_escape(&run.transcript),
@@ -227,6 +284,7 @@ fn main() {
     }
     let model_load_ms = elapsed_ms(t0);
     let startup_ms = elapsed_ms(process_start);
+    let memory_after_model_load_kb = current_rss_kb();
 
     let flags = qwen_asr::optimization_flags()
         .iter()
@@ -254,8 +312,11 @@ fn main() {
             if profile {
                 kernels::profile_reset();
             }
+            let rss_before_kb = current_rss_kb();
             let t0 = Instant::now();
-            let transcript = match transcribe::transcribe_audio(&mut ctx, &samples) {
+            let (transcript_result, peak_rss_kb) =
+                peak_rss_during(|| transcribe::transcribe_audio(&mut ctx, &samples));
+            let transcript = match transcript_result {
                 Some(text) => text,
                 None => {
                     eprintln!("transcription failed on {} run {}", audio_path, run);
@@ -263,6 +324,7 @@ fn main() {
                 }
             };
             let wall_inference_ms = elapsed_ms(t0);
+            let rss_after_kb = current_rss_kb();
             let inference_ms = if ctx.perf_total_ms > 0.0 {
                 ctx.perf_total_ms
             } else {
@@ -284,6 +346,9 @@ fn main() {
                 wall_inference_ms,
                 encode_ms: ctx.perf_encode_ms,
                 decode_ms: ctx.perf_decode_ms,
+                rss_before_kb,
+                rss_after_kb,
+                peak_rss_kb,
                 tokens: ctx.perf_text_tokens,
                 rtf,
                 transcript,
@@ -319,7 +384,7 @@ fn main() {
     }
 
     println!(
-        "{{\"model_dir\":\"{}\",\"input\":\"{}\",\"runs\":{},\"threads\":{},\"language\":{},\"prompt\":{},\"setup_ms\":{:.3},\"model_load_ms\":{:.3},\"startup_ms\":{:.3},\"optimization_flags\":[{}],\"target_arch\":\"{}\",\"profile_enabled\":{},\"files\":[{}]}}",
+        "{{\"model_dir\":\"{}\",\"input\":\"{}\",\"runs\":{},\"threads\":{},\"language\":{},\"prompt\":{},\"setup_ms\":{:.3},\"model_load_ms\":{:.3},\"startup_ms\":{:.3},\"memory_after_model_load_kb\":{},\"optimization_flags\":[{}],\"target_arch\":\"{}\",\"profile_enabled\":{},\"files\":[{}]}}",
         json_escape(&model_dir),
         json_escape(&input.to_string_lossy()),
         runs,
@@ -335,6 +400,7 @@ fn main() {
         setup_ms,
         model_load_ms,
         startup_ms,
+        memory_after_model_load_kb,
         flags,
         std::env::consts::ARCH,
         if profile { "true" } else { "false" },

@@ -18,6 +18,9 @@ Current benchmark protocol:
   `cv_yue_003.wav`, `cv_yue_003.txt`, `cv_yue_001.wav`, `cv_yue_001.txt`,
   `ptt_guardrail.wav`, and `ptt_guardrail.txt`.
 - Common Voice metric: median `inference_ms` across five fixed Yue clips.
+- Startup and memory metrics for new runs: `model_load_ms`,
+  `memory_after_model_load_kb`, and per-run `peak_rss_kb` / TSV
+  `peak_inference_rss_kb`.
 - Guardrail: `ptt_guardrail.wav` should remain semantically and phonetically
   stable for `Hello,你好吗？已经坐低咗啦。`; exact punctuation/script can vary
   under Auto language.
@@ -26,7 +29,7 @@ Current benchmark protocol:
   defaulting to English. For Yue benchmark prompts, use concise Simplified
   Chinese context: `BENCH_LANGUAGE=Auto`,
   `BENCH_PROMPT='音频是粤语，可能夹杂英语'`.
-- Standard run: `bench/android_run.sh --runs 3 --threads "1 2 4 6 8"`
+- Standard run: `bench/android_run.sh --runs 3 --threads "1"`
 - Device pre-run setup is now built into `bench/android_run.sh`:
   it wakes the device, enables `svc power stayon true`, enables fixed
   performance mode, then restores fixed performance mode and the original
@@ -61,6 +64,13 @@ Current state summary:
   language prompt policy.
 - Dotprod remains the chosen Android build flag for non-BLAS runs, but OpenBLAS
   is the clear performance path.
+- Best accepted Android baseline so far:
+  `android-baseline-openblas-fixedperf-t1-r3-20260524-215914`, with static
+  OpenBLAS, `android-blas`, `-C target-feature=+dotprod`, fixed-performance
+  mode, and engine `threads=1`.
+- `bench/android_run.sh` now defaults to that best baseline config:
+  `/private/tmp/OpenBLAS`, static link, `android-blas`, dotprod, and
+  `threads=1`.
 - Fixed-performance Android OpenBLAS median is `1677.491 ms`; prompt-correct macOS
   host median is `262.911 ms`, leaving about a `6.38x` Android/macOS gap.
 - The latest OpenBLAS `DYNAMIC_ARCH=1`, `USE_THREAD=1`, `NUM_THREADS=8` run
@@ -94,7 +104,7 @@ file for each completed experiment.
 | C2 | Fixed-performance baseline reached `1677.491 ms`; engine `threads=2` regressed to `92916.558 ms` and empty Common Voice transcripts. | Reject engine thread counts above `1`; keep engine `threads=1`. | [C2 details](android-speed-results/c2-openblas-engine-thread-sweep-fixedperf.md) |
 | C3 | NDK 29 generic `ARMV8` static OpenBLAS reached `1602.726 ms` Common Voice; `DYNAMIC_ARCH=1`, `USE_THREAD=1`, `NUM_THREADS=8`, API 33 reached `2466.708 ms`. Both were slower than the prompt-correct fast baseline. | Reject NDK-version-only and threaded dynamic-arch rebuilds at Stage 1. Stop broad OpenBLAS rebuild guessing until phase-split and shape-level measurements isolate the failure mode. | [C3 details](android-speed-results/c3-openblas-ndk29-armv8-rebuild.md) |
 
-## Current Post-OpenBLAS Performance Plan
+## Current Android Experiment Plan
 
 Use this section as the active backlog, sorted by expected ROI. The current
 fixed-performance Android/OpenBLAS median is `1677.491 ms` versus macOS
@@ -118,6 +128,112 @@ Working hypothesis:
 - Single-token decode matvecs are more likely memory-bandwidth limited, but the
   current timing combines prefill and token loop decode, so this must be
   measured before optimizing decoder kernels.
+
+ROI scoring:
+- `5`: likely large user-visible win, low to moderate implementation risk.
+- `3`: useful diagnostic or medium-size win, moderate risk.
+- `1`: uncertain payoff or high product/format risk.
+
+| Rank | ID | ROI | Experiment | Main metrics |
+| --- | --- | ---: | --- | --- |
+| 1 | Q1 | 5 | Decoder INT8 sidecar cache generated on first load. | `model_load_ms`, `memory_after_model_load_kb`, `peak_inference_rss_kb` |
+| 2 | P0 | 5 | Phase-split benchmark timing. | `mel_ms`, `encoder_ms`, `prefill_ms`, `decode_loop_ms/token` |
+| 3 | Q2 | 4 | Pre-generated decoder INT8 sidecar packaged with Android assets. | asset bytes, `model_load_ms`, RSS |
+| 4 | P1 | 4 | Isolate threaded OpenBLAS runtime settings. | encode/decode split and fast-gate latency |
+| 5 | P3 | 4 | Android SGEMM shape microbench. | per-shape Android/macOS gap |
+| 6 | Q3 | 3 | Encoder weight quantization feasibility probe. | encoder timing, RSS, CER |
+| 7 | P2 | 3 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. | fast-gate and acceptance latency |
+| 8 | P4 | 3 | Decoder token-loop matvec work after phase split. | `decode_loop_ms/token` |
+| 9 | P5 | 2 | Guardrail normalization for Auto language. | experiment velocity, false rejection rate |
+| 10 | Q4 | 1 | Whole-model quantized file format. | package size, startup, fallback complexity |
+
+### Q1: decoder INT8 sidecar cache
+
+Status:
+- Next quantization experiment; run before deeper model-file work.
+
+ROI:
+- 5/5.
+
+Purpose:
+- Persist the decoder INT8 weights and per-row scales that are already produced
+  during `QwenCtx::load()`, then reuse them on later loads when the source model
+  hash and sidecar schema version match.
+
+Why:
+- Current decoder single-token path already uses INT8 on `aarch64`, so the
+  sidecar avoids repeated load-time quantization without changing inference
+  math.
+- It preserves official BF16 safetensors compatibility and gives a clean
+  fallback if the cache is missing, stale, or unsupported.
+
+Decision:
+- Keep if `model_load_ms` improves by at least 5% or
+  `memory_after_model_load_kb`/`peak_inference_rss_kb` improves by at least
+  10%, with no inference regression or transcript drift.
+- Reject if cache validation is brittle, load failures no longer fall back to
+  BF16, or Android cold start gets worse.
+
+### Q2: packaged decoder INT8 sidecar
+
+Status:
+- Run after Q1 only if the generated sidecar validates cleanly.
+
+ROI:
+- 4/5.
+
+Purpose:
+- Generate the decoder INT8 sidecar on the host and package/push it with the
+  Android model assets, so device first load does not pay the sidecar creation
+  cost.
+
+Why:
+- This answers the file-level quantization question while avoiding a hard fork
+  from upstream `model.safetensors`.
+- It measures installed bytes, cold-start behavior, and RSS separately from
+  inference speed.
+
+Decision:
+- Keep only if startup or package/RSS value is clear and the no-sidecar path
+  remains fully compatible.
+
+### Q3: encoder quantization feasibility
+
+Status:
+- Run after Q1/Q2 and P0 phase timing.
+
+ROI:
+- 3/5.
+
+Purpose:
+- Quantize a single high-cost encoder projection family and compare it against
+  the current F32/OpenBLAS path.
+
+Why:
+- Encoder weights are currently loaded as F32 and call BLAS-like kernels.
+  Quantization may reduce memory, but could lose optimized SGEMM throughput or
+  introduce dequantization overhead.
+
+Decision:
+- Promote only if encoder phase timing improves or RSS falls materially without
+  CER/guardrail regression.
+
+### Q4: whole-model quantized file format
+
+Status:
+- Deferred.
+
+ROI:
+- 1/5 until Q1-Q3 show measurable Android value.
+
+Purpose:
+- Design a native quantized model file or GGUF-like export only after sidecar
+  and encoder data justify the format cost.
+
+Why:
+- A replacement model file requires schema/versioning, conversion tooling,
+  architecture fallback, and accuracy-debug paths. Current x86 and prefill
+  paths still expect BF16/F32-compatible data.
 
 Dropped from the active plan:
 - Engine thread sweeps above `threads=1`: C2 showed `threads=2` can produce
