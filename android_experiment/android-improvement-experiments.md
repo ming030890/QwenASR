@@ -11,13 +11,9 @@ Protocol, scripts, thermal control, and acceptance rules:
   is the clear performance path.
 - Best accepted Android baseline, rebuild steps, and latest rerun comparison
   live in [android-best-baseline.md](android-best-baseline.md).
-- M3 A is currently implemented as a memory-prioritized tradeoff despite
-  missing the speed-first Stage 3 acceptance rule: it cuts load RSS to about
-  `508 MB` and peak RSS to about `1.45 GB`, while full Common Voice median
-  regressed `+3.5%` in the controlled benchmark.
-- M4 is accepted on top of M3 A: tied `lm_head` host pre-quantization cuts
-  model load to about `27.5 ms`, load RSS to about `52.7 MB`, and peak RSS to
-  about `1.15 GB`, with full Common Voice median neutral/slightly faster.
+- K4 is accepted: INT8 SDOT packed matmat decoder prefill cuts prefill phase by 20.1%, full Common Voice median inference by 9.1%, model load by 68.3%, load RSS by 67.6%, and peak inference RSS by 33.2%.
+- M3 A remains implemented as a memory-prioritized tradeoff.
+- M4 remains accepted on top of M3 A.
 - Latest rejected OpenBLAS variants are summarized in the completed result
   index below; use linked result logs for detailed numbers.
 - The active work is now bottleneck isolation. Do not resume broad OpenBLAS
@@ -50,6 +46,7 @@ file for each completed experiment.
 | M3 | Transient BF16 encoder weight conversion: tested all encoder projection weights transient, then transformer-layer-only transient with stem/final projections kept F32. Stage 3 reached `507756-558156 KB` load RSS and `149.5-185.6 ms` model load, but full Common Voice median regressed `+3.5-3.7%`. | Implement M3 A as a memory-prioritized tradeoff. It misses the speed-first `+2%` inference regression limit, but saves the most RSS and may improve low-memory robustness. | [M3 details](android-speed-results/m3-transient-bf16-encoder.md) |
 | M4 | Tied `lm_head` host-side pre-quantization: emits an I8 mmap-backed `thinker.lm_head.weight` while keeping BF16 token embeddings for lookup. Stage 3 reached `27.5 ms` model load, `52700 KB` load RSS, `1147644 KB` peak RSS, and `1771.6 ms` full Common Voice median. | Accept. Meets model-load, load-RSS, and peak-RSS thresholds with neutral/slightly faster full Common Voice median versus M3 A. | [M4 details](android-speed-results/m4-tied-lm-head-int8.md) |
 | P0 | Phase-split benchmark timing: bench_android JSON now emits `mel_ms`, `encoder_ms`, `prefill_ms`, `decode_loop_ms`, `decode_loop_ms_per_token`, and `median_tokens` per file/run. Fast-gate cv_yue_003 split: mel `3.3` / encoder `403.9` / prefill `893.2` / decode_loop `371.9` ms over `7` tokens (`53.1` ms/token), total `1672.5` ms — neutral vs `1677.5` baseline. | Accept as infrastructure. Confirms prefill (`70%` of decode_ms) is the largest decode-side slice, not the autoregressive token loop. | [P0 details](android-speed-results/p0-phase-split-benchmark-timing.md) |
+| K4 | INT8 SDOT packed matmat for decoder prefill: replace F32 dequantization path with dynamic activation quantization and multithreaded SDOT matmatmul. Stage 3 reached `128.1 ms` model load, `508024 KB` load RSS, `1426984 KB` peak RSS, and `1565.8 ms` full Common Voice median. | Accept. Achieves a `9.1%` speedup in Common Voice inference, a `20.1%` speedup in prefill phase, a `68.3%` startup speedup, and massive memory savings (`67.6%` lower startup RSS and `33.2%` lower peak RSS). | [K4 details](android-speed-results/k4-int8-prefill-sdot.md) |
 
 ## Current Android Experiment Plan
 
@@ -135,16 +132,15 @@ Gate scripts: `bench/android_run.py` (collect numbers, waits for thermal interna
 
 | Rank | ID | ROI | Experiment | Main metrics |
 | --- | --- | ---: | --- | --- |
-| 1 | K4 | 5 | INT8 SDOT packed matmat for decoder prefill — reuse the already-on-disk INT8 weights and the validated SDOT decode-loop path, skip dequant + OpenBLAS SGEMM. | `prefill_ms`, total inference |
-| 2 | K1 | 5 | NEON `BFDOT`/`BFMMLA` BF16 matvec/matmul kernel for the bf16_matvec encoder hotpath. | `bf16_matvec` profile share, `encoder_ms` |
-| 3 | K3 | 4 | True packed BF16 GEMM (BFMMLA) for encoder (replace bf16_matvec-in-a-loop). Pairs with K1. | `encoder_ms`, sgemm share |
-| 4 | P3 | 3 | Android SGEMM/INT8/BF16 shape microbench across candidate kernels (K1/K3/K4 vs OpenBLAS vs KleidiAI). | per-shape Android/macOS gap |
-| 5 | P1 | 3 | Isolate threaded OpenBLAS runtime settings. | `encoder_ms`/`prefill_ms` split, fast-gate latency |
-| 6 | K2 | 3 | KleidiAI (Arm) GEMM library probe for top shapes from P3. | per-shape latency vs OpenBLAS/K1/K4 |
-| 7 | E1 | 3 | Encoder INT8 weights + native INT8 GEMM kernel (replaces Q3). Now lower priority than K1 since K1 directly attacks encoder bf16_matvec without changing format. | `encoder_ms`, RSS, CER |
-| 8 | P4 | 2 | Decoder token-loop matvec work — demoted by P0: token loop is only ~22% of total inference and Android/macOS ratio is already 3.3x (close to hardware). | `decode_loop_ms_per_token` |
-| 9 | C1K | 2 | Replace `conv2d_op` with im2col+GEMM through the K1/K3 path. | `conv2d_op` profile share, `encoder_ms` |
-| 10 | P2 | 1 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. K4 sidesteps OpenBLAS for the biggest phase, so this matters less than before. | fast-gate and acceptance latency |
+| 1 | K1 | 5 | NEON `BFDOT`/`BFMMLA` BF16 matvec/matmul kernel for the bf16_matvec encoder hotpath. | `bf16_matvec` profile share, `encoder_ms` |
+| 2 | K3 | 4 | True packed BF16 GEMM (BFMMLA) for encoder (replace bf16_matvec-in-a-loop). Pairs with K1. | `encoder_ms`, sgemm share |
+| 3 | P3 | 3 | Android SGEMM/INT8/BF16 shape microbench across candidate kernels (K1/K3 vs OpenBLAS vs KleidiAI). | per-shape Android/macOS gap |
+| 4 | P1 | 3 | Isolate threaded OpenBLAS runtime settings. | `encoder_ms`/`prefill_ms` split, fast-gate latency |
+| 5 | K2 | 3 | KleidiAI (Arm) GEMM library probe for top shapes from P3. | per-shape latency vs OpenBLAS/K1 |
+| 6 | E1 | 3 | Encoder INT8 weights + native INT8 GEMM kernel (replaces Q3). Now lower priority than K1 since K1 directly attacks encoder bf16_matvec without changing format. | `encoder_ms`, RSS, CER |
+| 7 | P4 | 2 | Decoder token-loop matvec work — demoted by P0: token loop is only ~22% of total inference and Android/macOS ratio is already 3.3x (close to hardware). | `decode_loop_ms_per_token` |
+| 8 | C1K | 2 | Replace `conv2d_op` with im2col+GEMM through the K1/K3 path. | `conv2d_op` profile share, `encoder_ms` |
+| 9 | P2 | 1 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. K4 sidesteps OpenBLAS for the biggest phase, so this matters less than before. | fast-gate and acceptance latency |
 
 Removed from backlog:
 - **Q3** — reformulated as E1 (the probe form was too loose; we need a real INT8

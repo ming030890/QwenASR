@@ -141,6 +141,7 @@ fn load_i8_mmap(ms: &MultiSafetensors, name: &str) -> Option<Int8Buf> {
     }
 }
 
+#[allow(dead_code)]
 fn dequantize_int8_to_f32_scratch<'a>(
     int8: &[i8],
     scales: &[f32],
@@ -623,6 +624,10 @@ pub struct DecoderBuffers {
 
     // Reusable scratch for BF16→F32 conversion in prefill path
     pub bf16_scratch: Vec<f32>,
+
+    // Reusable scratch for INT8 activation quantization in prefill path
+    pub pref_x_int8: Vec<i8>,
+    pub pref_x_scales: Vec<f32>,
 }
 
 impl DecoderBuffers {
@@ -657,6 +662,8 @@ impl DecoderBuffers {
             pref_gate: Vec::new(),
             pref_seq_cap: 0,
             bf16_scratch: vec![0.0f32; max_weight],
+            pref_x_int8: Vec::new(),
+            pref_x_scales: Vec::new(),
         }
     }
 
@@ -689,6 +696,11 @@ impl DecoderBuffers {
         self.pref_ffn_out.resize(new_cap * dim, 0.0);
         self.pref_gate_up.resize(new_cap * 2 * intermediate, 0.0);
         self.pref_gate.resize(new_cap * intermediate, 0.0);
+        
+        let max_in_dim = dim.max(intermediate).max(q_dim);
+        self.pref_x_int8.resize(new_cap * max_in_dim, 0);
+        self.pref_x_scales.resize(new_cap, 0.0);
+        
         self.pref_seq_cap = new_cap;
     }
 }
@@ -747,30 +759,69 @@ pub fn decoder_prefill(
         let v = &mut bufs.pref_v[..seq_len * kv_dim];
 
         if layer.wq_weight_f32_prefill.is_empty() {
-            let wq = dequantize_int8_to_f32_scratch(
-                &layer.wq_int8,
-                &layer.wq_int8_scales,
-                q_dim,
-                dim,
-                &mut bufs.bf16_scratch,
-            );
-            kernels::linear_nobias(q, x_norm, wq, seq_len, dim, q_dim);
-            let wk = dequantize_int8_to_f32_scratch(
-                &layer.wk_int8,
-                &layer.wk_int8_scales,
-                kv_dim,
-                dim,
-                &mut bufs.bf16_scratch,
-            );
-            kernels::linear_nobias(k, x_norm, wk, seq_len, dim, kv_dim);
-            let wv = dequantize_int8_to_f32_scratch(
-                &layer.wv_int8,
-                &layer.wv_int8_scales,
-                kv_dim,
-                dim,
-                &mut bufs.bf16_scratch,
-            );
-            kernels::linear_nobias(v, x_norm, wv, seq_len, dim, kv_dim);
+            #[cfg(target_arch = "aarch64")]
+            {
+                kernels::linear_nobias_int8_matmat(
+                    q,
+                    x_norm,
+                    &layer.wq_int8,
+                    &layer.wq_int8_scales,
+                    seq_len,
+                    dim,
+                    q_dim,
+                    &mut bufs.pref_x_int8,
+                    &mut bufs.pref_x_scales,
+                );
+                kernels::linear_nobias_int8_matmat(
+                    k,
+                    x_norm,
+                    &layer.wk_int8,
+                    &layer.wk_int8_scales,
+                    seq_len,
+                    dim,
+                    kv_dim,
+                    &mut bufs.pref_x_int8,
+                    &mut bufs.pref_x_scales,
+                );
+                kernels::linear_nobias_int8_matmat(
+                    v,
+                    x_norm,
+                    &layer.wv_int8,
+                    &layer.wv_int8_scales,
+                    seq_len,
+                    dim,
+                    kv_dim,
+                    &mut bufs.pref_x_int8,
+                    &mut bufs.pref_x_scales,
+                );
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let wq = dequantize_int8_to_f32_scratch(
+                    &layer.wq_int8,
+                    &layer.wq_int8_scales,
+                    q_dim,
+                    dim,
+                    &mut bufs.bf16_scratch,
+                );
+                kernels::linear_nobias(q, x_norm, wq, seq_len, dim, q_dim);
+                let wk = dequantize_int8_to_f32_scratch(
+                    &layer.wk_int8,
+                    &layer.wk_int8_scales,
+                    kv_dim,
+                    dim,
+                    &mut bufs.bf16_scratch,
+                );
+                kernels::linear_nobias(k, x_norm, wk, seq_len, dim, kv_dim);
+                let wv = dequantize_int8_to_f32_scratch(
+                    &layer.wv_int8,
+                    &layer.wv_int8_scales,
+                    kv_dim,
+                    dim,
+                    &mut bufs.bf16_scratch,
+                );
+                kernels::linear_nobias(v, x_norm, wv, seq_len, dim, kv_dim);
+            }
         } else {
             kernels::linear_nobias(q, x_norm, &layer.wq_weight_f32_prefill, seq_len, dim, q_dim);
             kernels::linear_nobias(
@@ -834,14 +885,31 @@ pub fn decoder_prefill(
 
         let proj_out = &mut bufs.pref_proj_out[..seq_len * dim];
         if layer.wo_weight_f32_prefill.is_empty() {
-            let wo = dequantize_int8_to_f32_scratch(
-                &layer.wo_int8,
-                &layer.wo_int8_scales,
-                dim,
-                q_dim,
-                &mut bufs.bf16_scratch,
-            );
-            kernels::linear_nobias(proj_out, attn_out, wo, seq_len, q_dim, dim);
+            #[cfg(target_arch = "aarch64")]
+            {
+                kernels::linear_nobias_int8_matmat(
+                    proj_out,
+                    attn_out,
+                    &layer.wo_int8,
+                    &layer.wo_int8_scales,
+                    seq_len,
+                    q_dim,
+                    dim,
+                    &mut bufs.pref_x_int8,
+                    &mut bufs.pref_x_scales,
+                );
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let wo = dequantize_int8_to_f32_scratch(
+                    &layer.wo_int8,
+                    &layer.wo_int8_scales,
+                    dim,
+                    q_dim,
+                    &mut bufs.bf16_scratch,
+                );
+                kernels::linear_nobias(proj_out, attn_out, wo, seq_len, q_dim, dim);
+            }
         } else {
             kernels::linear_nobias(
                 proj_out,
@@ -867,21 +935,38 @@ pub fn decoder_prefill(
 
         let gate_up = &mut bufs.pref_gate_up[..seq_len * 2 * intermediate];
         if layer.gate_up_fused_f32_prefill.is_empty() {
-            let gate_up_weight = dequantize_int8_to_f32_scratch(
-                &layer.gate_up_int8,
-                &layer.gate_up_int8_scales,
-                2 * intermediate,
-                dim,
-                &mut bufs.bf16_scratch,
-            );
-            kernels::linear_nobias(
-                gate_up,
-                x_norm2,
-                gate_up_weight,
-                seq_len,
-                dim,
-                2 * intermediate,
-            );
+            #[cfg(target_arch = "aarch64")]
+            {
+                kernels::linear_nobias_int8_matmat(
+                    gate_up,
+                    x_norm2,
+                    &layer.gate_up_int8,
+                    &layer.gate_up_int8_scales,
+                    seq_len,
+                    dim,
+                    2 * intermediate,
+                    &mut bufs.pref_x_int8,
+                    &mut bufs.pref_x_scales,
+                );
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let gate_up_weight = dequantize_int8_to_f32_scratch(
+                    &layer.gate_up_int8,
+                    &layer.gate_up_int8_scales,
+                    2 * intermediate,
+                    dim,
+                    &mut bufs.bf16_scratch,
+                );
+                kernels::linear_nobias(
+                    gate_up,
+                    x_norm2,
+                    gate_up_weight,
+                    seq_len,
+                    dim,
+                    2 * intermediate,
+                );
+            }
         } else {
             kernels::linear_nobias(
                 gate_up,
@@ -898,14 +983,31 @@ pub fn decoder_prefill(
 
         let ffn_out = &mut bufs.pref_ffn_out[..seq_len * dim];
         if layer.down_weight_f32_prefill.is_empty() {
-            let down = dequantize_int8_to_f32_scratch(
-                &layer.down_int8,
-                &layer.down_int8_scales,
-                dim,
-                intermediate,
-                &mut bufs.bf16_scratch,
-            );
-            kernels::linear_nobias(ffn_out, gate, down, seq_len, intermediate, dim);
+            #[cfg(target_arch = "aarch64")]
+            {
+                kernels::linear_nobias_int8_matmat(
+                    ffn_out,
+                    gate,
+                    &layer.down_int8,
+                    &layer.down_int8_scales,
+                    seq_len,
+                    intermediate,
+                    dim,
+                    &mut bufs.pref_x_int8,
+                    &mut bufs.pref_x_scales,
+                );
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let down = dequantize_int8_to_f32_scratch(
+                    &layer.down_int8,
+                    &layer.down_int8_scales,
+                    dim,
+                    intermediate,
+                    &mut bufs.bf16_scratch,
+                );
+                kernels::linear_nobias(ffn_out, gate, down, seq_len, intermediate, dim);
+            }
         } else {
             kernels::linear_nobias(
                 ffn_out,
