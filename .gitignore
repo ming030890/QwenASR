@@ -1,22 +1,42 @@
+# macOS
 .DS_Store
+**/.DS_Store
+
+# Rust build output
 /target
-/qwen3-asr-0.6b
-/bench/results/
-/bench/compare-results/
+/flutter/qwen_asr/rust/target
+
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.egg-info/
+**/.venv*/
 /bench/.venv-bench/
 /bench/.venv-mlx-audio/
-/bench/__pycache__/
-/tmp/qwen3_asr_rs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Model directories (large, not in repo)
+/qwen3-asr-0.6b
+/qwen3-aligner-0.6b
+
+# Bench scratch
+/bench/results/
+/bench/compare-results/
 /bench/run_mlx_audio.py
 /bench/generate_unified_charts.py
-/qwen3-aligner-0.6b
+/tmp/qwen3_asr_rs/
 /tmp/
+
+# Librispeech — keep only scripts and readme
 /librispeech-wer-bench/*
 !/librispeech-wer-bench/librispeech_wer.py
 !/librispeech-wer-bench/run_wer_range.py
 !/librispeech-wer-bench/README.md
-
-/flutter/qwen_asr/rust/target
 
 # Flutter / FRB generated files
 /flutter/qwen_asr/rust/src/frb_generated.rs
