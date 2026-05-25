@@ -63,8 +63,16 @@ Current state summary:
   is the clear performance path.
 - Fixed-performance Android OpenBLAS median is `1677.491 ms`; prompt-correct macOS
   host median is `262.911 ms`, leaving about a `6.38x` Android/macOS gap.
-- The active work is now post-OpenBLAS profiling and tuning, not no-BLAS scalar
-  fallback work.
+- The latest OpenBLAS `DYNAMIC_ARCH=1`, `USE_THREAD=1`, `NUM_THREADS=8` run
+  regressed badly. On `cv_yue_003`, inference moved from `1481.111 ms`
+  baseline to `2466.708 ms`; encode moved from `292.986 ms` to `881.855 ms`,
+  while decode moved from `1188.245 ms` to `1393.140 ms`.
+- The latest regression is mostly encoder/BLAS-side. Treat it as an OpenBLAS
+  configuration failure, not evidence that the model has hit a global memory
+  bandwidth limit.
+- The active work is now bottleneck isolation. Do not resume broad OpenBLAS
+  rebuild guessing until phase-split profiling and shape-level SGEMM data point
+  to a specific target.
 
 ## Completed Result Index
 
@@ -82,9 +90,9 @@ file for each completed experiment.
 | B1 | Fast gate found dotprod neutral/slightly slower on one clip but faster on guardrail, with exact transcript. | Promote to B2 instead of rejecting. | [B1 details](android-speed-results/b1-clean-fast-gate-baseline-vs-dotprod.md) |
 | B2 | Candidate gate found dotprod `7.8%` faster; acceptance follow-up confirmed `8.66%` speedup. | Dotprod passes acceptance. | [B2 details](android-speed-results/b2-candidate-gate-baseline-vs-dotprod.md) |
 | B11 | Android OpenBLAS static reduced prompt-correct median to `1789.114 ms`, about `14.96x` faster than old Android dotprod/no-BLAS and `6.81x` slower than macOS. | OpenBLAS is the Android performance path; continue with post-OpenBLAS plan. | [B11 details](android-speed-results/b11-android-openblas-static-benchmark-arm.md) |
-| C1 | Profiled corrected Android/OpenBLAS static build: `sgemm` was about `62-66%` of profiled time, followed by `bf16_matvec` at about `20-24%`. | Run C2 OpenBLAS/thread sweep next; keep static OpenBLAS as primary Android packaging path. | [C1 details](android-speed-results/c1-profile-corrected-openblas-build.md) |
-| C2 | Fixed-performance baseline reached `1677.491 ms`; engine `threads=2` regressed to `92916.558 ms` and empty Common Voice transcripts. | Reject engine thread counts above `1`; keep `threads=1` and move to C3 OpenBLAS rebuild tuning. | [C2 details](android-speed-results/c2-openblas-engine-thread-sweep-fixedperf.md) |
-| C3 | NDK 29 generic `ARMV8` static OpenBLAS reached `1602.726 ms` Common Voice; `DYNAMIC_ARCH=1`, `USE_THREAD=1`, `NUM_THREADS=8`, API 33 reached `2466.708 ms`. Both were slower than the prompt-correct fast baseline. | Reject NDK-version-only and threaded dynamic-arch rebuilds at Stage 1; next isolate `DYNAMIC_ARCH=1` with single-threaded OpenBLAS. | [C3 details](android-speed-results/c3-openblas-ndk29-armv8-rebuild.md) |
+| C1 | Profiled corrected Android/OpenBLAS static build: `sgemm` was about `62-66%` of profiled time, followed by `bf16_matvec` at about `20-24%`. | Keep as coarse profile evidence only; current work needs phase-split attribution before choosing kernels. | [C1 details](android-speed-results/c1-profile-corrected-openblas-build.md) |
+| C2 | Fixed-performance baseline reached `1677.491 ms`; engine `threads=2` regressed to `92916.558 ms` and empty Common Voice transcripts. | Reject engine thread counts above `1`; keep engine `threads=1`. | [C2 details](android-speed-results/c2-openblas-engine-thread-sweep-fixedperf.md) |
+| C3 | NDK 29 generic `ARMV8` static OpenBLAS reached `1602.726 ms` Common Voice; `DYNAMIC_ARCH=1`, `USE_THREAD=1`, `NUM_THREADS=8`, API 33 reached `2466.708 ms`. Both were slower than the prompt-correct fast baseline. | Reject NDK-version-only and threaded dynamic-arch rebuilds at Stage 1. Stop broad OpenBLAS rebuild guessing until phase-split and shape-level measurements isolate the failure mode. | [C3 details](android-speed-results/c3-openblas-ndk29-armv8-rebuild.md) |
 
 ## Current Post-OpenBLAS Performance Plan
 
@@ -94,178 +102,172 @@ fixed-performance Android/OpenBLAS median is `1677.491 ms` versus macOS
 encode `383.011 ms` versus macOS `39.634 ms`, and Android decode `1305.652 ms`
 versus macOS `224.362 ms`.
 
-C1 changed the shape of the plan: the corrected static OpenBLAS profile is
-dominated by `sgemm` (`62-66%` of profiled time), followed by `bf16_matvec`
-(`20-24%`), then `conv2d_op` (`7-10%`) and causal attention (`3-5%`). Treat
-static OpenBLAS as the primary Android packaging path unless a later packaging
-constraint forces a shared-library comparison.
+C1 says the corrected static OpenBLAS profile is dominated by `sgemm`
+(`62-66%` of profiled time), followed by `bf16_matvec` (`20-24%`),
+`conv2d_op` (`7-10%`), and causal attention (`3-5%`). That aggregate is not
+phase-split: `sgemm` mixes encoder, decoder prefill, and any sequence-length
+greater-than-one paths. Do not treat the current profile as proof that the
+whole pipeline is memory-bound.
+
+Working hypothesis:
+- The latest C3 regression is OpenBLAS configuration overhead, especially
+  internal threading and/or dynamic-arch dispatch, because encode regressed far
+  more than decode on the same fast-gate clip.
+- Encoder and prefill SGEMM are probably kernel-shape/threading limited on
+  Android's small and skinny matrices.
+- Single-token decode matvecs are more likely memory-bandwidth limited, but the
+  current timing combines prefill and token loop decode, so this must be
+  measured before optimizing decoder kernels.
 
 Dropped from the active plan:
+- Engine thread sweeps above `threads=1`: C2 showed `threads=2` can produce
+  pathological decode latency and empty transcripts; keep engine `threads=1`.
+- More NDK-version-only OpenBLAS rebuilds: C3 showed this does not move the
+  needle.
+- OpenBLAS internal threading as a default path: the threaded dynamic-arch
+  archive regressed badly. Revisit only if a phase/shape microbench shows a
+  large single BLAS call that can amortize thread overhead.
 - Prompt-length tuning: useful for quality policy, but unlikely to close a large
   runtime gap now that the intended prompt is fixed.
 - CPU affinity/core-placement policy: can improve a benchmark, but is hard to
-  ship reliably and should only be revisited if normal thread tuning leaves an
-  unexplained gap.
+  ship reliably. Revisit only after algorithmic and kernel bottlenecks are
+  understood.
 - Shared versus static OpenBLAS comparison: static is already the benchmarked
   path and is closer to the intended single native Android artifact. Revisit
-  only for binary-size or packaging reasons, not as a near-term speed bet.
-- Decoder INT8-specific kernels such as `linear_nobias_int8_qkv`,
-  `linear_nobias_int8_swiglu`, `linear_nobias_int8_addto`, and
-  `argmax_int8_range`: they did not appear as top C1 counters. Revisit only if
-  more detailed profiling shows one of them hidden inside the large decode
-  bucket after BLAS and BF16 matvec work.
+  only for binary-size or packaging reasons.
 
-### C2: current static OpenBLAS thread sweep
+### P0: phase-split benchmark timing
 
 Status:
-- Rejected. Engine-level `threads=2` caused a massive decode regression and
-  empty transcripts on the candidate gate. Keep `threads=1`.
-
-ROI:
-- Highest active item. It is the cheapest way to learn whether the current
-  static, single-threaded OpenBLAS build has a better production setting through
-  the engine's existing thread policy. Previous accepted OpenBLAS data is only
-  `threads=1`, while C1 shows most measured time is in `sgemm`.
+- Next.
 
 Purpose:
-- Find the best `kernels::set_threads(...)` value for the current static
-  OpenBLAS build before spending time rebuilding BLAS.
-- Use staged gates: candidate subset first, then full five-clip acceptance only
-  if a non-1 thread count looks meaningfully better and transcript quality is
+- Split the current coarse `encode_ms` and `decode_ms` into actionable buckets:
+  `mel_ms`, `encoder_ms`, `prefill_ms`, `decode_loop_ms`,
+  generated token count, and `decode_loop_ms/token`.
+
+Why:
+- The current `decode_ms` includes decoder prefill plus autoregressive token
+  generation. Optimizing decoder matvecs before separating those phases risks
+  chasing the wrong part of the runtime.
+- The current profile counters are operation-level, not phase-level. `sgemm`
+  needs to be attributed to mel, encoder, or prefill before choosing a kernel
+  experiment.
+
+Decision:
+- Do not start another OpenBLAS build variant until this timing split exists and
+  a profile run records the phase-level breakdown on the fast assets.
+
+### P1: isolate threaded OpenBLAS runtime settings
+
+Status:
+- Run after P0, using the existing rejected threaded dynamic-arch archive.
+
+Purpose:
+- Determine whether the latest C3 regression is caused by OpenBLAS internal
+  threading or by dynamic architecture/kernel selection itself.
+
+Command shape:
+
+First add or use a benchmark harness passthrough that prefixes the device-side
+command with runtime environment variables. Host-side exports alone do not
+reach `adb shell`.
+
+```bash
+OPENBLAS_ANDROID_LIB_DIR=/private/tmp/OpenBLAS-v0.3.33-dynarch-thread8 \
+OPENBLAS_ANDROID_STATIC=1 \
+BENCH_REMOTE_ENV="OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1" \
+CARGO_FEATURES_EXTRA=android-blas \
+RUSTFLAGS_EXTRA="-C target-feature=+dotprod" \
+BENCH_LANGUAGE=Auto \
+BENCH_PROMPT="音频是粤语，可能夹杂英语" \
+bench/android_run.sh \
+  --label android-fast-openblas-v0333-dynarch-thread8-forced1-$(date -u +%Y%m%d-%H%M%S) \
+  --assets-dir /Volumes/SSD/qwen-asr-android-fast-assets \
+  --threads "1" \
+  --runs 1 \
+  --profile
+```
+
+Decision:
+- If forced single-thread runtime mostly recovers `cv_yue_003` encode from
+  `881.855 ms` toward the `292.986 ms` baseline, the failure mode is internal
+  OpenBLAS threading. Drop threaded OpenBLAS from speed work.
+- If it remains slow, dynamic-arch dispatch or selected kernels are suspect.
+
+### P2: dynamic-arch single-thread build only if needed
+
+Status:
+- Conditional.
+
+Purpose:
+- Isolate `DYNAMIC_ARCH=1` from OpenBLAS internal threading only if P1 does not
+  already prove threading is the failure mode.
+
+Build shape:
+- `TARGET=ARMV8`
+- `DYNAMIC_ARCH=1`
+- `USE_THREAD=0`
+- `NUM_THREADS=1`
+- `ONLY_CBLAS=1`
+- Android API `33` or the current benchmark default API
+
+Decision:
+- Keep only if it improves the prompt-correct fast gate and then the full
+  acceptance gate. Otherwise stop OpenBLAS build-variant work and move to P3.
+
+### P3: Android SGEMM shape microbench
+
+Status:
+- Next after P1/P2, or immediately after P0 if P1 confirms threading overhead.
+
+Purpose:
+- Benchmark the actual SGEMM shapes used by this pipeline on Android for each
+  candidate OpenBLAS archive.
+
+Shapes to include:
+- mel DFT and mel filter matrix multiplies
+- encoder convolution projection
+- encoder attention Q/K/V/O and FFN projections
+- decoder prefill Q/K/V/O and FFN projections
+
+Decision:
+- If one or two skinny shapes dominate the gap, build a targeted custom kernel
+  or packing path for those shapes.
+- If OpenBLAS is broadly slow across all important shapes, keep the best known
+  static archive and move optimization effort to reducing calls, fusing adjacent
+  work, or changing data layout.
+
+### P4: decoder token-loop matvec work
+
+Status:
+- Blocked on P0 phase timing.
+
+Purpose:
+- Optimize only if `decode_loop_ms/token` is a large share after prefill is
+  separated.
+
+Likely targets:
+- INT8 QKV, O, SwiGLU, down-projection, and lm_head argmax throughput.
+- Weight layout and packing for single-token matvec locality.
+- Reducing generated tokens or prompt/prefix work only if quality remains
   stable.
 
-Stage 1 command:
-
-```bash
-OPENBLAS_ANDROID_LIB_DIR=/private/tmp/OpenBLAS \
-OPENBLAS_ANDROID_STATIC=1 \
-CARGO_FEATURES_EXTRA=android-blas \
-RUSTFLAGS_EXTRA="-C target-feature=+dotprod" \
-BENCH_LANGUAGE=Auto \
-BENCH_PROMPT="音频是粤语，可能夹杂英语" \
-bench/android_run.sh \
-  --label android-candidate-thread-sweep-openblas-auto-zhprompt-$(date -u +%Y%m%d-%H%M%S) \
-  --assets-dir /Volumes/SSD/qwen-asr-android-candidate-assets \
-  --threads "1 2 4 6 8" \
-  --runs 1
-```
-
-Acceptance command, only if Stage 1 justifies it:
-
-```bash
-OPENBLAS_ANDROID_LIB_DIR=/private/tmp/OpenBLAS \
-OPENBLAS_ANDROID_STATIC=1 \
-CARGO_FEATURES_EXTRA=android-blas \
-RUSTFLAGS_EXTRA="-C target-feature=+dotprod" \
-BENCH_LANGUAGE=Auto \
-BENCH_PROMPT="音频是粤语，可能夹杂英语" \
-bench/android_run.sh \
-  --label android-thread-sweep-openblas-auto-zhprompt-$(date -u +%Y%m%d-%H%M%S) \
-  --assets-dir bench/android-assets \
-  --threads "1 2 4 6 8" \
-  --runs 3
-```
-
 Decision:
-- Keep the fastest stable thread count that improves full five-clip median
-  inference and does not regress transcript quality.
-- If more threads only improve guardrail or one clip, keep `threads=1` and move
-  to C3.
-- If thermal status changes or later thread counts start warmer, rerun only the
-  promising counts after cooldown before changing the default.
+- Promote only if phase timing shows the token loop, not prefill, dominates the
+  remaining decode cost and the candidate gate improves without transcript
+  drift.
 
-### C3: OpenBLAS static rebuild tuning
+### P5: guardrail normalization for Auto language
 
 Status:
-- In progress. The NDK 29 generic `ARMV8`, `USE_THREAD=0`, `NUM_THREADS=1`
-  rebuild was rejected at Stage 1 because it was slower than the comparable
-  prompt-correct fast-gate baseline. The `DYNAMIC_ARCH=1`, `USE_THREAD=1`,
-  `NUM_THREADS=8`, API 33 follow-up was also rejected because it was much
-  slower on the fast Common Voice clip. Next C3 step is `TARGET=ARMV8`,
-  `DYNAMIC_ARCH=1`, `USE_THREAD=0`, `NUM_THREADS=1`, so dynamic arch can be
-  separated from OpenBLAS internal threading.
-
-ROI:
-- High. C1 says `sgemm` is the largest measured bucket, and the current static
-  library was a first working generic `ARMV8`, `USE_THREAD=0`, `NUM_THREADS=1`
-  build. A better static OpenBLAS build can attack the largest bucket while
-  preserving the intended Android packaging shape.
-
-Purpose:
-- Improve the static OpenBLAS archive used by Android without changing model
-  behavior or introducing a runtime `.so` dependency.
-
-Experiments, in this order:
-- Done/rejected: rebuild static OpenBLAS with NDK 29 and confirm the selected
-  AArch64 kernels in the build log. Keep `ONLY_CBLAS=1`, `NOFORTRAN=1`, and
-  static output.
-- Done/rejected: rebuild OpenBLAS `v0.3.33` with `DYNAMIC_ARCH=1`,
-  `USE_THREAD=1`, `NUM_THREADS=8`, `ONLY_CBLAS=1`, and Android API 33. It was
-  `60.67%` slower than the prompt-correct fast-gate baseline on Common Voice.
-- Next: rebuild OpenBLAS `v0.3.33` with `TARGET=ARMV8`, `DYNAMIC_ARCH=1`,
-  `USE_THREAD=0`, `NUM_THREADS=1`, `ONLY_CBLAS=1`, and Android API 33. Benchmark
-  it with the same fast gate to isolate dynamic-arch dispatch from OpenBLAS
-  internal threading.
-- Check whether OpenBLAS has a better ARMv8/AArch64 target for Pixel 9 than
-  generic `TARGET=ARMV8`; benchmark any candidate with the same C2 Stage 1 gate.
-- Do not continue OpenBLAS internal threading unless the single-threaded
-  dynamic-arch result is promising or a later profile shows a clear single large
-  BLAS call that can amortize its overhead.
-
-Decision:
-- Keep a rebuilt library only if it improves prompt-correct median inference on
-  the acceptance gate and still links statically into the Android benchmark.
-- If OpenBLAS internal threading is tested, compare it against the best C2
-  external-thread setting, not only against `threads=1`.
-
-### C4: BF16 matvec microkernel
-
-ROI:
-- Medium-high after C2/C3. C1 consistently shows `bf16_matvec` as the second
-  largest measured bucket (`20-24%`), so it is the most relevant non-BLAS
-  kernel target.
-
-Purpose:
-- Optimize the custom BF16 matvec paths that BLAS does not cover, especially in
-  decode.
-
-Likely work:
-- Inspect `bf16_matvec` implementation and add a focused host microbenchmark if
-  one does not exist.
-- Tune NEON/dotprod-friendly BF16 conversion and accumulation paths one narrow
-  change at a time.
-- Gate every change through candidate assets before acceptance because this
-  path touches decode-heavy user-visible transcription.
-
-Decision:
-- Promote only if the C1-style profile shows `bf16_matvec` time falls and the
-  full benchmark median improves without quality drift.
-
-### C5: conv2d encoder kernel
-
-ROI:
-- Medium. C1 shows `conv2d_op` at `7-10%` of profiled counter time. It is
-  smaller than `sgemm` and `bf16_matvec`, but it is still a visible encoder
-  bucket and may compound with OpenBLAS gains.
-
-Purpose:
-- Reduce Android encoder overhead that remains outside `sgemm`.
-
-Decision:
-- Start only after C2/C3, or if a rebuilt OpenBLAS lowers `sgemm` enough that
-  `conv2d_op` becomes a larger share of the profile.
-
-### C6: guardrail normalization for Auto language
-
-ROI:
-- Low for speed, medium for experiment velocity. Current Auto-language outputs
-  can be semantically and phonetically stable while failing the old exact string
-  check (`Hello` versus `哈喽`, punctuation variants). This can obscure whether a
-  speed experiment truly regressed quality.
+- Low speed ROI, useful for experiment velocity.
 
 Purpose:
 - Add a normalized guardrail comparison for benchmark reporting while keeping
-  raw transcripts in JSON.
+  raw transcripts in JSON. Current Auto-language outputs can be semantically and
+  phonetically stable while failing the old exact string check (`Hello` versus
+  `哈喽`, punctuation variants).
 
 Decision:
 - Do this when quality triage starts slowing speed experiments, or before

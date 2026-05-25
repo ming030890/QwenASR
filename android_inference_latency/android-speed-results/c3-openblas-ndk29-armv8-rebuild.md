@@ -141,6 +141,8 @@ Comparison:
 Decision:
 - Reject `DYNAMIC_ARCH=1`, `USE_THREAD=1`, `NUM_THREADS=8` at Stage 1.
 - Do not promote to the candidate gate.
-- Next isolate dynamic architecture without OpenBLAS internal threading:
-  `TARGET=ARMV8`, `DYNAMIC_ARCH=1`, `USE_THREAD=0`, `NUM_THREADS=1`, Android
-  API 33.
+- Do not continue broad OpenBLAS rebuild guessing from this result alone. The
+  next step is phase-split timing plus an isolated runtime-thread control for
+  this threaded archive. Only build `DYNAMIC_ARCH=1`, `USE_THREAD=0`,
+  `NUM_THREADS=1` if that control does not already prove OpenBLAS internal
+  threading is the failure mode.
