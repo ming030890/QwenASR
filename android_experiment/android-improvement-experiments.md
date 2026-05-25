@@ -1,4 +1,4 @@
-# Android Speed Improvement Experiments
+# Android Improvement Experiments (Speed & Memory)
 
 Protocol, scripts, thermal control, and acceptance rules:
 [android-autoresearch-program.md](android-autoresearch-program.md).
@@ -73,13 +73,73 @@ Gate scripts: `bench/android_run.py` (collect numbers, waits for thermal interna
 
 | Rank | ID | ROI | Experiment | Main metrics |
 | --- | --- | ---: | --- | --- |
-| 1 | P0 | 5 | Phase-split benchmark timing. | `mel_ms`, `encoder_ms`, `prefill_ms`, `decode_loop_ms/token` |
-| 2 | P1 | 4 | Isolate threaded OpenBLAS runtime settings. | encode/decode split and fast-gate latency |
-| 3 | P3 | 4 | Android SGEMM shape microbench. | per-shape Android/macOS gap |
-| 4 | Q3 | 3 | Encoder weight quantization feasibility probe. | encoder timing, RSS, CER |
-| 5 | P2 | 3 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. | fast-gate and acceptance latency |
-| 6 | P4 | 3 | Decoder token-loop matvec work after phase split. | `decode_loop_ms/token` |
-| 7 | Q4 | 1 | Whole-model quantized file format. | package size, startup, fallback complexity |
+| 1 | M1 | 5 | Transient layer-by-layer dequantization of F32 prefill weights. | `memory_kb`, `peak_rss_kb`, `model_load_ms` |
+| 2 | M2 | 5 | Lazy/Dynamic KV Cache scaling starting at 128 tokens. | `memory_kb`, `peak_rss_kb`, `inference_ms` |
+| 3 | M3 | 4 | Transient layer-by-layer conversion of BF16 encoder weights. | `memory_kb`, `peak_rss_kb`, `encoder_ms` |
+| 4 | M4 | 4 | Host-side pre-quantization of the tied LM head. | `memory_kb`, `peak_rss_kb`, `model_load_ms` |
+| 5 | P0 | 5 | Phase-split benchmark timing. | `mel_ms`, `encoder_ms`, `prefill_ms`, `decode_loop_ms/token` |
+| 6 | P1 | 4 | Isolate threaded OpenBLAS runtime settings. | encode/decode split and fast-gate latency |
+| 7 | P3 | 4 | Android SGEMM shape microbench. | per-shape Android/macOS gap |
+| 8 | Q3 | 3 | Encoder weight quantization feasibility probe. | encoder timing, RSS, CER |
+| 9 | P2 | 3 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. | fast-gate and acceptance latency |
+| 10 | P4 | 3 | Decoder token-loop matvec work after phase split. | `decode_loop_ms/token` |
+| 11 | Q4 | 1 | Whole-model quantized file format. | package size, startup, fallback complexity |
+
+### M1: Transient layer-by-layer dequantization of F32 prefill weights
+
+Status:
+- Proposed. High ROI memory-saver.
+
+ROI:
+- 5/5.
+
+Purpose:
+- Refactor the decoder initialization (`decoder.rs`) to dequantize the INT8 decoder weights (`wq`, `wk`, `wv`, `wo`, `gate_up_fused`, `down`) into a single, shared F32 prefill scratch buffer during the prefill phase, instead of pre-converting all layers to F32 permanently on the heap at startup.
+
+Why:
+- The current implementation consumes **1.68 GB of permanent heap** solely to store pre-converted F32 prefill weights. Since prefill is compute-bound and transient, we can share a single layer-sized F32 scratch buffer (~60 MB) across all layers, dequantizing on the fly in <2 ms per layer, saving **1.62 GB of permanent heap** with 0% latency regression.
+
+### M2: Lazy/dynamic KV Cache allocation
+
+Status:
+- Proposed. High ROI memory-saver.
+
+ROI:
+- 5/5.
+
+Purpose:
+- Initialize the `KvCache` with a small default sequence capacity (e.g. `128` or `256` tokens) instead of pre-allocating for `2048` tokens. Rely on the existing dynamic `.grow()` method to automatically resize the cache on demand for longer audio inputs.
+
+Why:
+- The current pre-allocation at `max_seq = 2048` consumes **448 MB of heap** immediately upon loading, even though ASR transcripts are typically short (often <100 tokens per chunk). Starting at `128` tokens consumes only **~28 MB** (saving **420 MB / 93%**) and grows gracefully only when needed.
+
+### M3: Transient layer-by-layer conversion of BF16 encoder weights
+
+Status:
+- Proposed. High ROI memory-saver.
+
+ROI:
+- 4/5.
+
+Purpose:
+- Keep the encoder weights in their native BF16 format in the `mmap` region, and perform on-the-fly SIMD conversion to a small single-layer F32 scratch buffer during the encoder forward pass immediately before running each layer's SGEMM.
+
+Why:
+- The encoder currently converts all layer weights from BF16 in the safetensors file to F32 on startup, consuming **714 MB of permanent heap**. Keeping them as BF16 in the mmap file and converting them layer-by-layer on-the-fly into a shared ~12.8 MB scratch buffer saves **~700 MB of permanent heap** while still utilizing optimized F32 BLAS `sgemm` kernels.
+
+### M4: Tied LM Head host-side pre-quantization
+
+Status:
+- Proposed. High ROI memory-saver.
+
+ROI:
+- 4/5.
+
+Purpose:
+- Update `prepare_int8_model.py` to pre-quantize the tied `lm_head` weights on the host, saving them directly as INT8 in the model file. Refactor `decoder.rs` to load the tied LM head via zero-copy mmap pointers rather than allocating and quantizing on-device at startup.
+
+Why:
+- The engine currently quantizes the massive `lm_head` (vocabulary size `151,936` x `1024` hidden) to INT8 on the heap at startup, consuming **149 MB of heap**. Pre-quantizing it on the host lets the client read it directly from `mmap` zero-copy, saving startup CPU overhead and 149 MB of heap.
 
 ### Q2: decoder INT8 weight replacement
 

@@ -324,12 +324,12 @@ sensitive for every experiment.
 
 For every stage that runs:
 - Append/keep the generated row in `results-android.tsv`.
-- Add a short note to `android-speed-improvement-experiments.md`.
+- Add a short note to `android-improvement-experiments.md`.
 - Link the JSON directory and record whether thermal snapshots were clean.
 
 Resume source of truth:
 - This file defines the stable protocol and acceptance rules.
-- `android-speed-improvement-experiments.md` contains current state, completed
+- `android-improvement-experiments.md` contains current state, completed
   attempts, and the ordered next-experiment backlog with concrete commands.
 - A future session should read both files before running anything, then continue
   from the first unresolved item in that backlog.
