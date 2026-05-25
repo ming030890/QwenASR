@@ -65,27 +65,29 @@ Baseline comparison (fast gate: `android-baseline-openblas-fixedperf-t1-r3-20260
 Stage 1 gate: PASS (within +10% threshold), but no improvement on any metric.
 
 Interpretation:
-- Making the model file 419 MB smaller did not reduce `model_load_ms` or
-  `inference_ms`.
-- The on-device BF16→INT8 quantization in the BF16 model path operates on
-  already-paged-in mmap data (page cache shared with F32 prefill conversion),
-  so it is essentially free from an I/O perspective, just like Q1 showed.
-- In the INT8 model, `Vec<i8>` copy + F32 dequantization for prefill involves
-  the same amount of memory allocation and roughly the same data movement as
-  the BF16 path.
-- The inference regression (+7.7%) is within Stage 1 noise margin but confirms
-  the INT8 decoder path offers no advantage over on-device quantization.
-- Memory improvement is 0.9%, far below the 10% acceptance threshold.
+- The apparent +7.7% inference regression is measurement noise, not a real
+  regression.  The encoder (unchanged in the INT8 model) was measured +38 ms
+  slower in the Q2 run vs the baseline; since the encoder is identical, that
+  +38 ms is entirely explained by session-to-session variance (different day,
+  different device state).  The remaining decode gap is also consistent with
+  cross-session noise.  There is no mechanism by which INT8 decoder weights
+  could slow the encoder.
+- The `model_load_ms` result is neutral: 1361 ms for Q2 vs a comparable single-
+  session baseline of ~1329-1361 ms.  Saving 419 MB of storage I/O did not
+  reduce load time because load is not storage-I/O bound.  The BF16→INT8
+  quantization step in the standard path operates on mmap pages already paged
+  in by the F32 prefill conversion, so it costs almost no additional I/O.  The
+  CPU and memory-allocation work is effectively the same in both paths.
+- Memory is ~0.9% lower (smaller mmap region), far below the 10% threshold.
 
 Decision:
-- Reject Q2.  A smaller model file does not translate to a load-time or
-  inference win on this device.  The on-device BF16→INT8 quantization is not
-  the bottleneck — it rides on top of the page-fault I/O already triggered by
-  F32 prefill weight conversion.
+- Reject Q2.  The result is neutral: no improvement on any acceptance metric.
+  The model file is smaller but that does not translate to a measurable load or
+  inference win on this device.
 - The INT8 decoder loading path (safetensors I8 dtype + `decoder.rs` branch) is
   kept in the codebase as a non-default path for future exploration, but is
   never invoked with the standard BF16 model.
 - Do not promote Q2 to Stage 2; the fast-gate data gives sufficient signal to
-  reject.
+  classify as neutral/reject.
 - Next: P0 phase-split benchmark timing to properly attribute encode, prefill,
   and decode-loop costs before choosing further optimization targets.
