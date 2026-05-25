@@ -209,6 +209,18 @@ impl SafetensorsFile {
         unsafe { std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), n); }
         Some(out)
     }
+
+    /// Get direct zero-copy pointer to I8 data in the mmap region.
+    pub fn get_i8_ptr(&self, tensor: &TensorMeta) -> Option<(*const i8, usize)> {
+        if tensor.dtype != Dtype::I8 {
+            return None;
+        }
+        let n = tensor.numel();
+        if n == 0 {
+            return None;
+        }
+        Some((self.data_ptr(tensor) as *const i8, n))
+    }
 }
 
 impl Drop for SafetensorsFile {
@@ -295,6 +307,12 @@ impl MultiSafetensors {
     pub fn get_i8_vec(&self, name: &str) -> Option<Vec<i8>> {
         let (si, t) = self.find(name)?;
         self.shards[si].get_i8_vec(t)
+    }
+
+    /// Convenience: zero-copy pointer into I8 tensor in the mmap region.
+    pub fn get_i8_ptr(&self, name: &str) -> Option<(*const i8, usize)> {
+        let (si, t) = self.find(name)?;
+        self.shards[si].get_i8_ptr(t)
     }
 
     /// Return the dtype of a named tensor, or None if not found.

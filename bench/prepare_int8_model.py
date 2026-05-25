@@ -32,14 +32,13 @@ from pathlib import Path
 
 import numpy as np
 
-# Suffixes of per-layer decoder projection weights to replace with INT8.
+# Suffixes of per-layer decoder projection weights to quantize individually.
+# gate_proj and up_proj are handled separately: they are fused into gate_up_fused.weight.
 DECODER_PROJ_SUFFIXES = [
     "self_attn.q_proj.weight",
     "self_attn.k_proj.weight",
     "self_attn.v_proj.weight",
     "self_attn.o_proj.weight",
-    "mlp.gate_proj.weight",
-    "mlp.up_proj.weight",
     "mlp.down_proj.weight",
 ]
 
@@ -123,22 +122,26 @@ def quantize_bf16_to_int8(w_bf16: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 # Safetensors writer
 # ---------------------------------------------------------------------------
 
-def write_safetensors(path: str, tensors: list[tuple[str, str, np.ndarray]]) -> None:
+def write_safetensors(path: str, tensors: list[tuple]) -> None:
     """Write tensors to a safetensors file.
 
-    tensors: list of (name, dtype_str, data_ndarray) in desired layout order.
+    tensors: list of (name, dtype_str, data_ndarray [, shape_override]) tuples.
     dtype_str must be one of the standard safetensors dtype strings (F32, BF16, I8, …).
+    shape_override: if provided (as a list of ints), written to the header instead of arr.shape.
+    Used for raw-byte copies of non-native-dtype arrays where arr.shape would be [n_bytes].
     """
     header_entries = {}
     offset = 0
     flat_bufs = []
 
-    for name, dtype_str, arr in tensors:
+    for entry in tensors:
+        name, dtype_str, arr = entry[0], entry[1], entry[2]
+        shape = list(entry[3]) if len(entry) > 3 else list(arr.shape)
         raw = arr.tobytes()
         n_bytes = len(raw)
         header_entries[name] = {
             "dtype": dtype_str,
-            "shape": list(arr.shape),
+            "shape": shape,
             "data_offsets": [offset, offset + n_bytes],
         }
         offset += n_bytes
@@ -164,6 +167,12 @@ def is_decoder_proj(name: str) -> bool:
     if "thinker.model.layers." not in name:
         return False
     return any(name.endswith(sfx) for sfx in DECODER_PROJ_SUFFIXES)
+
+def is_decoder_gate_proj(name: str) -> bool:
+    return "thinker.model.layers." in name and name.endswith("mlp.gate_proj.weight")
+
+def is_decoder_up_proj(name: str) -> bool:
+    return "thinker.model.layers." in name and name.endswith("mlp.up_proj.weight")
 
 
 def main():
@@ -193,7 +202,9 @@ def main():
 
     # Identify decoder projection tensors
     decoder_proj_names = {n for n in names if is_decoder_proj(n)}
-    print(f"  decoder projection tensors to quantize: {len(decoder_proj_names)}", flush=True)
+    gate_proj_names = {n for n in names if is_decoder_gate_proj(n)}
+    print(f"  individual projections to quantize: {len(decoder_proj_names)}, "
+          f"gate+up pairs to fuse: {len(gate_proj_names)}", flush=True)
 
     # Build the output tensor list
     out_tensors: list[tuple[str, str, np.ndarray]] = []
@@ -212,11 +223,40 @@ def main():
             out_tensors.append((name, "I8", w_int8))
             out_tensors.append((name + "_int8_scale", "F32", scales))
             quantized_count += 1
+        elif is_decoder_gate_proj(name):
+            # Fuse gate + up into a single pre-interleaved tensor so the Rust
+            # loader can point directly into the mmap region without copying.
+            assert dtype_str == "BF16", f"Expected BF16 for {name}, got {dtype_str}"
+            up_name = name.replace("gate_proj", "up_proj")
+            gate_bf16 = get_tensor_np(header, data_mmap, name)
+            up_bf16 = get_tensor_np(header, data_mmap, up_name)
+            assert gate_bf16.shape == up_bf16.shape, \
+                f"gate/up shape mismatch: {gate_bf16.shape} vs {up_bf16.shape}"
+            inter, hidden = gate_bf16.shape
+            print(f"  fusing+quantizing gate+up for {name[:-len('gate_proj.weight')]} "
+                  f"[{inter},{hidden}] …", flush=True)
+            gate_int8, gate_scales = quantize_bf16_to_int8(gate_bf16)
+            up_int8, up_scales = quantize_bf16_to_int8(up_bf16)
+            # Interleave rows: [gate0, up0, gate1, up1, ...]
+            fused_int8 = np.empty((2 * inter, hidden), dtype=np.int8)
+            fused_int8[0::2] = gate_int8
+            fused_int8[1::2] = up_int8
+            fused_scales = np.empty(2 * inter, dtype=np.float32)
+            fused_scales[0::2] = gate_scales
+            fused_scales[1::2] = up_scales
+            fused_name = name.replace("gate_proj.weight", "gate_up_fused.weight")
+            out_tensors.append((fused_name, "I8", fused_int8))
+            out_tensors.append((fused_name + "_int8_scale", "F32", fused_scales))
+            quantized_count += 1  # gate + up emitted as a single fused tensor
+        elif is_decoder_up_proj(name):
+            pass  # already emitted as gate_up_fused when gate_proj was processed
         else:
-            # Copy as-is: get raw bytes and wrap in uint8 ndarray
+            # Copy as-is: raw bytes wrapped as uint8 ndarray.
+            # Pass original shape explicitly — arr.shape would be [n_bytes], not the
+            # tensor's logical shape, which would corrupt numel() in the Rust reader.
             start, end = meta["data_offsets"]
             raw = np.array(data_mmap[start:end], dtype=np.uint8)
-            out_tensors.append((name, dtype_str, raw))
+            out_tensors.append((name, dtype_str, raw, list(meta["shape"])))
 
     print(f"\nQuantized {quantized_count} tensors.", flush=True)
     print(f"Writing {model_dst} …", flush=True)
