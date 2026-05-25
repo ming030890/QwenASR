@@ -12,7 +12,7 @@ use crate::transcribe;
 
 /// Opaque handle to the ASR engine.
 pub struct QwenAsrEngine {
-    ctx: QwenCtx,
+    pub(crate) ctx: QwenCtx,
 }
 
 /// Load model from a directory path. Returns null on failure.

@@ -113,6 +113,28 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeSetLanguage(
     );
 }
 
+/// Set transcription prompt text configuration.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeSetPrompt(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    prompt: JString,
+) {
+    if handle == 0 {
+        return;
+    }
+
+    let prompt_str: String = match env.get_string(&prompt) {
+        Ok(s) => s.into(),
+        Err(_) => return,
+    };
+
+    let engine = &mut *(handle as *mut crate::c_api::QwenAsrEngine);
+    let _ = engine.ctx.set_prompt(&prompt_str);
+}
+
+
 /// Set transcription segment seconds.
 #[no_mangle]
 pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeSetSegmentSec(
