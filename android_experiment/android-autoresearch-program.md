@@ -19,8 +19,9 @@ Secondary metrics:
 - `peak_rss_kb`: sampled peak process RSS during each inference run.
 
 Guardrails:
-- `ptt_guardrail.wav` transcript must remain exactly:
-  `Hello,你好吗？已经坐低咗啦。`
+- `ptt_guardrail.wav` transcript must remain semantically and phonetically
+  stable for `Hello,你好吗？已经坐低咗啦。`; exact punctuation/script can vary
+  under Auto language.
 - Common Voice average CER must not regress versus the current best baseline.
 - Host Rust tests must continue to pass:
   `cargo test --release --test kernels --test audio`
@@ -82,7 +83,7 @@ Android benchmark binary:
 
 ```bash
 PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" \
-bench/android_run.sh --label android-baseline --runs 3 --threads "1"
+bench/android_run.py --label android-baseline --runs 3 --threads "1"
 ```
 
 Standard environment for every run:
@@ -99,7 +100,7 @@ NDK note:
 - Prefer NDK `29.0.14206865` for Android benchmark builds and OpenBLAS
   rebuilds on this machine. The installed NDK `30.0.14904198` has a text
   `clang` shim that drops compiler arguments when OpenBLAS invokes the standard
-  `aarch64-linux-android*-clang` wrapper. `bench/android_run.sh` defaults to
+  `aarch64-linux-android*-clang` wrapper. `bench/android_run.py` defaults to
   NDK 29 but still honors `NDK_HOME`, `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, or
   `NDK_BIN` overrides.
 
@@ -119,7 +120,7 @@ Prompt/language policy:
 - For fixed Yue Android assets, use concise Simplified Chinese context when
   testing code-switching behavior, for example:
   `音频是粤语，可能夹杂英语`.
-- `bench/android_run.sh` defaults to `BENCH_LANGUAGE=Auto` and
+- `bench/android_run.py` defaults to `BENCH_LANGUAGE=Auto` and
   `BENCH_PROMPT='音频是粤语，可能夹杂英语'`.
 
 Canonical results files:
@@ -132,7 +133,7 @@ Best accepted Android baseline so far:
 - `android-baseline-openblas-fixedperf-t1-r3-20260524-215914`
 - Config: OpenBLAS static archive, `android-blas`, `-C target-feature=+dotprod`,
   engine `threads=1`, fixed-performance mode.
-- `bench/android_run.sh` defaults to this baseline config. Override defaults
+- `bench/android_run.py` defaults to this baseline config. Override defaults
   only for a named experiment.
 - Common Voice median: `1677.491 ms`, encode `383.011 ms`, decode
   `1305.652 ms`.
@@ -172,122 +173,40 @@ Rejected configs that must not be defaults:
 
 ## Thermal Control
 
-Android phone benchmarks are highly sensitive to temperature, battery state, and
-CPU governor decisions. Treat thermal control as part of the protocol, not as
-post-hoc explanation.
+`bench/android_run.py` waits for `Thermal Status: 0` automatically before
+running. It prints the current status every 15 seconds and proceeds once the
+device is cool. Set `THERMAL_TIMEOUT` (default 600 s) to control the maximum
+wait.
 
-Default practice:
+Physical discipline (cannot be scripted):
 - Run plugged in with the same charger/cable each time.
-- Keep the screen state consistent.
 - Do not run unrelated apps or background workloads.
-- Run a short warmup only if every arm gets the same warmup.
-- Do not block routine Stage 1/Stage 2 iteration on tightly matched
-  temperatures. `Thermal Status: 0` is still required for normal comparable
-  runs; relax only the skin/soc matching and cooldown strictness.
-- Cool down before long acceptance/thread-sweep arms, or when `Thermal Status`
-  is nonzero.
-- Record device temperature and battery/thermal state before each arm.
-- Compare arms in alternating order when possible, for example baseline,
-  dotprod, baseline, dotprod, instead of running all of one arm first.
+- Compare arms in alternating order when possible (baseline, candidate, baseline,
+  candidate) rather than running all of one arm first.
 
-Use the same labels and snapshots for every arm. Prefer the helper script so
-snapshot capture is one command:
+Snapshot before and after each arm:
 
 ```bash
 LABEL=android-exp-name
-
 bench/android_snapshot.sh --label "$LABEL" --phase before
-
-PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" \
-RUSTFLAGS_EXTRA="" \
-bench/android_run.sh --label "$LABEL" --threads "1" --runs 3
-
+bench/android_run.py --label "$LABEL" --threads "1" --runs 3
 bench/android_snapshot.sh --label "$LABEL" --phase after
 ```
 
-Fast readiness check before starting a routine Stage 1/Stage 2 arm:
+## Acceptance Rules
 
-```bash
-adb shell dumpsys thermalservice | grep 'Thermal Status'
-```
+Stage 1 and Stage 2 can reject or promote an idea but do not define final
+acceptance thresholds.
 
-For Stage 1/Stage 2:
-- Start only when `Thermal Status: 0`.
-- If status is nonzero, wait or run a diagnostic only and mark it as thermally
-  contaminated.
-- Do not wait for exact skin/soc matching. Record the snapshot and interpret
-  close results conservatively.
+Stage 3 accepts a change only if at least one of:
+- Full Common Voice median `inference_ms` improves by at least `5%`.
+- `model_load_ms` improves by at least `5%`.
+- `memory_after_model_load_kb` or `peak_inference_rss_kb` improves by at least
+  `10%`.
 
-Stricter cooldown check before acceptance runs, thread sweeps, or when a result
-will decide the default build/thread policy:
+Startup or memory wins must not regress full Common Voice median inference.
 
-```bash
-while true; do
-  adb shell dumpsys thermalservice | grep 'Thermal Status'
-  adb shell dumpsys thermalservice | grep -E 'VIRTUAL-SKIN|soc_therm|BIG|MID|LITTLE|battery' | head -20
-  adb shell 'for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq; do echo "$f=$(cat "$f" 2>/dev/null)"; done'
-  sleep 60
-done
-```
-
-Start long decision-making arms when:
-- `Thermal Status` is `0`.
-- Skin/soc readings are not obviously hotter than the previous arm. They do not
-  need to be exact.
-- CPU frequency readings are not obviously clamped lower than the previous arm.
-
-Controlled build-feature comparison:
-
-```bash
-BASE_LABEL=android-control-baseline-t1-r3
-DOT_LABEL=android-control-dotprod-t1-r3
-
-# Arm 1: baseline
-RUSTFLAGS_EXTRA="" \
-bench/android_run.sh --label "$BASE_LABEL" --threads "1" --runs 3
-
-# Cool down and snapshot before continuing.
-
-# Arm 2: dotprod
-RUSTFLAGS_EXTRA="-C target-feature=+dotprod" \
-bench/android_run.sh --label "$DOT_LABEL" --threads "1" --runs 3
-```
-
-Frequency locking:
-- Only lock CPU frequency/governor if the device exposes the controls and the
-  benchmark user has permission, usually root.
-- Prefer a documented helper script over one-off shell commands.
-- Always save the original governor/frequency settings before changing them.
-- Always restore the original settings after the benchmark, even if a run fails.
-- Record whether frequency locking was used in the result label and notes.
-
-Suggested locked-frequency flow:
-
-```bash
-# Inspect first. This usually requires root for writes.
-adb shell 'for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo "$f=$(cat "$f" 2>/dev/null)"; done'
-adb shell 'for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_available_frequencies; do echo "$f=$(cat "$f" 2>/dev/null)"; done'
-
-# Save originals on the device before changing anything.
-adb shell su -c 'for d in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do cpu=${d%/cpufreq}; cpu=${cpu##*/cpu}; printf "%s\t%s\t%s\t%s\n" "$cpu" "$(cat "$d/scaling_governor")" "$(cat "$d/scaling_min_freq")" "$(cat "$d/scaling_max_freq")"; done > /data/local/tmp/qwen-asr-cpufreq-original.tsv'
-adb pull /data/local/tmp/qwen-asr-cpufreq-original.tsv bench/android-cpufreq-original.tsv
-
-# Root-only example: pin every CPU to its current max frequency.
-# Do not run this unless the device allows adb root or su.
-adb shell su -c 'for d in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do max=$(cat "$d/cpuinfo_max_freq"); echo performance > "$d/scaling_governor"; echo "$max" > "$d/scaling_min_freq"; echo "$max" > "$d/scaling_max_freq"; done'
-
-# Restore immediately after the benchmark from the saved values.
-adb shell su -c 'while IFS="$(printf "\t")" read -r cpu gov min max; do d="/sys/devices/system/cpu/cpu${cpu}/cpufreq"; [ -d "$d" ] || continue; echo "$max" > "$d/scaling_max_freq"; echo "$min" > "$d/scaling_min_freq"; echo "$gov" > "$d/scaling_governor"; done < /data/local/tmp/qwen-asr-cpufreq-original.tsv'
-
-# Verify restore.
-adb shell 'for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor /sys/devices/system/cpu/cpu*/cpufreq/scaling_min_freq /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do echo "$f=$(cat "$f" 2>/dev/null)"; done'
-```
-
-If frequency locking is not available, use cooldown plus temperature gates:
-- Start each arm only when battery/skin/CPU thermal readings are within a narrow
-  range of the previous arm.
-- Reject or rerun comparisons where one arm starts materially hotter.
-- Avoid drawing conclusions from a single long run after sustained throttling.
+All accepted changes must satisfy every guardrail listed in the Goal section.
 
 ## Experiment Loop
 
@@ -303,7 +222,7 @@ PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:
 cargo test --release --test kernels --test audio
 
 PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" \
-bench/android_run.sh \
+bench/android_run.py \
   --label android-build-smoke \
   --assets-dir /Volumes/SSD/qwen-asr-android-fast-assets \
   --threads "1" \
@@ -321,22 +240,23 @@ Run for every experiment idea that passes Stage 0:
 
 ```bash
 LABEL=android-fast-<idea>-$(date -u +%Y%m%d-%H%M%S)
-bench/android_run.sh \
+bench/android_run.py \
   --label "$LABEL" \
   --assets-dir /Volumes/SSD/qwen-asr-android-fast-assets \
   --threads "1" \
   --runs 1
 ```
 
-Inputs:
-- `cv_yue_003.wav`, the shortest fixed Common Voice clip.
-- `ptt_guardrail.wav`, because it catches the most important transcript drift.
+Then check the result (replace `BASELINE_LABEL` with the current best fast-gate label):
 
-Decision:
-- Reject immediately if the guardrail transcript changes.
-- Reject immediately if `cv_yue_003.wav` inference regresses by more than 10%
-  versus the current best fast-gate result under comparable thermal conditions.
-- Promote only if speed is neutral or better, or if the experiment is diagnostic.
+```bash
+bench/android_check_gate.py \
+  --result "$LABEL" \
+  --baseline BASELINE_LABEL \
+  --stage 1
+```
+
+Exit 0 = promote to Stage 2. Exit 1 = reject; read the output for the reason.
 
 ### Stage 2: Candidate Gate
 
@@ -344,47 +264,44 @@ Run only for ideas that pass Stage 1:
 
 ```bash
 LABEL=android-candidate-<idea>-$(date -u +%Y%m%d-%H%M%S)
-bench/android_run.sh \
+bench/android_run.py \
   --label "$LABEL" \
   --assets-dir /Volumes/SSD/qwen-asr-android-candidate-assets \
   --threads "1" \
   --runs 1
 ```
 
-Inputs:
-- `cv_yue_003.wav`: short clip.
-- `cv_yue_001.wav`: longer clip with more generated tokens.
-- `ptt_guardrail.wav`: exact transcript guardrail.
+```bash
+bench/android_check_gate.py \
+  --result "$LABEL" \
+  --baseline BASELINE_LABEL \
+  --stage 2
+```
 
-Decision:
-- Reject if guardrail changes.
-- Reject if either Common Voice clip regresses materially.
-- Promote to acceptance only if median inference is at least 3% faster, or if
-  the change is required infrastructure.
+Exit 0 = promote to Stage 3. Exit 1 = reject.
 
 ### Stage 3: Acceptance Gate
 
-Run only for candidates worth keeping:
+Run only for candidates that pass Stage 2:
 
 ```bash
 LABEL=android-accept-<idea>-$(date -u +%Y%m%d-%H%M%S)
-bench/android_run.sh \
+bench/android_run.py \
   --label "$LABEL" \
   --assets-dir bench/android-assets \
-  --threads "<current-best-thread-count>" \
+  --threads "1" \
   --runs 3
 ```
 
-Inputs:
-- All five fixed Common Voice clips.
-- `ptt_guardrail.wav`.
+```bash
+bench/android_check_gate.py \
+  --result "$LABEL" \
+  --baseline BASELINE_LABEL \
+  --stage 3
+```
 
-Decision:
-- Keep only if Common Voice median inference improves by at least 5%, or
-  startup/model load improves by at least 5%, or memory after model load or
-  peak inference RSS improves by at least 10%, without inference regression.
-- Reject if build/tests fail, guardrail changes, Common Voice CER worsens, or
-  median inference regresses.
+Exit 0 = accepted; update `android-best-baseline.md` and the Completed Result
+Index. Exit 1 = rejected; the output explains which threshold was missed.
 
 ### Stage 4: Full Thread Sweep
 
@@ -393,7 +310,7 @@ after an accepted build-feature/kernel change needs a new default thread count:
 
 ```bash
 LABEL=android-thread-sweep-<idea>-$(date -u +%Y%m%d-%H%M%S)
-bench/android_run.sh \
+bench/android_run.py \
   --label "$LABEL" \
   --assets-dir bench/android-assets \
   --threads "1 2 4 6 8" \
@@ -412,138 +329,10 @@ For every stage that runs:
 
 Resume source of truth:
 - This file defines the stable protocol and acceptance rules.
-- `android-speed-improvement-experiments.md` contains the current state,
-  completed attempts, and the ordered next-experiment backlog with concrete
-  commands.
+- `android-speed-improvement-experiments.md` contains current state, completed
+  attempts, and the ordered next-experiment backlog with concrete commands.
 - A future session should read both files before running anything, then continue
   from the first unresolved item in that backlog.
-
-## Initial Priorities
-
-Rank by expected ROI: impact on Android user experience divided by
-implementation risk and validation cost.
-
-### Q1: Decoder INT8 Sidecar Cache
-
-ROI: very high.
-
-Add an optional generated cache beside the official BF16 model containing the
-existing decoder INT8 payloads and per-row scales. First load creates the cache;
-later loads verify a model hash/schema version and skip BF16-to-INT8
-quantization.
-
-Reason:
-- The current decoder already uses load-time INT8 on `aarch64`, so this reuses
-  proven kernels instead of inventing a model format.
-- Expected win is lower `model_load_ms`, lower temporary load pressure, and
-  smaller app-prepackaged assets if the cache is shipped.
-- Risk is contained because the BF16 model remains the source of truth and
-  cache miss/failure can fall back to current behavior.
-
-Metrics:
-- `model_load_ms`
-- `memory_after_model_load_kb`
-- `peak_rss_kb`
-- unchanged inference latency and transcript quality
-
-### Q2: Decoder INT8 Sidecar Packaging
-
-ROI: high.
-
-Pre-generate the Q1 sidecar on host and push/package it with the Android model
-assets so device cold start does not pay cache creation.
-
-Reason:
-- This tests the product-level question: whether file-level quantization helps
-  Android packaging and first-run startup without breaking upstream model
-  compatibility.
-- It is safer than replacing `model.safetensors` because old deployments and
-  non-`aarch64` paths can ignore the sidecar.
-
-Metrics:
-- model asset bytes on device
-- `model_load_ms`
-- `memory_after_model_load_kb`
-- app/package integration complexity
-
-### Q3: Encoder Weight Quantization Feasibility
-
-ROI: medium.
-
-Prototype quantizing one encoder projection family and benchmark it against the
-current F32/OpenBLAS path.
-
-Reason:
-- Encoder weights are currently expanded to F32 and executed through BLAS-like
-  paths. Quantization could reduce RSS, but may lose OpenBLAS throughput or add
-  dequantization cost.
-- Run this only after Q1/Q2 because it has higher correctness and kernel risk.
-
-Metrics:
-- encoder phase timing
-- `memory_after_model_load_kb`
-- `peak_rss_kb`
-- CER and guardrail stability
-
-### Q4: Whole-Model Quantized File Format
-
-ROI: low until Q1-Q3 prove value.
-
-Design a native quantized model file or GGUF-like export only after the sidecar
-and encoder experiments show measurable Android value.
-
-Reason:
-- A replacement model file introduces schema/versioning, conversion tooling,
-  platform fallback, and accuracy-debug complexity.
-- Current x86 paths and decoder prefill still need BF16/F32-compatible data, so
-  an INT8-only model is not yet a clean runtime contract.
-
-### A1: Android Build-Feature Tuning
-
-Compare:
-- baseline Android arm64 build
-- `-C target-cpu=cortex-a76`
-- `-C target-feature=+dotprod`
-- combined CPU/feature variants if the individual arms justify it
-
-Reason:
-- Pixel 9 supports dot-product instructions, but enabling a feature globally
-  can change LLVM code generation beyond the intended hot path. Treat this as
-  data-driven, not automatically beneficial.
-
-### A2: Android Thread/Core Scheduling
-
-Sweep:
-- `--threads "1 2 4 6 8"`
-- optional `taskset` masks for big/mid/all cores after the plain thread sweep
-
-Reason:
-- Parallel phases may wait on slower cores. The best Android policy may differ
-  from macOS and from host defaults.
-
-### A3: Android No-BLAS Fallback Kernels
-
-Target current fallback hot paths one at a time:
-- `linear`
-- `linear_accumulate`
-- `matmul_nn`
-- `matmul_t`
-- `conv2d`
-
-Reason:
-- Android currently cannot rely on Accelerate and may not link BLAS. Large
-  dense operations falling back to scalar Rust loops are the likely biggest
-  code-level opportunity.
-
-### A4: Profiling Counters
-
-Run the benchmark with `--profile` only for diagnosis, not final timing.
-Use per-file counters to choose the next kernel target.
-
-### Deferred: Android OpenBLAS
-
-Try only if focused NEON fallback work stalls. Treat as a separate experiment
-because it changes runtime dependencies and build complexity.
 
 ## Rules
 

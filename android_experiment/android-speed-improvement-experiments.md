@@ -1,76 +1,10 @@
 # Android Speed Improvement Experiments
 
-Goal: improve Android arm64 inference speed on the connected Pixel 9 while
-keeping transcript quality stable.
+Protocol, scripts, thermal control, and acceptance rules:
+[android-autoresearch-program.md](android-autoresearch-program.md).
 
-Current benchmark protocol:
-- Model: `/Volumes/SSD/qwen3-asr-0.6b`
-- Device workspace: `/data/local/tmp/qwen-asr-bench`
-- Assets: `bench/android-assets`
-- NDK: `bench/android_run.sh` defaults to
-  `/Users/tony/Library/Android/sdk/ndk/29.0.14206865`; override with
-  `NDK_HOME`, `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, or `NDK_BIN` if needed.
-- Fast-gate asset subset: `/Volumes/SSD/qwen-asr-android-fast-assets`
-  contains `cv_yue_003.wav`, `cv_yue_003.txt`, `ptt_guardrail.wav`, and
-  `ptt_guardrail.txt`.
-- Candidate-gate asset subset:
-  `/Volumes/SSD/qwen-asr-android-candidate-assets` contains
-  `cv_yue_003.wav`, `cv_yue_003.txt`, `cv_yue_001.wav`, `cv_yue_001.txt`,
-  `ptt_guardrail.wav`, and `ptt_guardrail.txt`.
-- Common Voice metric: median `inference_ms` across five fixed Yue clips.
-- Startup and memory metrics for new runs: `model_load_ms`,
-  `memory_after_model_load_kb`, and per-run `peak_rss_kb` / TSV
-  `peak_inference_rss_kb`.
-- Guardrail: `ptt_guardrail.wav` should remain semantically and phonetically
-  stable for `Hello,你好吗？已经坐低咗啦。`; exact punctuation/script can vary
-  under Auto language.
-- Prompt/language policy: upstream-style auto language means no `language ...`
-  suffix. Rust now treats unset language and `"Auto"` as auto instead of
-  defaulting to English. For Yue benchmark prompts, use concise Simplified
-  Chinese context: `BENCH_LANGUAGE=Auto`,
-  `BENCH_PROMPT='音频是粤语，可能夹杂英语'`.
-- Standard run: `bench/android_run.sh --runs 3 --threads "1"`
-- Device pre-run setup is now built into `bench/android_run.sh`:
-  it wakes the device, enables `svc power stayon true`, enables fixed
-  performance mode, then restores fixed performance mode and the original
-  `stay_on_while_plugged_in` setting on exit.
-- Controlled build-feature check: compare arms with identical `--runs` and
-  `--threads`, preferably after cooldown.
+## Current State
 
-Resume checklist:
-- Read `android-autoresearch-program.md` first; it defines fixed inputs,
-  thermal control, staged gates, and acceptance rules.
-- Make sure the phone is visible:
-  `/Users/tony/Library/Android/sdk/platform-tools/adb devices`
-- Treat this file and `android-autoresearch-program.md` as the source of truth;
-  do not rely on chat history for the plan.
-- Keep Android work separate from macOS autoresearch docs and results.
-- Do not resume with a full five-clip thread sweep. Use Stage 1 or Stage 2
-  unless the experiment is specifically about thread/core policy.
-- Recreate fast/candidate asset subsets if missing:
-  `/Volumes/SSD/qwen-asr-android-fast-assets` and
-  `/Volumes/SSD/qwen-asr-android-candidate-assets`.
-- Start normal comparable runs only when `dumpsys thermalservice` reports
-  `Thermal Status: 0`.
-- Do not wait for exact skin/soc matching during Stage 1/Stage 2. Snapshot the
-  state with `bench/android_snapshot.sh` and record any warmer-start caveat.
-- Record every run, even if it is rejected or thermally contaminated. Put the
-  detailed result in `android-speed-results/` and keep only the summary here.
-- Only promote an experiment to the full acceptance gate if the staged gate
-  justifies it.
-
-Universal acceptance rule:
-- Stage 1 and Stage 2 results can reject or promote an idea, but they do not
-  define experiment-specific acceptance thresholds.
-- Stage 3 accepts a change only if it improves full Common Voice median
-  inference by at least `5%`, improves `model_load_ms` by at least `5%`, or
-  improves `memory_after_model_load_kb` or `peak_inference_rss_kb` by at least
-  `10%`.
-- Startup or memory wins must not regress full Common Voice median inference.
-- All accepted changes must keep Common Voice quality stable versus the current
-  best baseline and keep the guardrail semantically and phonetically stable.
-
-Current state summary:
 - Android benchmark infrastructure exists and defaults to the corrected Auto
   language prompt policy.
 - Dotprod remains the chosen Android build flag for non-BLAS runs, but OpenBLAS
@@ -91,7 +25,7 @@ file for each completed experiment.
 
 | ID | Summary | Decision | Detail |
 | --- | --- | --- | --- |
-| A0 | Added Android benchmark binary, fixed assets, and `bench/android_run.sh`. | Keep as infrastructure. | [A0 details](android-speed-results/a0-android-benchmark-harness-and-assets.md) |
+| A0 | Added Android benchmark binary, fixed assets, and `bench/android_run.py`. | Keep as infrastructure. | [A0 details](android-speed-results/a0-android-benchmark-harness-and-assets.md) |
 | H1 | macOS host reference: original median `196.125 ms`; prompt-correct median `262.911 ms`, encode `39.634 ms`, decode `224.362 ms`. | Use as host reference only, not Android acceptance. | [H1 details](android-speed-results/h1-macos-host-baseline-reference.md) |
 | A1 | Legal no-dotprod Android smoke build: median `25937.755 ms`, guardrail `46855.435 ms`. | Keep build correctness fix; not a speed comparator. | [A1 details](android-speed-results/a1-legal-no-dotprod-android-baseline-build.md) |
 | A2 | Dotprod acceptance: `26761.235 ms` vs no-dotprod `29299.505 ms`, an `8.66%` median speedup with exact guardrail. | Keep `-C target-feature=+dotprod` for Android experiments. | [A2 details](android-speed-results/a2-dotprod-build-feature-controlled-check.md) |
@@ -102,6 +36,7 @@ file for each completed experiment.
 | C1 | Profiled corrected Android/OpenBLAS static build: `sgemm` was about `62-66%` of profiled time, followed by `bf16_matvec` at about `20-24%`. | Keep as coarse profile evidence only; current work needs phase-split attribution before choosing kernels. | [C1 details](android-speed-results/c1-profile-corrected-openblas-build.md) |
 | C2 | Fixed-performance baseline reached `1677.491 ms`; engine `threads=2` regressed to `92916.558 ms` and empty Common Voice transcripts. | Reject engine thread counts above `1`; keep engine `threads=1`. | [C2 details](android-speed-results/c2-openblas-engine-thread-sweep-fixedperf.md) |
 | C3 | NDK 29 generic `ARMV8` static OpenBLAS reached `1602.726 ms` Common Voice; `DYNAMIC_ARCH=1`, `USE_THREAD=1`, `NUM_THREADS=8`, API 33 reached `2466.708 ms`. Both were slower than the prompt-correct fast baseline. | Reject NDK-version-only and threaded dynamic-arch rebuilds at Stage 1. Stop broad OpenBLAS rebuild guessing until phase-split and shape-level measurements isolate the failure mode. | [C3 details](android-speed-results/c3-openblas-ndk29-armv8-rebuild.md) |
+| Q1 | Decoder INT8 sidecar cache generated on first device load. Cached `model_load_ms` was slower than baseline (`1476 ms` vs `1402 ms`); RSS improvement was `~6%`, below the `10%` threshold; inference regressed. | Reject. Sidecar requires reading an extra `570M` file from device storage, which costs more than the on-device quantization it avoids. | [Q1 details](android-speed-results/q1-decoder-int8-sidecar-cache.md) |
 
 ## Current Android Experiment Plan
 
@@ -133,67 +68,54 @@ ROI scoring:
 - `3`: useful diagnostic or medium-size win, moderate risk.
 - `1`: uncertain payoff or high product/format risk.
 
+Gate scripts: `bench/android_run.py` (collect numbers, waits for thermal internally) and `bench/android_check_gate.py --result LABEL --baseline LABEL --stage 1|2|3` (accept/reject with detailed output).
+
 | Rank | ID | ROI | Experiment | Main metrics |
 | --- | --- | ---: | --- | --- |
-| 1 | Q1 | 5 | Decoder INT8 sidecar cache generated on first load. | `model_load_ms`, `memory_after_model_load_kb`, `peak_inference_rss_kb` |
+| 1 | Q2 | 5 | Pre-quantize decoder weights to INT8 on host; ship as model assets. No sidecar file. | `model_load_ms`, `memory_after_model_load_kb`, `peak_inference_rss_kb`, `inference_ms` |
 | 2 | P0 | 5 | Phase-split benchmark timing. | `mel_ms`, `encoder_ms`, `prefill_ms`, `decode_loop_ms/token` |
-| 3 | Q2 | 4 | Pre-generated decoder INT8 sidecar packaged with Android assets. | asset bytes, `model_load_ms`, RSS |
-| 4 | P1 | 4 | Isolate threaded OpenBLAS runtime settings. | encode/decode split and fast-gate latency |
-| 5 | P3 | 4 | Android SGEMM shape microbench. | per-shape Android/macOS gap |
-| 6 | Q3 | 3 | Encoder weight quantization feasibility probe. | encoder timing, RSS, CER |
-| 7 | P2 | 3 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. | fast-gate and acceptance latency |
-| 8 | P4 | 3 | Decoder token-loop matvec work after phase split. | `decode_loop_ms/token` |
-| 9 | P5 | 2 | Guardrail normalization for Auto language. | experiment velocity, false rejection rate |
-| 10 | Q4 | 1 | Whole-model quantized file format. | package size, startup, fallback complexity |
+| 3 | P1 | 4 | Isolate threaded OpenBLAS runtime settings. | encode/decode split and fast-gate latency |
+| 4 | P3 | 4 | Android SGEMM shape microbench. | per-shape Android/macOS gap |
+| 5 | Q3 | 3 | Encoder weight quantization feasibility probe. | encoder timing, RSS, CER |
+| 6 | P2 | 3 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. | fast-gate and acceptance latency |
+| 7 | P4 | 3 | Decoder token-loop matvec work after phase split. | `decode_loop_ms/token` |
+| 8 | Q4 | 1 | Whole-model quantized file format. | package size, startup, fallback complexity |
 
-### Q1: decoder INT8 sidecar cache
+### Q2: decoder INT8 weight replacement
 
 Status:
-- Next quantization experiment; run before deeper model-file work.
+- Next quantization experiment.
 
 ROI:
 - 5/5.
 
 Purpose:
-- Persist the decoder INT8 weights and per-row scales that are already produced
-  during `QwenCtx::load()`, then reuse them on later loads when the source model
-  hash and sidecar schema version match.
+- Pre-quantize all decoder attention/MLP/lm_head weights to INT8 on the host
+  and ship them as part of the model assets pushed to the device.
+- On load, read the INT8 weights directly instead of loading BF16 and
+  quantizing at runtime. No sidecar file; no separate read path.
 
 Why:
-- Current decoder single-token path already uses INT8 on `aarch64`, so the
-  sidecar avoids repeated load-time quantization without changing inference
-  math.
-- It preserves official BF16 safetensors compatibility and gives a clean
-  fallback if the cache is missing, stale, or unsupported.
+- Q1 showed that a sidecar avoids on-device quantization but still costs a
+  `570M` extra file read from device storage, which is slower than the mmap'd
+  BF16 path it was meant to replace.
+- Embedding INT8 weights in the packaged assets eliminates the sidecar file
+  read entirely. The device reads exactly what it needs and no BF16-to-INT8
+  conversion happens at load time.
+- The decoder single-token path already uses INT8 on `aarch64`, so the
+  inference math is unchanged.
 
-Decision:
-- Apply the universal acceptance rule after the generated sidecar validates
-  cleanly.
-- Reject if cache validation is brittle, load failures no longer fall back to
-  BF16, or Android cold start gets worse.
+Run:
 
-### Q2: packaged decoder INT8 sidecar
-
-Status:
-- Run after Q1 only if the generated sidecar validates cleanly.
-
-ROI:
-- 4/5.
-
-Purpose:
-- Generate the decoder INT8 sidecar on the host and package/push it with the
-  Android model assets, so device first load does not pay the sidecar creation
-  cost.
-
-Why:
-- This answers the file-level quantization question while avoiding a hard fork
-  from upstream `model.safetensors`.
-- It measures installed bytes, cold-start behavior, and RSS separately from
-  inference speed.
-
-Decision:
-- Apply the universal acceptance rule; additionally require the no-sidecar path
-  to remain fully compatible.
+```bash
+LABEL=android-fast-q2-decoder-int8-weights-$(date -u +%Y%m%d-%H%M%S)
+bench/android_run.py \
+  --label "$LABEL" \
+  --assets-dir /Volumes/SSD/qwen-asr-android-fast-assets \
+  --threads "1" \
+  --runs 1
+bench/android_check_gate.py --result "$LABEL" --baseline BASELINE_LABEL --stage 1
+```
 
 ### Q3: encoder quantization feasibility
 
@@ -212,9 +134,17 @@ Why:
   Quantization may reduce memory, but could lose optimized SGEMM throughput or
   introduce dequantization overhead.
 
-Decision:
-- Use phase timing and RSS only to decide whether to promote; apply the
-  universal acceptance rule before keeping any quantized encoder path.
+Run (after Q2 and P0 phase timing):
+
+```bash
+LABEL=android-fast-q3-encoder-quant-$(date -u +%Y%m%d-%H%M%S)
+bench/android_run.py \
+  --label "$LABEL" \
+  --assets-dir /Volumes/SSD/qwen-asr-android-fast-assets \
+  --threads "1" \
+  --runs 1
+bench/android_check_gate.py --result "$LABEL" --baseline BASELINE_LABEL --stage 1
+```
 
 ### Q4: whole-model quantized file format
 
@@ -295,7 +225,7 @@ CARGO_FEATURES_EXTRA=android-blas \
 RUSTFLAGS_EXTRA="-C target-feature=+dotprod" \
 BENCH_LANGUAGE=Auto \
 BENCH_PROMPT="音频是粤语，可能夹杂英语" \
-bench/android_run.sh \
+bench/android_run.py \
   --label android-fast-openblas-v0333-dynarch-thread8-forced1-$(date -u +%Y%m%d-%H%M%S) \
   --assets-dir /Volumes/SSD/qwen-asr-android-fast-assets \
   --threads "1" \
@@ -303,11 +233,18 @@ bench/android_run.sh \
   --profile
 ```
 
-Decision:
-- If forced single-thread runtime mostly recovers `cv_yue_003` encode from
-  `881.855 ms` toward the `292.986 ms` baseline, the failure mode is internal
-  OpenBLAS threading. Drop threaded OpenBLAS from speed work.
-- If it remains slow, dynamic-arch dispatch or selected kernels are suspect.
+After the run:
+
+```bash
+bench/android_check_gate.py \
+  --result android-fast-openblas-v0333-dynarch-thread8-forced1-<timestamp> \
+  --baseline BASELINE_LABEL \
+  --stage 1
+```
+
+Interpret the output: if `cv_yue_003` encode recovers toward `292.986 ms`
+baseline, the regression was internal OpenBLAS threading. If it stays slow,
+dynamic-arch dispatch or kernel selection is suspect.
 
 ### P2: dynamic-arch single-thread build only if needed
 
@@ -326,10 +263,13 @@ Build shape:
 - `ONLY_CBLAS=1`
 - Android API `33` or the current benchmark default API
 
-Decision:
-- Promote only if it improves the prompt-correct fast gate. Apply the universal
-  acceptance rule at the full gate; otherwise stop OpenBLAS build-variant work
-  and move to P3.
+After the run:
+
+```bash
+bench/android_check_gate.py --result "$LABEL" --baseline BASELINE_LABEL --stage 1
+```
+
+If stage 1 fails, stop OpenBLAS build-variant work and move to P3.
 
 ### P3: Android SGEMM shape microbench
 
@@ -368,22 +308,22 @@ Likely targets:
 - Reducing generated tokens or prompt/prefix work only if quality remains
   stable.
 
-Decision:
-- Promote only if phase timing shows the token loop, not prefill, dominates the
-  remaining decode cost and the candidate gate improves without transcript
-  drift.
+Run only after P0 confirms token loop dominates decode cost:
+
+```bash
+LABEL=android-fast-p4-decode-matvec-$(date -u +%Y%m%d-%H%M%S)
+bench/android_run.py \
+  --label "$LABEL" \
+  --assets-dir /Volumes/SSD/qwen-asr-android-fast-assets \
+  --threads "1" \
+  --runs 1
+bench/android_check_gate.py --result "$LABEL" --baseline BASELINE_LABEL --stage 1
+```
 
 ### P5: guardrail normalization for Auto language
 
 Status:
-- Low speed ROI, useful for experiment velocity.
-
-Purpose:
-- Add a normalized guardrail comparison for benchmark reporting while keeping
-  raw transcripts in JSON. Current Auto-language outputs can be semantically and
-  phonetically stable while failing the old exact string check (`Hello` versus
-  `哈喽`, punctuation variants).
-
-Decision:
-- Do this when quality triage starts slowing speed experiments, or before
-  changing any default benchmark acceptance rule.
+- Done. `bench/android_run.py` and `bench/android_check_gate.py` both use
+  keyword matching (`你好吗`, `坐低咗`) instead of an exact string, so
+  script/punctuation variants under Auto language no longer cause false
+  rejections.

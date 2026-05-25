@@ -5,14 +5,15 @@ Canonical result for quick comparison:
 | Result | Label | Common Voice median | Common Voice encode | Common Voice decode | Guardrail median | Guardrail encode | Guardrail decode | Guardrail transcript |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | Best accepted | `android-baseline-openblas-fixedperf-t1-r3-20260524-215914` | `1677.491 ms` | `383.011 ms` | `1305.652 ms` | `2609.735 ms` | `722.009 ms` | `1908.856 ms` | `哈喽，你好吗？已经坐低咗啦。` |
-| Latest rerun | `android-baseline-openblas-fixedperf-t1-r3-20260525-rerun` | `1797.315 ms` | `378.084 ms` | `1419.142 ms` | `2798.915 ms` | `748.484 ms` | `2054.865 ms` | `哈喽，你好吗？已经坐低咗啦。` |
+| Rerun (bash script) | `android-baseline-openblas-fixedperf-t1-r3-20260525-rerun` | `1797.315 ms` | `378.084 ms` | `1419.142 ms` | `2798.915 ms` | `748.484 ms` | `2054.865 ms` | `哈喽，你好吗？已经坐低咗啦。` |
+| Latest rerun (python script) | `android-baseline-py-full-20260525-103710` | `1778.161 ms` | `377.781 ms` | `1399.354 ms` | `2813.800 ms` | `751.200 ms` | `2065.700 ms` | `哈喽，你好吗？已经坐低咗啦。` |
 
 Latest rerun delta versus best accepted:
 
 | Input | Delta |
 | --- | ---: |
-| Common Voice median inference | `+7.14%` slower |
-| Guardrail median inference | `+7.25%` slower |
+| Common Voice median inference | `+6.0%` slower |
+| Guardrail median inference | `+7.8%` slower |
 
 Best accepted config:
 
@@ -36,7 +37,7 @@ CARGO_FEATURES_EXTRA=android-blas \
 RUSTFLAGS_EXTRA="-C target-feature=+dotprod" \
 BENCH_LANGUAGE=Auto \
 BENCH_PROMPT="音频是粤语，可能夹杂英语" \
-bench/android_run.sh \
+bench/android_run.py \
   --label android-baseline-openblas-fixedperf-t1-r3-$(date -u +%Y%m%d-%H%M%S) \
   --assets-dir bench/android-assets \
   --threads "1" \
@@ -49,3 +50,5 @@ JSON references:
 - `bench/android-results/android-baseline-openblas-fixedperf-t1-r3-20260524-215914/ptt_guardrail-t1.json`
 - `bench/android-results/android-baseline-openblas-fixedperf-t1-r3-20260525-rerun/common_voice-t1.json`
 - `bench/android-results/android-baseline-openblas-fixedperf-t1-r3-20260525-rerun/ptt_guardrail-t1.json`
+- `bench/android-results/android-baseline-py-full-20260525-103710/common_voice-t1.json`
+- `bench/android-results/android-baseline-py-full-20260525-103710/ptt_guardrail-t1.json`

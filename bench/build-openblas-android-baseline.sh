@@ -116,4 +116,4 @@ echo "Build metadata:"
 echo "  $OPENBLAS_DIR/android-baseline-build-info.txt"
 echo
 echo "Use with:"
-echo "  OPENBLAS_ANDROID_LIB_DIR=$OPENBLAS_DIR OPENBLAS_ANDROID_STATIC=1 bench/android_run.sh --threads '1' --runs 3"
+echo "  OPENBLAS_ANDROID_LIB_DIR=$OPENBLAS_DIR OPENBLAS_ANDROID_STATIC=1 bench/android_run.py --threads '1' --runs 3"
