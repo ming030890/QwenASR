@@ -92,7 +92,7 @@ pub struct Decoder {
     /// Separate lm_head for forced aligner (None = tied weights with tok_embeddings)
     pub lm_head_bf16: Option<*const u16>,
     /// INT8 quantized lm_head weights for fast argmax
-    pub lm_head_int8: Option<Vec<i8>>,
+    pub lm_head_int8: Option<Int8Buf>,
     pub lm_head_int8_scales: Option<Vec<f32>>,
 }
 
@@ -379,20 +379,28 @@ impl Decoder {
             ms.get_bf16_direct("thinker.lm_head.weight")
         };
 
-        // Quantize lm_head to INT8 for fast argmax
-        let lm_weight = lm_head_bf16.unwrap_or(tok_embeddings_bf16);
         let lm_out_dim = cfg.lm_head_dim();
         let lm_in_dim = cfg.dec_hidden;
-        let (lm_int8, lm_scales) =
-            kernels::quantize_bf16_weights_to_int8(lm_weight, lm_out_dim, lm_in_dim);
+        let (lm_head_int8, lm_head_int8_scales) = match ms.get_i8_ptr("thinker.lm_head.weight") {
+            Some((ptr, len)) if len == lm_out_dim * lm_in_dim => (
+                Some(Int8Buf::from_mmap(ptr, len)),
+                Some(load_f32(ms, "thinker.lm_head.weight_int8_scale")?),
+            ),
+            _ => {
+                let lm_weight = lm_head_bf16.unwrap_or(tok_embeddings_bf16);
+                let (lm_int8, lm_scales) =
+                    kernels::quantize_bf16_weights_to_int8(lm_weight, lm_out_dim, lm_in_dim);
+                (Some(Int8Buf::from_owned(lm_int8)), Some(lm_scales))
+            }
+        };
 
         Some(Decoder {
             tok_embeddings_bf16,
             layers,
             norm,
             lm_head_bf16,
-            lm_head_int8: Some(lm_int8),
-            lm_head_int8_scales: Some(lm_scales),
+            lm_head_int8,
+            lm_head_int8_scales,
         })
     }
 }

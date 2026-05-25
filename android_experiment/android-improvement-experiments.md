@@ -15,6 +15,9 @@ Protocol, scripts, thermal control, and acceptance rules:
   missing the speed-first Stage 3 acceptance rule: it cuts load RSS to about
   `508 MB` and peak RSS to about `1.45 GB`, while full Common Voice median
   regressed `+3.5%` in the controlled benchmark.
+- M4 is accepted on top of M3 A: tied `lm_head` host pre-quantization cuts
+  model load to about `27.5 ms`, load RSS to about `52.7 MB`, and peak RSS to
+  about `1.15 GB`, with full Common Voice median neutral/slightly faster.
 - Latest rejected OpenBLAS variants are summarized in the completed result
   index below; use linked result logs for detailed numbers.
 - The active work is now bottleneck isolation. Do not resume broad OpenBLAS
@@ -45,6 +48,7 @@ file for each completed experiment.
 | M1 | Transient prefill dequantization: INT8 decoder prefill weights dequantize into a shared F32 scratch buffer instead of permanent per-layer F32 heap copies. Stage 3 reached `404.7 ms` model load, `1567828 KB` load RSS, and `2136024 KB` peak RSS. | Accept. Model load improved `56.7%`, load RSS improved `57.7%`, peak RSS improved `44.3%`, and Common Voice median was `1.1%` faster versus Q2B. | [M1 details](android-speed-results/m1-transient-prefill-dequant.md) |
 | M2 | Lazy/dynamic KV cache allocation: start `KvCache` at `128` tokens and grow on demand instead of constructing `2048` tokens up front. Stage 3 was neutral: Common Voice median `1718.5 ms` vs M1 `1722.5 ms`, load RSS `1567760 KB` vs `1567828 KB`, peak RSS `2135716 KB` vs `2136024 KB`. | Reject and revert. The untouched zeroed KV pages do not appear to commit into Android RSS, so the smaller logical capacity does not improve measured memory metrics and adds a future long-input growth/copy event. | [M2 details](android-speed-results/m2-lazy-kv-cache.md) |
 | M3 | Transient BF16 encoder weight conversion: tested all encoder projection weights transient, then transformer-layer-only transient with stem/final projections kept F32. Stage 3 reached `507756-558156 KB` load RSS and `149.5-185.6 ms` model load, but full Common Voice median regressed `+3.5-3.7%`. | Implement M3 A as a memory-prioritized tradeoff. It misses the speed-first `+2%` inference regression limit, but saves the most RSS and may improve low-memory robustness. | [M3 details](android-speed-results/m3-transient-bf16-encoder.md) |
+| M4 | Tied `lm_head` host-side pre-quantization: emits an I8 mmap-backed `thinker.lm_head.weight` while keeping BF16 token embeddings for lookup. Stage 3 reached `27.5 ms` model load, `52700 KB` load RSS, `1147644 KB` peak RSS, and `1771.6 ms` full Common Voice median. | Accept. Meets model-load, load-RSS, and peak-RSS thresholds with neutral/slightly faster full Common Voice median versus M3 A. | [M4 details](android-speed-results/m4-tied-lm-head-int8.md) |
 
 ## Current Android Experiment Plan
 
@@ -80,14 +84,13 @@ Gate scripts: `bench/android_run.py` (collect numbers, waits for thermal interna
 
 | Rank | ID | ROI | Experiment | Main metrics |
 | --- | --- | ---: | --- | --- |
-| 1 | M4 | 4 | Host-side pre-quantization of the tied LM head. | `memory_kb`, `peak_rss_kb`, `model_load_ms` |
-| 2 | P0 | 5 | Phase-split benchmark timing. | `mel_ms`, `encoder_ms`, `prefill_ms`, `decode_loop_ms/token` |
-| 3 | P1 | 4 | Isolate threaded OpenBLAS runtime settings. | encode/decode split and fast-gate latency |
-| 4 | P3 | 4 | Android SGEMM shape microbench. | per-shape Android/macOS gap |
-| 5 | Q3 | 3 | Encoder weight quantization feasibility probe. | encoder timing, RSS, CER |
-| 6 | P2 | 3 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. | fast-gate and acceptance latency |
-| 7 | P4 | 3 | Decoder token-loop matvec work after phase split. | `decode_loop_ms/token` |
-| 8 | Q4 | 1 | Whole-model quantized file format. | package size, startup, fallback complexity |
+| 1 | P0 | 5 | Phase-split benchmark timing. | `mel_ms`, `encoder_ms`, `prefill_ms`, `decode_loop_ms/token` |
+| 2 | P1 | 4 | Isolate threaded OpenBLAS runtime settings. | encode/decode split and fast-gate latency |
+| 3 | P3 | 4 | Android SGEMM shape microbench. | per-shape Android/macOS gap |
+| 4 | Q3 | 3 | Encoder weight quantization feasibility probe. | encoder timing, RSS, CER |
+| 5 | P2 | 3 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. | fast-gate and acceptance latency |
+| 6 | P4 | 3 | Decoder token-loop matvec work after phase split. | `decode_loop_ms/token` |
+| 7 | Q4 | 1 | Whole-model quantized file format. | package size, startup, fallback complexity |
 
 ### M1: Transient layer-by-layer dequantization of F32 prefill weights
 
@@ -150,7 +153,7 @@ Result:
 ### M4: Tied LM Head host-side pre-quantization
 
 Status:
-- Proposed. High ROI memory-saver.
+- Done. Accepted.
 
 ROI:
 - 4/5.
@@ -160,6 +163,12 @@ Purpose:
 
 Why:
 - The engine currently quantizes the massive `lm_head` (vocabulary size `151,936` x `1024` hidden) to INT8 on the heap at startup, consuming **149 MB of heap**. Pre-quantizing it on the host lets the client read it directly from `mmap` zero-copy, saving startup CPU overhead and 149 MB of heap.
+
+Result:
+- Stage 3 passed versus M3 A with neutral/slightly faster full Common Voice
+  median (`1771.6 ms` vs `1782.3 ms`) and large memory/startup wins:
+  `27.5 ms` model load, `52700 KB` load RSS, and `1147644 KB` peak RSS.
+- See [M4 details](android-speed-results/m4-tied-lm-head-int8.md).
 
 ### Q2: decoder INT8 weight replacement
 

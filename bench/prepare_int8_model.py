@@ -2,8 +2,9 @@
 """Prepare INT8-decoder model for Q2 experiment.
 
 Reads the BF16 model.safetensors, replaces all decoder layer projection weights
-(q/k/v/o attention, gate/up/down MLP) with INT8 + per-row F32 scales, and
-writes the result to OUTPUT_DIR/model.safetensors.
+(q/k/v/o attention, gate/up/down MLP) with INT8 + per-row F32 scales, adds a
+pre-quantized tied lm_head tensor, and writes the result to
+OUTPUT_DIR/model.safetensors.
 
 All non-decoder tensors (encoder weights, embeddings, norms, etc.) are copied
 unchanged as BF16.  Vocabulary files (vocab.json, merges.txt) are symlinked or
@@ -15,6 +16,8 @@ on-device BF16→INT8 quantization at model-load time.
 Naming convention in the output file:
   {layer}.{proj}.weight          dtype I8   [out_dim, in_dim]   (replaces BF16)
   {layer}.{proj}.weight_int8_scale  dtype F32  [out_dim]         (new)
+  thinker.lm_head.weight         dtype I8   [vocab, hidden]     (new for tied head)
+  thinker.lm_head.weight_int8_scale dtype F32 [vocab]           (new)
 
 Usage:
   bench/prepare_int8_model.py \\
@@ -43,6 +46,9 @@ DECODER_PROJ_SUFFIXES = [
 ]
 
 DTYPE_SIZES = {"F32": 4, "F16": 2, "BF16": 2, "I8": 1, "I32": 4, "I64": 8, "BOOL": 1}
+EMBED_TOKENS = "thinker.model.embed_tokens.weight"
+LM_HEAD = "thinker.lm_head.weight"
+LM_HEAD_SCALE = "thinker.lm_head.weight_int8_scale"
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +181,15 @@ def is_decoder_up_proj(name: str) -> bool:
     return "thinker.model.layers." in name and name.endswith("mlp.up_proj.weight")
 
 
+def has_untied_lm_head(header: dict) -> bool:
+    """Return true when the source model has a separate BF16 lm_head tensor."""
+    if LM_HEAD not in header:
+        return False
+    lm_shape = header[LM_HEAD]["shape"]
+    embed_shape = header.get(EMBED_TOKENS, {}).get("shape")
+    return lm_shape != embed_shape
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -203,8 +218,11 @@ def main():
     # Identify decoder projection tensors
     decoder_proj_names = {n for n in names if is_decoder_proj(n)}
     gate_proj_names = {n for n in names if is_decoder_gate_proj(n)}
+    quantize_tied_lm_head = not has_untied_lm_head(header)
     print(f"  individual projections to quantize: {len(decoder_proj_names)}, "
           f"gate+up pairs to fuse: {len(gate_proj_names)}", flush=True)
+    print(f"  tied lm_head pre-quantization: {'yes' if quantize_tied_lm_head else 'no'}",
+          flush=True)
 
     # Build the output tensor list
     out_tensors: list[tuple[str, str, np.ndarray]] = []
@@ -250,6 +268,8 @@ def main():
             quantized_count += 1  # gate + up emitted as a single fused tensor
         elif is_decoder_up_proj(name):
             pass  # already emitted as gate_up_fused when gate_proj was processed
+        elif name == LM_HEAD and quantize_tied_lm_head:
+            pass  # replaced below from embed_tokens so embedding lookup stays BF16
         else:
             # Copy as-is: raw bytes wrapped as uint8 ndarray.
             # Pass original shape explicitly — arr.shape would be [n_bytes], not the
@@ -257,6 +277,16 @@ def main():
             start, end = meta["data_offsets"]
             raw = np.array(data_mmap[start:end], dtype=np.uint8)
             out_tensors.append((name, dtype_str, raw, list(meta["shape"])))
+
+        if name == EMBED_TOKENS and quantize_tied_lm_head:
+            assert dtype_str == "BF16", f"Expected BF16 for {name}, got {dtype_str}"
+            embed_bf16 = get_tensor_np(header, data_mmap, name)
+            assert embed_bf16.ndim == 2, f"Expected 2D weight for {name}"
+            print(f"  quantizing tied lm_head from {name} {embed_bf16.shape} …", flush=True)
+            lm_int8, lm_scales = quantize_bf16_to_int8(embed_bf16)
+            out_tensors.append((LM_HEAD, "I8", lm_int8))
+            out_tensors.append((LM_HEAD_SCALE, "F32", lm_scales))
+            quantized_count += 1
 
     print(f"\nQuantized {quantized_count} tensors.", flush=True)
     print(f"Writing {model_dst} …", flush=True)
