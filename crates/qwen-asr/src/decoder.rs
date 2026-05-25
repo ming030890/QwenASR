@@ -88,120 +88,234 @@ fn load_bf16_as_f32(
     Some(out)
 }
 
+fn load_i8_vec(ms: &MultiSafetensors, name: &str) -> Option<Vec<i8>> {
+    let result = ms.get_i8_vec(name);
+    if result.is_none() {
+        eprintln!("decoder: I8 weight not found: {}", name);
+    }
+    result
+}
+
+fn dequantize_int8_to_f32(int8: &[i8], scales: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; out_dim * in_dim];
+    for row in 0..out_dim {
+        let s = scales[row];
+        for col in 0..in_dim {
+            out[row * in_dim + col] = (int8[row * in_dim + col] as f32) * s;
+        }
+    }
+    out
+}
+
 impl Decoder {
     pub fn load(ms: &MultiSafetensors, cfg: &QwenConfig) -> Option<Self> {
+        use crate::safetensors::Dtype;
+
         let tok_embeddings_bf16 = load_bf16_direct(ms, "thinker.model.embed_tokens.weight")?;
+
+        // Detect whether the model file stores decoder weights as pre-quantized INT8.
+        // The Python host script prepare_int8_model.py creates a model where every
+        // decoder projection weight has dtype I8 instead of BF16.
+        let use_int8_weights = matches!(
+            ms.get_dtype("thinker.model.layers.0.self_attn.q_proj.weight"),
+            Some(Dtype::I8)
+        );
+
+        if use_int8_weights {
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                eprintln!("decoder: INT8 pre-quantized model is not supported on this architecture");
+                return None;
+            }
+        }
 
         let mut layers = Vec::new();
         for i in 0..cfg.dec_layers {
             let lp = format!("thinker.model.layers.{}", i);
 
-            let wq = load_bf16_direct(ms, &format!("{}.self_attn.q_proj.weight", lp))?;
-            let wk = load_bf16_direct(ms, &format!("{}.self_attn.k_proj.weight", lp))?;
-            let wv = load_bf16_direct(ms, &format!("{}.self_attn.v_proj.weight", lp))?;
-            let wo = load_bf16_direct(ms, &format!("{}.self_attn.o_proj.weight", lp))?;
             let q_dim = cfg.dec_heads * cfg.dec_head_dim;
             let kv_dim = cfg.dec_kv_heads * cfg.dec_head_dim;
             let hidden = cfg.dec_hidden;
             let inter = cfg.dec_intermediate;
-
-            let wq_weight_f32_prefill = load_bf16_as_f32(
-                ms,
-                &format!("{}.self_attn.q_proj.weight", lp),
-                q_dim,
-                hidden,
-            )?;
-            let wk_weight_f32_prefill = load_bf16_as_f32(
-                ms,
-                &format!("{}.self_attn.k_proj.weight", lp),
-                kv_dim,
-                hidden,
-            )?;
-            let wv_weight_f32_prefill = load_bf16_as_f32(
-                ms,
-                &format!("{}.self_attn.v_proj.weight", lp),
-                kv_dim,
-                hidden,
-            )?;
-            let wo_weight_f32_prefill = load_bf16_as_f32(
-                ms,
-                &format!("{}.self_attn.o_proj.weight", lp),
-                hidden,
-                q_dim,
-            )?;
 
             let q_norm = load_f32(ms, &format!("{}.self_attn.q_norm.weight", lp))?;
             let k_norm = load_f32(ms, &format!("{}.self_attn.k_norm.weight", lp))?;
             let input_norm = load_f32(ms, &format!("{}.input_layernorm.weight", lp))?;
             let post_attn_norm = load_f32(ms, &format!("{}.post_attention_layernorm.weight", lp))?;
 
-            let gate_bf16 = load_bf16_direct(ms, &format!("{}.mlp.gate_proj.weight", lp))?;
-            let up_bf16 = load_bf16_direct(ms, &format!("{}.mlp.up_proj.weight", lp))?;
-            let down_bf16 = load_bf16_direct(ms, &format!("{}.mlp.down_proj.weight", lp))?;
+            if use_int8_weights {
+                // INT8 model path: decoder projection weights stored as I8 + F32 scales.
+                // The BF16 raw pointers are unused on aarch64; gate_up_fused_bf16 is empty.
+                let wq_int8 = load_i8_vec(ms, &format!("{}.self_attn.q_proj.weight", lp))?;
+                let wq_int8_scales = load_f32(ms, &format!("{}.self_attn.q_proj.weight_int8_scale", lp))?;
+                let wk_int8 = load_i8_vec(ms, &format!("{}.self_attn.k_proj.weight", lp))?;
+                let wk_int8_scales = load_f32(ms, &format!("{}.self_attn.k_proj.weight_int8_scale", lp))?;
+                let wv_int8 = load_i8_vec(ms, &format!("{}.self_attn.v_proj.weight", lp))?;
+                let wv_int8_scales = load_f32(ms, &format!("{}.self_attn.v_proj.weight_int8_scale", lp))?;
+                let wo_int8 = load_i8_vec(ms, &format!("{}.self_attn.o_proj.weight", lp))?;
+                let wo_int8_scales = load_f32(ms, &format!("{}.self_attn.o_proj.weight_int8_scale", lp))?;
 
-            // Fuse gate+up: interleave rows
-            let mut gate_up_fused = vec![0u16; 2 * inter * hidden];
-            unsafe {
-                let gate_slice = std::slice::from_raw_parts(gate_bf16, inter * hidden);
-                let up_slice = std::slice::from_raw_parts(up_bf16, inter * hidden);
+                // gate and up stored separately; interleave to produce fused representation
+                let gate_int8 = load_i8_vec(ms, &format!("{}.mlp.gate_proj.weight", lp))?;
+                let gate_int8_scales = load_f32(ms, &format!("{}.mlp.gate_proj.weight_int8_scale", lp))?;
+                let up_int8 = load_i8_vec(ms, &format!("{}.mlp.up_proj.weight", lp))?;
+                let up_int8_scales = load_f32(ms, &format!("{}.mlp.up_proj.weight_int8_scale", lp))?;
+
+                let down_int8 = load_i8_vec(ms, &format!("{}.mlp.down_proj.weight", lp))?;
+                let down_int8_scales = load_f32(ms, &format!("{}.mlp.down_proj.weight_int8_scale", lp))?;
+
+                // Interleave gate + up INT8 rows: [gate0, up0, gate1, up1, ...]
+                let mut gate_up_int8 = vec![0i8; 2 * inter * hidden];
+                let mut gate_up_int8_scales = vec![0.0f32; 2 * inter];
                 for r in 0..inter {
-                    gate_up_fused[2 * r * hidden..(2 * r + 1) * hidden]
-                        .copy_from_slice(&gate_slice[r * hidden..(r + 1) * hidden]);
-                    gate_up_fused[(2 * r + 1) * hidden..(2 * r + 2) * hidden]
-                        .copy_from_slice(&up_slice[r * hidden..(r + 1) * hidden]);
+                    gate_up_int8[2 * r * hidden..(2 * r + 1) * hidden]
+                        .copy_from_slice(&gate_int8[r * hidden..(r + 1) * hidden]);
+                    gate_up_int8[(2 * r + 1) * hidden..(2 * r + 2) * hidden]
+                        .copy_from_slice(&up_int8[r * hidden..(r + 1) * hidden]);
+                    gate_up_int8_scales[2 * r] = gate_int8_scales[r];
+                    gate_up_int8_scales[2 * r + 1] = up_int8_scales[r];
                 }
+
+                // Dequantize INT8 → F32 for prefill paths
+                let wq_weight_f32_prefill = dequantize_int8_to_f32(&wq_int8, &wq_int8_scales, q_dim, hidden);
+                let wk_weight_f32_prefill = dequantize_int8_to_f32(&wk_int8, &wk_int8_scales, kv_dim, hidden);
+                let wv_weight_f32_prefill = dequantize_int8_to_f32(&wv_int8, &wv_int8_scales, kv_dim, hidden);
+                let wo_weight_f32_prefill = dequantize_int8_to_f32(&wo_int8, &wo_int8_scales, hidden, q_dim);
+                let gate_up_fused_f32_prefill = dequantize_int8_to_f32(&gate_up_int8, &gate_up_int8_scales, 2 * inter, hidden);
+                let down_weight_f32_prefill = dequantize_int8_to_f32(&down_int8, &down_int8_scales, hidden, inter);
+
+                layers.push(DecLayer {
+                    wq_weight_bf16: std::ptr::null(),
+                    wk_weight_bf16: std::ptr::null(),
+                    wv_weight_bf16: std::ptr::null(),
+                    wo_weight_bf16: std::ptr::null(),
+                    wq_weight_f32_prefill,
+                    wk_weight_f32_prefill,
+                    wv_weight_f32_prefill,
+                    wo_weight_f32_prefill,
+                    q_norm_weight: q_norm,
+                    k_norm_weight: k_norm,
+                    input_norm,
+                    post_attn_norm,
+                    gate_weight_bf16: std::ptr::null(),
+                    up_weight_bf16: std::ptr::null(),
+                    down_weight_bf16: std::ptr::null(),
+                    gate_up_fused_bf16: Vec::new(),
+                    gate_up_fused_f32_prefill,
+                    down_weight_f32_prefill,
+                    wq_int8,
+                    wq_int8_scales,
+                    wk_int8,
+                    wk_int8_scales,
+                    wv_int8,
+                    wv_int8_scales,
+                    wo_int8,
+                    wo_int8_scales,
+                    gate_up_int8,
+                    gate_up_int8_scales,
+                    down_int8,
+                    down_int8_scales,
+                });
+            } else {
+                // BF16 model path (original): load BF16 then quantize on device.
+                let wq = load_bf16_direct(ms, &format!("{}.self_attn.q_proj.weight", lp))?;
+                let wk = load_bf16_direct(ms, &format!("{}.self_attn.k_proj.weight", lp))?;
+                let wv = load_bf16_direct(ms, &format!("{}.self_attn.v_proj.weight", lp))?;
+                let wo = load_bf16_direct(ms, &format!("{}.self_attn.o_proj.weight", lp))?;
+
+                let wq_weight_f32_prefill = load_bf16_as_f32(
+                    ms,
+                    &format!("{}.self_attn.q_proj.weight", lp),
+                    q_dim,
+                    hidden,
+                )?;
+                let wk_weight_f32_prefill = load_bf16_as_f32(
+                    ms,
+                    &format!("{}.self_attn.k_proj.weight", lp),
+                    kv_dim,
+                    hidden,
+                )?;
+                let wv_weight_f32_prefill = load_bf16_as_f32(
+                    ms,
+                    &format!("{}.self_attn.v_proj.weight", lp),
+                    kv_dim,
+                    hidden,
+                )?;
+                let wo_weight_f32_prefill = load_bf16_as_f32(
+                    ms,
+                    &format!("{}.self_attn.o_proj.weight", lp),
+                    hidden,
+                    q_dim,
+                )?;
+
+                let gate_bf16 = load_bf16_direct(ms, &format!("{}.mlp.gate_proj.weight", lp))?;
+                let up_bf16 = load_bf16_direct(ms, &format!("{}.mlp.up_proj.weight", lp))?;
+                let down_bf16 = load_bf16_direct(ms, &format!("{}.mlp.down_proj.weight", lp))?;
+
+                // Fuse gate+up: interleave rows
+                let mut gate_up_fused = vec![0u16; 2 * inter * hidden];
+                unsafe {
+                    let gate_slice = std::slice::from_raw_parts(gate_bf16, inter * hidden);
+                    let up_slice = std::slice::from_raw_parts(up_bf16, inter * hidden);
+                    for r in 0..inter {
+                        gate_up_fused[2 * r * hidden..(2 * r + 1) * hidden]
+                            .copy_from_slice(&gate_slice[r * hidden..(r + 1) * hidden]);
+                        gate_up_fused[(2 * r + 1) * hidden..(2 * r + 2) * hidden]
+                            .copy_from_slice(&up_slice[r * hidden..(r + 1) * hidden]);
+                    }
+                }
+                let mut gate_up_fused_f32_prefill = vec![0.0f32; 2 * inter * hidden];
+                kernels::bf16_to_f32_buf(&mut gate_up_fused_f32_prefill, &gate_up_fused);
+                let down_weight_f32_prefill =
+                    load_bf16_as_f32(ms, &format!("{}.mlp.down_proj.weight", lp), hidden, inter)?;
+
+                // INT8 quantize all decoder layer weights
+                let (wq_int8, wq_int8_scales) =
+                    kernels::quantize_bf16_weights_to_int8(wq, q_dim, hidden);
+                let (wk_int8, wk_int8_scales) =
+                    kernels::quantize_bf16_weights_to_int8(wk, kv_dim, hidden);
+                let (wv_int8, wv_int8_scales) =
+                    kernels::quantize_bf16_weights_to_int8(wv, kv_dim, hidden);
+                let (wo_int8, wo_int8_scales) =
+                    kernels::quantize_bf16_weights_to_int8(wo, hidden, q_dim);
+                let (gate_up_int8, gate_up_int8_scales) =
+                    kernels::quantize_bf16_weights_to_int8(gate_up_fused.as_ptr(), 2 * inter, hidden);
+                let (down_int8, down_int8_scales) =
+                    kernels::quantize_bf16_weights_to_int8(down_bf16, hidden, inter);
+
+                layers.push(DecLayer {
+                    wq_weight_bf16: wq,
+                    wk_weight_bf16: wk,
+                    wv_weight_bf16: wv,
+                    wo_weight_bf16: wo,
+                    wq_weight_f32_prefill,
+                    wk_weight_f32_prefill,
+                    wv_weight_f32_prefill,
+                    wo_weight_f32_prefill,
+                    q_norm_weight: q_norm,
+                    k_norm_weight: k_norm,
+                    input_norm,
+                    post_attn_norm,
+                    gate_weight_bf16: gate_bf16,
+                    up_weight_bf16: up_bf16,
+                    down_weight_bf16: down_bf16,
+                    gate_up_fused_bf16: gate_up_fused,
+                    gate_up_fused_f32_prefill,
+                    down_weight_f32_prefill,
+                    wq_int8,
+                    wq_int8_scales,
+                    wk_int8,
+                    wk_int8_scales,
+                    wv_int8,
+                    wv_int8_scales,
+                    wo_int8,
+                    wo_int8_scales,
+                    gate_up_int8,
+                    gate_up_int8_scales,
+                    down_int8,
+                    down_int8_scales,
+                });
             }
-            let mut gate_up_fused_f32_prefill = vec![0.0f32; 2 * inter * hidden];
-            kernels::bf16_to_f32_buf(&mut gate_up_fused_f32_prefill, &gate_up_fused);
-            let down_weight_f32_prefill =
-                load_bf16_as_f32(ms, &format!("{}.mlp.down_proj.weight", lp), hidden, inter)?;
-
-            // INT8 quantize all decoder layer weights
-            let (wq_int8, wq_int8_scales) =
-                kernels::quantize_bf16_weights_to_int8(wq, q_dim, hidden);
-            let (wk_int8, wk_int8_scales) =
-                kernels::quantize_bf16_weights_to_int8(wk, kv_dim, hidden);
-            let (wv_int8, wv_int8_scales) =
-                kernels::quantize_bf16_weights_to_int8(wv, kv_dim, hidden);
-            let (wo_int8, wo_int8_scales) =
-                kernels::quantize_bf16_weights_to_int8(wo, hidden, q_dim);
-            let (gate_up_int8, gate_up_int8_scales) =
-                kernels::quantize_bf16_weights_to_int8(gate_up_fused.as_ptr(), 2 * inter, hidden);
-            let (down_int8, down_int8_scales) =
-                kernels::quantize_bf16_weights_to_int8(down_bf16, hidden, inter);
-
-            layers.push(DecLayer {
-                wq_weight_bf16: wq,
-                wk_weight_bf16: wk,
-                wv_weight_bf16: wv,
-                wo_weight_bf16: wo,
-                wq_weight_f32_prefill,
-                wk_weight_f32_prefill,
-                wv_weight_f32_prefill,
-                wo_weight_f32_prefill,
-                q_norm_weight: q_norm,
-                k_norm_weight: k_norm,
-                input_norm,
-                post_attn_norm,
-                gate_weight_bf16: gate_bf16,
-                up_weight_bf16: up_bf16,
-                down_weight_bf16: down_bf16,
-                gate_up_fused_bf16: gate_up_fused,
-                gate_up_fused_f32_prefill,
-                down_weight_f32_prefill,
-                wq_int8,
-                wq_int8_scales,
-                wk_int8,
-                wk_int8_scales,
-                wv_int8,
-                wv_int8_scales,
-                wo_int8,
-                wo_int8_scales,
-                gate_up_int8,
-                gate_up_int8_scales,
-                down_int8,
-                down_int8_scales,
-            });
         }
 
         let norm = load_f32(ms, "thinker.model.norm.weight")?;

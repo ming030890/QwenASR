@@ -37,6 +37,7 @@ file for each completed experiment.
 | C2 | Fixed-performance baseline reached `1677.491 ms`; engine `threads=2` regressed to `92916.558 ms` and empty Common Voice transcripts. | Reject engine thread counts above `1`; keep engine `threads=1`. | [C2 details](android-speed-results/c2-openblas-engine-thread-sweep-fixedperf.md) |
 | C3 | NDK 29 generic `ARMV8` static OpenBLAS reached `1602.726 ms` Common Voice; `DYNAMIC_ARCH=1`, `USE_THREAD=1`, `NUM_THREADS=8`, API 33 reached `2466.708 ms`. Both were slower than the prompt-correct fast baseline. | Reject NDK-version-only and threaded dynamic-arch rebuilds at Stage 1. Stop broad OpenBLAS rebuild guessing until phase-split and shape-level measurements isolate the failure mode. | [C3 details](android-speed-results/c3-openblas-ndk29-armv8-rebuild.md) |
 | Q1 | Decoder INT8 sidecar cache generated on first device load. Cached `model_load_ms` was slower than baseline (`1476 ms` vs `1402 ms`); RSS improvement was `~6%`, below the `10%` threshold; inference regressed. | Reject. Sidecar requires reading an extra `570M` file from device storage, which costs more than the on-device quantization it avoids. | [Q1 details](android-speed-results/q1-decoder-int8-sidecar-cache.md) |
+| Q2 | Pre-quantize decoder weights to INT8 on host; replace BF16 tensors in model file. Model file `419 MB` smaller (`1370 MB` vs `1789 MB`). Fast gate: `cv_yue_003` `1595.6 ms` (+7.7% vs baseline); `model_load_ms` unchanged at `1361 ms`; RSS `~0.9%` lower. | Reject. Smaller model file does not reduce load or inference time; on-device quantization rides free on already-paged BF16 data. | [Q2 details](android-speed-results/q2-decoder-int8-weights.md) |
 
 ## Current Android Experiment Plan
 
@@ -72,19 +73,18 @@ Gate scripts: `bench/android_run.py` (collect numbers, waits for thermal interna
 
 | Rank | ID | ROI | Experiment | Main metrics |
 | --- | --- | ---: | --- | --- |
-| 1 | Q2 | 5 | Pre-quantize decoder weights to INT8 on host; ship as model assets. No sidecar file. | `model_load_ms`, `memory_after_model_load_kb`, `peak_inference_rss_kb`, `inference_ms` |
-| 2 | P0 | 5 | Phase-split benchmark timing. | `mel_ms`, `encoder_ms`, `prefill_ms`, `decode_loop_ms/token` |
-| 3 | P1 | 4 | Isolate threaded OpenBLAS runtime settings. | encode/decode split and fast-gate latency |
-| 4 | P3 | 4 | Android SGEMM shape microbench. | per-shape Android/macOS gap |
-| 5 | Q3 | 3 | Encoder weight quantization feasibility probe. | encoder timing, RSS, CER |
-| 6 | P2 | 3 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. | fast-gate and acceptance latency |
-| 7 | P4 | 3 | Decoder token-loop matvec work after phase split. | `decode_loop_ms/token` |
-| 8 | Q4 | 1 | Whole-model quantized file format. | package size, startup, fallback complexity |
+| 1 | P0 | 5 | Phase-split benchmark timing. | `mel_ms`, `encoder_ms`, `prefill_ms`, `decode_loop_ms/token` |
+| 2 | P1 | 4 | Isolate threaded OpenBLAS runtime settings. | encode/decode split and fast-gate latency |
+| 3 | P3 | 4 | Android SGEMM shape microbench. | per-shape Android/macOS gap |
+| 4 | Q3 | 3 | Encoder weight quantization feasibility probe. | encoder timing, RSS, CER |
+| 5 | P2 | 3 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. | fast-gate and acceptance latency |
+| 6 | P4 | 3 | Decoder token-loop matvec work after phase split. | `decode_loop_ms/token` |
+| 7 | Q4 | 1 | Whole-model quantized file format. | package size, startup, fallback complexity |
 
 ### Q2: decoder INT8 weight replacement
 
 Status:
-- Next quantization experiment.
+- Done. Rejected.
 
 ROI:
 - 5/5.
@@ -183,7 +183,7 @@ Dropped from the active plan:
 ### P0: phase-split benchmark timing
 
 Status:
-- Next.
+- Next (promoted to rank 1 after Q2 rejection).
 
 Purpose:
 - Split the current coarse `encode_ms` and `decode_ms` into actionable buckets:
