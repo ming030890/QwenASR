@@ -39,6 +39,7 @@ file for each completed experiment.
 | Q2 | Pre-quantize decoder weights to INT8 on host; replace BF16 tensors in model file. Model file `419 MB` smaller (`1370 MB` vs `1789 MB`). Fast gate: neutral — `model_load_ms` unchanged at `1361 ms`, inference within cross-session noise, RSS `~0.9%` lower. | Reject (neutral). Smaller file does not reduce load or inference time; on-device BF16→INT8 quantization rides free on already-paged mmap data; load is CPU/alloc bound, not I/O bound. | [Q2 details](android-speed-results/q2-decoder-int8-weights.md) |
 | Q2B | Zero-copy mmap INT8 decoder weights: read INT8 model weights directly via zero-copy mmap pointers rather than allocating and copying to the heap. Fuses gate+up projections in model file. | Accept. Achieves ~31.4% faster model load (935 ms vs 1364 ms) and ~24.5% lower memory footprint (3.71 GB vs 4.91 GB RSS) with neutral/slightly faster inference. | [Q2B details](android-speed-results/q2b-int8-mmap-zero-copy.md) |
 | M1 | Transient prefill dequantization: INT8 decoder prefill weights dequantize into a shared F32 scratch buffer instead of permanent per-layer F32 heap copies. Stage 3 reached `404.7 ms` model load, `1567828 KB` load RSS, and `2136024 KB` peak RSS. | Accept. Model load improved `56.7%`, load RSS improved `57.7%`, peak RSS improved `44.3%`, and Common Voice median was `1.1%` faster versus Q2B. | [M1 details](android-speed-results/m1-transient-prefill-dequant.md) |
+| M2 | Lazy/dynamic KV cache allocation: start `KvCache` at `128` tokens and grow on demand instead of constructing `2048` tokens up front. Stage 3 was neutral: Common Voice median `1718.5 ms` vs M1 `1722.5 ms`, load RSS `1567760 KB` vs `1567828 KB`, peak RSS `2135716 KB` vs `2136024 KB`. | Reject and revert. The untouched zeroed KV pages do not appear to commit into Android RSS, so the smaller logical capacity does not improve measured memory metrics and adds a future long-input growth/copy event. | [M2 details](android-speed-results/m2-lazy-kv-cache.md) |
 
 ## Current Android Experiment Plan
 
@@ -74,16 +75,15 @@ Gate scripts: `bench/android_run.py` (collect numbers, waits for thermal interna
 
 | Rank | ID | ROI | Experiment | Main metrics |
 | --- | --- | ---: | --- | --- |
-| 1 | M2 | 5 | Lazy/Dynamic KV Cache scaling starting at 128 tokens. | `memory_kb`, `peak_rss_kb`, `inference_ms` |
-| 2 | M3 | 4 | Transient layer-by-layer conversion of BF16 encoder weights. | `memory_kb`, `peak_rss_kb`, `encoder_ms` |
-| 3 | M4 | 4 | Host-side pre-quantization of the tied LM head. | `memory_kb`, `peak_rss_kb`, `model_load_ms` |
-| 4 | P0 | 5 | Phase-split benchmark timing. | `mel_ms`, `encoder_ms`, `prefill_ms`, `decode_loop_ms/token` |
-| 5 | P1 | 4 | Isolate threaded OpenBLAS runtime settings. | encode/decode split and fast-gate latency |
-| 6 | P3 | 4 | Android SGEMM shape microbench. | per-shape Android/macOS gap |
-| 7 | Q3 | 3 | Encoder weight quantization feasibility probe. | encoder timing, RSS, CER |
-| 8 | P2 | 3 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. | fast-gate and acceptance latency |
-| 9 | P4 | 3 | Decoder token-loop matvec work after phase split. | `decode_loop_ms/token` |
-| 10 | Q4 | 1 | Whole-model quantized file format. | package size, startup, fallback complexity |
+| 1 | M3 | 4 | Transient layer-by-layer conversion of BF16 encoder weights. | `memory_kb`, `peak_rss_kb`, `encoder_ms` |
+| 2 | M4 | 4 | Host-side pre-quantization of the tied LM head. | `memory_kb`, `peak_rss_kb`, `model_load_ms` |
+| 3 | P0 | 5 | Phase-split benchmark timing. | `mel_ms`, `encoder_ms`, `prefill_ms`, `decode_loop_ms/token` |
+| 4 | P1 | 4 | Isolate threaded OpenBLAS runtime settings. | encode/decode split and fast-gate latency |
+| 5 | P3 | 4 | Android SGEMM shape microbench. | per-shape Android/macOS gap |
+| 6 | Q3 | 3 | Encoder weight quantization feasibility probe. | encoder timing, RSS, CER |
+| 7 | P2 | 3 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. | fast-gate and acceptance latency |
+| 8 | P4 | 3 | Decoder token-loop matvec work after phase split. | `decode_loop_ms/token` |
+| 9 | Q4 | 1 | Whole-model quantized file format. | package size, startup, fallback complexity |
 
 ### M1: Transient layer-by-layer dequantization of F32 prefill weights
 
@@ -102,7 +102,7 @@ Why:
 ### M2: Lazy/dynamic KV Cache allocation
 
 Status:
-- Proposed. High ROI memory-saver.
+- Done. Rejected and reverted.
 
 ROI:
 - 5/5.
@@ -112,6 +112,13 @@ Purpose:
 
 Why:
 - The current pre-allocation at `max_seq = 2048` consumes **448 MB of heap** immediately upon loading, even though ASR transcripts are typically short (often <100 tokens per chunk). Starting at `128` tokens consumes only **~28 MB** (saving **420 MB / 93%**) and grows gracefully only when needed.
+
+Result:
+- Stage 3 showed no meaningful RSS, peak RSS, model-load, or inference
+  improvement versus M1. The untouched zeroed cache pages appear not to commit
+  into Android RSS, so the smaller initial logical capacity does not improve
+  the measured app memory metrics.
+- Reverted to the fixed `2048` token cache.
 
 ### M3: Transient layer-by-layer conversion of BF16 encoder weights
 

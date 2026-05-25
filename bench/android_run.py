@@ -35,6 +35,10 @@ import sys
 import time
 from pathlib import Path
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
 SCRIPT_DIR = Path(__file__).parent.resolve()
 PROJECT_DIR = SCRIPT_DIR.parent
 
@@ -50,6 +54,10 @@ GUARDRAIL_KEYWORDS = ["你好吗", "坐低咗"]
 
 def env(key, default=""):
     return os.environ.get(key, default)
+
+
+def log(msg=""):
+    print(msg, flush=True)
 
 
 # ── adb helpers ───────────────────────────────────────────────────────────────
@@ -73,6 +81,18 @@ def adb_output(adb, *args):
     ).stdout
 
 
+def run_step(label, cmd, **kwargs):
+    log(f"  {label}...")
+    start = time.monotonic()
+    try:
+        result = subprocess.run(cmd, check=True, **kwargs)
+        log(f"  {label} done in {time.monotonic() - start:.1f}s")
+        return result
+    except Exception:
+        log(f"  {label} failed after {time.monotonic() - start:.1f}s")
+        raise
+
+
 # ── Thermal wait ──────────────────────────────────────────────────────────────
 
 def wait_for_thermal_ready(adb, timeout):
@@ -83,12 +103,12 @@ def wait_for_thermal_ready(adb, timeout):
         status_line = next((l for l in out.splitlines() if "Thermal Status" in l), "")
         status = status_line.split()[-1].strip() if status_line else "?"
         if status == "0":
-            print("Thermal Status: 0 — device ready.")
+            log("Thermal Status: 0 — device ready.")
             return
-        print(f"Thermal Status: {status} — waiting ({elapsed}s elapsed, timeout {timeout}s)...")
+        log(f"Thermal Status: {status} — waiting ({elapsed}s elapsed, timeout {timeout}s)...")
         for line in out.splitlines():
             if any(k in line for k in ("VIRTUAL-SKIN", "soc_therm", "BIG", "MID", "LITTLE", "battery")):
-                print(f"  {line.strip()}")
+                log(f"  {line.strip()}")
         if elapsed >= timeout:
             print(f"WARNING: thermal wait timed out after {timeout}s (status {status}). Proceeding.", file=sys.stderr)
             return
@@ -103,7 +123,7 @@ def prepare_device(adb):
     subprocess.run([adb, "shell", "input", "keyevent", "KEYCODE_WAKEUP"], check=False, capture_output=True)
     subprocess.run([adb, "shell", "svc", "power", "stayon", "true"], check=False, capture_output=True)
     subprocess.run([adb, "shell", "cmd", "power", "set-fixed-performance-mode-enabled", "true"], check=False, capture_output=True)
-    print("Device: screen on, stay-on, fixed-performance mode enabled.")
+    log("Device: screen on, stay-on, fixed-performance mode enabled.")
     return original
 
 
@@ -152,11 +172,11 @@ def append_tsv(tsv_path, json_path, timestamp, label, threads, input_name):
         ok = all(kw in t for kw in GUARDRAIL_KEYWORDS)
         guardrail_ok = str(ok).lower()
         mark = "✓" if ok else "✗"
-        print(f"  guardrail {mark}: {t!r}")
+        log(f"  guardrail {mark}: {t!r}")
 
-    print(f"  {input_name}: inference {median_infer:.1f} ms  "
-          f"encode {median_encode:.1f}  decode {median_decode:.1f}  "
-          f"model_load {model_load_ms:.1f}  mem {mem_kb} KB")
+    log(f"  {input_name}: inference {median_infer:.1f} ms  "
+        f"encode {median_encode:.1f}  decode {median_decode:.1f}  "
+        f"model_load {model_load_ms:.1f}  mem {mem_kb} KB")
 
     with open(tsv_path, "a", encoding="utf-8") as fh:
         fh.write(
@@ -221,13 +241,13 @@ def main():
             )
 
     # ── Thermal + device setup ────────────────────────────────────────────────
-    print("\n── Thermal check ────────────────────────────────────────")
+    log("\n── Thermal check ────────────────────────────────────────")
     wait_for_thermal_ready(args.adb, thermal_timeout)
     original_stay_on = prepare_device(args.adb)
     atexit.register(cleanup_device, args.adb, original_stay_on)
 
     # ── Build ─────────────────────────────────────────────────────────────────
-    print("\n── Build ────────────────────────────────────────────────")
+    log("\n── Build ────────────────────────────────────────────────")
     build_env = os.environ.copy()
     build_env.update({
         "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER": linker,
@@ -251,44 +271,43 @@ def main():
     if cargo_feats:
         build_cmd += ["--features", cargo_feats]
 
-    subprocess.run(build_cmd, env=build_env, cwd=str(PROJECT_DIR), check=True)
+    run_step("cargo build", build_cmd, env=build_env, cwd=str(PROJECT_DIR))
 
     if args.save_binary:
         import shutil
         dest = Path(args.save_binary)
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(str(PROJECT_DIR / "target/aarch64-linux-android/release/qwen-asr-bench-android"), dest)
-        print(f"  binary saved to: {dest}")
+        log(f"  binary saved to: {dest}")
 
     # ── Push ─────────────────────────────────────────────────────────────────
-    print("\n── Push ─────────────────────────────────────────────────")
+    log("\n── Push ─────────────────────────────────────────────────")
     bin_path      = PROJECT_DIR / "target/aarch64-linux-android/release/qwen-asr-bench-android"
     remote_bin    = f"{args.remote_dir}/qwen-asr-bench-android"
     remote_model  = f"{args.remote_dir}/model"
     remote_assets = f"{args.remote_dir}/assets"
     remote_cv     = f"{args.remote_dir}/common_voice"
 
-    subprocess.run([args.adb, "shell",
+    run_step("prepare remote dirs", [args.adb, "shell",
         f"mkdir -p '{args.remote_dir}' && "
         f"rm -rf '{remote_assets}' '{remote_cv}' && "
         f"mkdir -p '{remote_assets}' '{remote_cv}'"
-    ], check=True)
-    subprocess.run([args.adb, "push", str(bin_path), remote_bin], check=True, capture_output=True)
-    subprocess.run([args.adb, "shell", f"chmod 755 '{remote_bin}'"], check=True, capture_output=True)
+    ])
+    run_step("push benchmark binary", [args.adb, "push", str(bin_path), remote_bin])
+    run_step("chmod benchmark binary", [args.adb, "shell", f"chmod 755 '{remote_bin}'"],
+             capture_output=True)
     if openblas_runtime:
-        subprocess.run([args.adb, "push", openblas_runtime, f"{args.remote_dir}/"], check=True, capture_output=True)
-    print(f"  pushing model ({args.model_dir})...")
-    subprocess.run([args.adb, "push", f"{args.model_dir}/.", remote_model], check=True, capture_output=True)
-    print(f"  pushing assets ({args.assets_dir})...")
-    subprocess.run([args.adb, "push", f"{args.assets_dir}/.", remote_assets], check=True, capture_output=True)
-    subprocess.run([args.adb, "shell",
+        run_step("push OpenBLAS runtime", [args.adb, "push", openblas_runtime, f"{args.remote_dir}/"])
+    run_step(f"push model ({args.model_dir})", [args.adb, "push", f"{args.model_dir}/.", remote_model])
+    run_step(f"push assets ({args.assets_dir})", [args.adb, "push", f"{args.assets_dir}/.", remote_assets])
+    run_step("prepare Common Voice input", [args.adb, "shell",
         f"rm -rf '{remote_cv}' && mkdir -p '{remote_cv}' && "
         f"cp '{remote_assets}'/cv_yue_*.wav '{remote_cv}/'"
-    ], check=True, capture_output=True)
-    print("  push complete.")
+    ], capture_output=True)
+    log("  push complete.")
 
     # ── Run ───────────────────────────────────────────────────────────────────
-    print(f"\n── Run: {args.label} ────────────────────────────────────")
+    log(f"\n── Run: {args.label} ────────────────────────────────────")
     results_tsv = PROJECT_DIR / "results-android.tsv"
     ensure_tsv(results_tsv)
     out_dir = PROJECT_DIR / "bench" / "android-results" / args.label
@@ -316,20 +335,24 @@ def main():
             if remote_env:
                 remote_cmd = f"{remote_env} {remote_cmd}"
 
-            print(f"\n  [{input_name}, threads={threads}]")
+            log(f"\n  [{input_name}, threads={threads}]")
             subprocess.run([args.adb, "shell", "input", "keyevent", "KEYCODE_WAKEUP"],
                            check=False, capture_output=True)
-            result = subprocess.run([args.adb, "shell", remote_cmd],
-                                    capture_output=True, text=True, check=True)
+            result = run_step(
+                f"run {input_name} threads={threads}",
+                [args.adb, "shell", remote_cmd],
+                capture_output=True,
+                text=True,
+            )
             json_path.write_text(result.stdout, encoding="utf-8")
             append_tsv(results_tsv, json_path, timestamp, args.label, threads, input_name)
 
-    print(f"\nJSON results : {out_dir}")
-    print(f"TSV          : {results_tsv}")
-    print(f"\nNext — same-session gate check (eliminates thermal noise):")
-    print(f"  bench/android_compare.py --baseline-binary bench/android-baselines/NAME --label LABEL --stage 1")
-    print(f"\nOr store this build as the new baseline binary for future comparisons:")
-    print(f"  cp target/aarch64-linux-android/release/qwen-asr-bench-android bench/android-baselines/NAME")
+    log(f"\nJSON results : {out_dir}")
+    log(f"TSV          : {results_tsv}")
+    log(f"\nNext — same-session gate check (eliminates thermal noise):")
+    log(f"  bench/android_compare.py --baseline-binary bench/android-baselines/NAME --label LABEL --stage 1")
+    log(f"\nOr store this build as the new baseline binary for future comparisons:")
+    log(f"  cp target/aarch64-linux-android/release/qwen-asr-bench-android bench/android-baselines/NAME")
 
 
 if __name__ == "__main__":
