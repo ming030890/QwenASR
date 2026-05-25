@@ -59,6 +59,17 @@ Resume checklist:
 - Only promote an experiment to the full acceptance gate if the staged gate
   justifies it.
 
+Universal acceptance rule:
+- Stage 1 and Stage 2 results can reject or promote an idea, but they do not
+  define experiment-specific acceptance thresholds.
+- Stage 3 accepts a change only if it improves full Common Voice median
+  inference by at least `5%`, improves `model_load_ms` by at least `5%`, or
+  improves `memory_after_model_load_kb` or `peak_inference_rss_kb` by at least
+  `10%`.
+- Startup or memory wins must not regress full Common Voice median inference.
+- All accepted changes must keep Common Voice quality stable versus the current
+  best baseline and keep the guardrail semantically and phonetically stable.
+
 Current state summary:
 - Android benchmark infrastructure exists and defaults to the corrected Auto
   language prompt policy.
@@ -163,9 +174,8 @@ Why:
   fallback if the cache is missing, stale, or unsupported.
 
 Decision:
-- Keep if `model_load_ms` improves by at least 5% or
-  `memory_after_model_load_kb`/`peak_inference_rss_kb` improves by at least
-  10%, with no inference regression or transcript drift.
+- Apply the universal acceptance rule after the generated sidecar validates
+  cleanly.
 - Reject if cache validation is brittle, load failures no longer fall back to
   BF16, or Android cold start gets worse.
 
@@ -189,8 +199,8 @@ Why:
   inference speed.
 
 Decision:
-- Keep only if startup or package/RSS value is clear and the no-sidecar path
-  remains fully compatible.
+- Apply the universal acceptance rule; additionally require the no-sidecar path
+  to remain fully compatible.
 
 ### Q3: encoder quantization feasibility
 
@@ -210,8 +220,8 @@ Why:
   introduce dequantization overhead.
 
 Decision:
-- Promote only if encoder phase timing improves or RSS falls materially without
-  CER/guardrail regression.
+- Use phase timing and RSS only to decide whether to promote; apply the
+  universal acceptance rule before keeping any quantized encoder path.
 
 ### Q4: whole-model quantized file format
 
@@ -324,8 +334,9 @@ Build shape:
 - Android API `33` or the current benchmark default API
 
 Decision:
-- Keep only if it improves the prompt-correct fast gate and then the full
-  acceptance gate. Otherwise stop OpenBLAS build-variant work and move to P3.
+- Promote only if it improves the prompt-correct fast gate. Apply the universal
+  acceptance rule at the full gate; otherwise stop OpenBLAS build-variant work
+  and move to P3.
 
 ### P3: Android SGEMM shape microbench
 
