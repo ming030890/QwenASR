@@ -80,17 +80,56 @@ ROI scoring:
 - `3`: useful diagnostic or medium-size win, moderate risk.
 - `1`: uncertain payoff or high product/format risk.
 
+Reranking notes (after M4 acceptance, 2026-05-25):
+- Memory is largely solved: peak RSS `1.15 GB`, load RSS `52.7 MB`, model load
+  `27.5 ms`. Pure memory-only ideas now have low marginal ROI; speed dominates.
+- Encode gap (`9.67x` macOS) is larger than decode (`5.84x`), so kernel work that
+  touches encoder/prefill shapes pays back the most. Decode still has a `5.84x`
+  gap so it remains relevant, but mostly via the prefill portion until P0
+  splits prefill from the token loop.
+- The current `bf16_matvec` NEON kernel (`crates/qwen-asr/src/kernels/neon.rs`)
+  unpacks BF16 with `vshll_n_u16`+`vfmaq_f32` — it does **not** use the Armv8.6
+  `BFDOT`/`BFMMLA` instructions. Pixel 9 (Tensor G4, Armv9-A) supports both, so
+  a native BF16 dot-product kernel is a concrete, well-scoped, high-ROI target
+  attacking the `20-24%` bf16_matvec slice and any matmat caller of it.
+- `bf16_matvec` is also called in a row loop to implement matmat in encoder and
+  prefill. A true packed GEMM path (BFMMLA-based, or routed through a BF16-aware
+  BLAS) would be a second multiplier on the same code surface.
+- C3 already proved broad OpenBLAS rebuild guessing is dead. New BLAS work must
+  be either (a) phase/shape-targeted after P0/P3, or (b) a different library
+  (KleidiAI), not another OpenBLAS configuration sweep.
+- Q3 (encoder weight quantization probe) is reformulated as E1 (encoder INT8
+  weights with a real native INT8 GEMM kernel). The original probe was too
+  loose given M3's signal that touching encoder math is sensitive.
+- Q4 (whole-model quantized format) is dropped. The current pre-quantization
+  scheme via `prepare_int8_model.py` already covers the wins a new format would
+  buy, with no schema/versioning cost.
+- P2 (dynamic-arch single-thread OpenBLAS rebuild) stays conditional behind P1
+  and is demoted; if P1 shows threading is the regression cause, P2 is moot.
+
 Gate scripts: `bench/android_run.py` (collect numbers, waits for thermal internally) and `bench/android_check_gate.py --result LABEL --baseline LABEL --stage 1|2|3` (accept/reject with detailed output).
 
 | Rank | ID | ROI | Experiment | Main metrics |
 | --- | --- | ---: | --- | --- |
 | 1 | P0 | 5 | Phase-split benchmark timing. | `mel_ms`, `encoder_ms`, `prefill_ms`, `decode_loop_ms/token` |
-| 2 | P1 | 4 | Isolate threaded OpenBLAS runtime settings. | encode/decode split and fast-gate latency |
-| 3 | P3 | 4 | Android SGEMM shape microbench. | per-shape Android/macOS gap |
-| 4 | Q3 | 3 | Encoder weight quantization feasibility probe. | encoder timing, RSS, CER |
-| 5 | P2 | 3 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. | fast-gate and acceptance latency |
-| 6 | P4 | 3 | Decoder token-loop matvec work after phase split. | `decode_loop_ms/token` |
-| 7 | Q4 | 1 | Whole-model quantized file format. | package size, startup, fallback complexity |
+| 2 | K1 | 5 | NEON `BFDOT`/`BFMMLA` BF16 matvec/matmul kernel for the bf16_matvec hotpath. | `bf16_matvec` profile share, encode/decode latency |
+| 3 | K3 | 4 | True packed GEMM path for prefill/encoder (replace matvec-in-a-loop matmat). | encoder/prefill latency, sgemm share |
+| 4 | P3 | 4 | Android SGEMM shape microbench across candidate kernels (K1/K3 vs OpenBLAS vs KleidiAI). | per-shape Android/macOS gap |
+| 5 | P1 | 3 | Isolate threaded OpenBLAS runtime settings. | encode/decode split and fast-gate latency |
+| 6 | K2 | 3 | KleidiAI (Arm) GEMM library probe for top shapes from P3. | per-shape latency vs OpenBLAS/K1 |
+| 7 | E1 | 3 | Encoder INT8 weights + native INT8 GEMM kernel (replaces Q3). | encoder timing, RSS, CER |
+| 8 | P4 | 3 | Decoder token-loop matvec work after phase split. | `decode_loop_ms/token` |
+| 9 | C1K | 2 | Replace `conv2d_op` with im2col+GEMM through the K1/K3 path. | `conv2d_op` profile share, encode_ms |
+| 10 | P2 | 2 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. | fast-gate and acceptance latency |
+
+Removed from backlog:
+- **Q3** — reformulated as E1 (the probe form was too loose; we need a real INT8
+  kernel, not just a feasibility BF16-swap test that risks repeating M3's
+  encoder-math sensitivity).
+- **Q4** — whole-model quantized file format. The host pre-quantization scheme
+  already in `prepare_int8_model.py` (M4, Q2B) delivers the savings without a
+  schema/versioning/fallback cost. Revisit only if a kernel needs a layout that
+  the safetensors path cannot express.
 
 ### M1: Transient layer-by-layer dequantization of F32 prefill weights
 
@@ -206,51 +245,180 @@ bench/android_run.py \
 bench/android_check_gate.py --result "$LABEL" --baseline BASELINE_LABEL --stage 1
 ```
 
-### Q3: encoder quantization feasibility
+### K1: NEON BFDOT/BFMMLA BF16 matvec/matmul kernel
 
 Status:
-- Run after Q1/Q2 and P0 phase timing.
+- Next after P0 (or in parallel — P0 doesn't block the kernel work, it just
+  scopes which call sites matter most).
+
+ROI:
+- 5/5.
+
+Purpose:
+- Add an aarch64 NEON kernel path that consumes BF16 weights natively using the
+  Armv8.6 BF16 extension instructions `BFDOT` (4-lane BF16 dot, accumulating to
+  F32) and `BFMMLA` (2x2 BF16 matrix-multiply accumulate to F32) instead of the
+  current shift-left → `vfmaq_f32` path.
+
+Why:
+- The existing `bf16_matvec_fused` at
+  `crates/qwen-asr/src/kernels/neon.rs:30` unpacks BF16 into F32 with
+  `vshll_n_u16(.., 16)` and then accumulates with `vfmaq_f32`. That is 1 BF16
+  FMA per F32 FMA throughput — half (or worse) the Armv8.6 BF16 path.
+- Pixel 9 / Tensor G4 (Cortex-X4 / A720 / A520) is Armv9-A with mandatory BF16
+  support, so `BFDOT`/`BFMMLA` are available at runtime. Detect at startup, fall
+  back to the current kernel otherwise (older devices, non-aarch64).
+- C1 attributed `20-24%` of profiled time to `bf16_matvec`. The function is also
+  called as a matvec-per-row loop to implement matmat in encoder and prefill,
+  so a faster kernel also reduces the apparent `sgemm` share (which currently
+  includes BF16-weighted GEMM through this path).
+
+Plan:
+- Add a `neon_bf16` cargo feature and runtime CPU detection (via `is_aarch64_feature_detected!("bf16")`).
+- Implement `bf16_matvec_fused` using `vbfdotq_f32` (4-lane dot, four BF16 pairs into 4 F32 accumulators).
+- Implement a packed `bf16_matmat_fused` using `vbfmmlaq_f32` (2x4 BF16 panels, 2x2 F32 output tiles).
+- Add a unit test that diffs the new kernel vs the existing generic kernel on the same inputs (tolerance ~`1e-3` after BF16 rounding).
+- Microbench at the call shapes that show up in the encoder/prefill before running the full Android gate.
+
+Acceptance:
+- Stage 1 fast-gate: total median speedup, no transcript regression.
+- Stage 3 full Common Voice: median improvement, CER neutral.
+
+Run:
+
+```bash
+LABEL=android-fast-k1-bfdot-bfmmla-$(date -u +%Y%m%d-%H%M%S)
+bench/android_run.py \
+  --label "$LABEL" \
+  --assets-dir /Volumes/SSD/qwen-asr-android-fast-assets \
+  --threads "1" \
+  --runs 1 \
+  --profile
+bench/android_check_gate.py --result "$LABEL" --baseline BASELINE_LABEL --stage 1
+```
+
+### K3: packed GEMM path for prefill/encoder (eliminate matvec-loop matmat)
+
+Status:
+- Run after K1 lands. Uses the same kernel surface.
+
+ROI:
+- 4/5.
+
+Purpose:
+- Replace call sites in encoder and decoder prefill that currently call
+  `bf16_matvec_fused` per row (an implicit matmat with poor weight reuse) with
+  a true packed GEMM that streams the weight tile across multiple input rows.
+
+Why:
+- A `BFMMLA` GEMM that holds a weight tile in registers across an x-panel of
+  rows hits much higher GFLOPS than calling matvec N times — the weight loads
+  amortize across rows.
+- Encoder forward and prefill are the highest-shape callers; K3 specifically
+  attacks the encode `9.67x` gap.
+- Independent of OpenBLAS, so does not interact with C3's threading regressions.
+
+Acceptance:
+- Stage 3 full Common Voice: encode_ms improvement of `>= 15%`, CER neutral.
+
+### K2: KleidiAI (Arm) GEMM library probe
+
+Status:
+- Conditional on K1/K3 results and the P3 shape microbench.
 
 ROI:
 - 3/5.
 
 Purpose:
-- Quantize a single high-cost encoder projection family and compare it against
-  the current F32/OpenBLAS path.
+- Evaluate Arm's KleidiAI micro-kernels (the same library backing XNNPACK/
+  llama.cpp/MediaPipe Arm backends) for the top shapes identified by P3.
 
 Why:
-- Encoder weights are currently loaded as F32 and call BLAS-like kernels.
-  Quantization may reduce memory, but could lose optimized SGEMM throughput or
-  introduce dequantization overhead.
+- KleidiAI ships hand-tuned BF16/F32/INT8 GEMM micro-kernels for Armv8.6+ and
+  is specifically targeted at LLM/transformer shapes, including the skinny
+  encoder/prefill matrices where general-purpose OpenBLAS underperformed in C3.
+- Lower risk than writing a full GEMM macro-kernel from scratch; higher cost
+  than K1/K3 because of the library integration surface.
+- Only worth pulling in if K1/K3 leave a clear residual gap on specific shapes.
 
-Run (after Q2 and P0 phase timing):
+Decision rule:
+- If P3 shows K1/K3 within ~10% of KleidiAI on the top shapes, do not adopt the
+  dependency. If KleidiAI is meaningfully faster on shapes that dominate
+  runtime, ship it as the Android BLAS path.
 
-```bash
-LABEL=android-fast-q3-encoder-quant-$(date -u +%Y%m%d-%H%M%S)
-bench/android_run.py \
-  --label "$LABEL" \
-  --assets-dir /Volumes/SSD/qwen-asr-android-fast-assets \
-  --threads "1" \
-  --runs 1
-bench/android_check_gate.py --result "$LABEL" --baseline BASELINE_LABEL --stage 1
-```
-
-### Q4: whole-model quantized file format
+### E1: encoder INT8 weights + native INT8 GEMM kernel (replaces Q3)
 
 Status:
-- Deferred.
+- Run after K1/K3, and only if encoder_ms is still the dominant phase after
+  those kernels land.
 
 ROI:
-- 1/5 until Q1-Q3 show measurable Android value.
+- 3/5.
 
 Purpose:
-- Design a native quantized model file or GGUF-like export only after sidecar
-  and encoder data justify the format cost.
+- Host-pre-quantize encoder projection weights to INT8 with per-row F32 scales
+  (like the decoder path), and add an aarch64 INT8 GEMM kernel using `SDOT`
+  (`vdotq_s32`) that dequantizes by F32 scale on the accumulator.
 
 Why:
-- A replacement model file requires schema/versioning, conversion tooling,
-  architecture fallback, and accuracy-debug paths. Current x86 and prefill
-  paths still expect BF16/F32-compatible data.
+- M3 showed that swapping encoder math from F32 to "transient BF16 → F32 GEMM"
+  regresses speed `+3.5-3.7%` because we lose F32 SGEMM throughput without a
+  faster replacement. INT8 with `SDOT` is meaningfully higher throughput than
+  F32 SGEMM on Arm (4 INT8 MACs per dot, 16 lanes per `vdotq_s32`), so the
+  encoder math has a real upside path, not just a memory tradeoff.
+- The decoder already validates the host-pre-quant + mmap + on-device INT8
+  matmul flow end-to-end (Q2B/M1), so the safetensors and loader surface is
+  reusable.
+
+Acceptance:
+- Stage 3 full Common Voice: encode_ms improvement of `>= 10%`, CER neutral.
+
+### C1K: replace conv2d_op via im2col + K1/K3 GEMM
+
+Status:
+- After K3 lands.
+
+ROI:
+- 2/5.
+
+Purpose:
+- Route the encoder convolution projection through im2col packing into the K3
+  GEMM path instead of the current direct `conv2d_op`.
+
+Why:
+- C1 attributed `7-10%` of profiled time to `conv2d_op`. Once K1/K3 give us a
+  fast BF16 GEMM, the cheapest way to make `conv2d_op` faster is to convert it
+  to a GEMM call — at the cost of an im2col copy that is typically cheap
+  relative to the matmul itself for these shapes.
+- Smaller and more uncertain than K1/K3 (the conv shape is small and im2col
+  overhead could eat the win), but a natural follow-on once the GEMM kernel
+  exists.
+
+### Q3 (retired): encoder quantization feasibility probe
+
+Status:
+- Retired. Reformulated as E1.
+
+Why retired:
+- The original Q3 was a loose "swap weights, see what happens" probe. M3 showed
+  the encoder is sensitive to changes in the math path: a memory-saving swap
+  without a faster math path regressed Common Voice `+3.5-3.7%`. E1 replaces
+  Q3 with a sharper proposal — host pre-quantization plus a real native INT8
+  GEMM that has a credible speed upside (`SDOT`), not just RSS savings.
+
+### Q4 (dropped): whole-model quantized file format
+
+Status:
+- Dropped from the active plan.
+
+Why dropped:
+- The host pre-quantization scheme in `bench/prepare_int8_model.py` (Q2B INT8
+  decoder projections, M4 tied lm_head) already delivers the memory, load, and
+  zero-copy wins a new file format would buy, with no schema/versioning or
+  fallback cost.
+- Revisit only if a future kernel (K1/K3/E1/KleidiAI) needs a tensor layout the
+  current safetensors path cannot express. That is not the case for any
+  currently planned experiment.
 
 Dropped from the active plan:
 - Engine thread sweeps above `threads=1`: C2 showed `threads=2` can produce
