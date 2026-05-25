@@ -77,15 +77,8 @@ Current state summary:
   is the clear performance path.
 - Best accepted Android baseline, rebuild steps, and latest rerun comparison
   live in [android-best-baseline.md](android-best-baseline.md).
-- Prompt-correct macOS host median is `262.911 ms`; compare current Android
-  baseline numbers against the Android baseline reference above.
-- The latest OpenBLAS `DYNAMIC_ARCH=1`, `USE_THREAD=1`, `NUM_THREADS=8` run
-  regressed badly. On `cv_yue_003`, inference moved from `1481.111 ms`
-  baseline to `2466.708 ms`; encode moved from `292.986 ms` to `881.855 ms`,
-  while decode moved from `1188.245 ms` to `1393.140 ms`.
-- The latest regression is mostly encoder/BLAS-side. Treat it as an OpenBLAS
-  configuration failure, not evidence that the model has hit a global memory
-  bandwidth limit.
+- Latest rejected OpenBLAS variants are summarized in the completed result
+  index below; use linked result logs for detailed numbers.
 - The active work is now bottleneck isolation. Do not resume broad OpenBLAS
   rebuild guessing until phase-split profiling and shape-level SGEMM data point
   to a specific target.
