@@ -41,3 +41,6 @@
 # Flutter / FRB generated files
 /flutter/qwen_asr/rust/src/frb_generated.rs
 /flutter/qwen_asr/lib/src/rust/frb_generated*.dart
+
+# Saved baseline binaries for same-session gate comparisons
+/bench/android-baselines/

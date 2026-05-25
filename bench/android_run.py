@@ -182,7 +182,9 @@ def main():
     p.add_argument("--threads",    default="1", help='space-separated thread counts, e.g. "1 2 4"')
     p.add_argument("--remote-dir", default="/data/local/tmp/qwen-asr-bench")
     p.add_argument("--adb",        default=env("ADB", "/Users/tony/Library/Android/sdk/platform-tools/adb"))
-    p.add_argument("--profile",    action="store_true", help="Enable kernel profiling counters")
+    p.add_argument("--profile",     action="store_true", help="Enable kernel profiling counters")
+    p.add_argument("--save-binary", metavar="PATH",
+                   help="Copy the compiled binary to PATH after build (e.g. bench/android-baselines/my-baseline)")
     args = p.parse_args()
 
     ndk_home     = env("NDK_HOME", env("ANDROID_NDK_HOME", env("ANDROID_NDK_ROOT",
@@ -251,6 +253,13 @@ def main():
 
     subprocess.run(build_cmd, env=build_env, cwd=str(PROJECT_DIR), check=True)
 
+    if args.save_binary:
+        import shutil
+        dest = Path(args.save_binary)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(PROJECT_DIR / "target/aarch64-linux-android/release/qwen-asr-bench-android"), dest)
+        print(f"  binary saved to: {dest}")
+
     # ── Push ─────────────────────────────────────────────────────────────────
     print("\n── Push ─────────────────────────────────────────────────")
     bin_path      = PROJECT_DIR / "target/aarch64-linux-android/release/qwen-asr-bench-android"
@@ -317,8 +326,10 @@ def main():
 
     print(f"\nJSON results : {out_dir}")
     print(f"TSV          : {results_tsv}")
-    print(f"\nNext — check the gate:")
-    print(f"  bench/android_check_gate.py --result {args.label} --baseline BASELINE_LABEL --stage 1")
+    print(f"\nNext — same-session gate check (eliminates thermal noise):")
+    print(f"  bench/android_compare.py --baseline-binary bench/android-baselines/NAME --label LABEL --stage 1")
+    print(f"\nOr store this build as the new baseline binary for future comparisons:")
+    print(f"  cp target/aarch64-linux-android/release/qwen-asr-bench-android bench/android-baselines/NAME")
 
 
 if __name__ == "__main__":

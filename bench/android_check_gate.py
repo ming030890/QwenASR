@@ -6,6 +6,11 @@ Usage:
 
 Exits 0 = PASS (promote/accept), 1 = FAIL (reject).
 
+IMPORTANT: baseline and result must come from the same on-device session (run
+back-to-back via android_compare.py) so that thermal/scheduling noise cancels
+out.  Comparing results from different sessions produces 6-13% phantom variance
+that violates the tight regression limits below.
+
 Stage 1 (fast gate, 1 CV clip):
   - Guardrail must be phonetically stable.
   - cv_yue_003 inference must not regress >10% vs baseline.
