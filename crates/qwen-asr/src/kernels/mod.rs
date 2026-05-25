@@ -707,6 +707,30 @@ pub unsafe fn linear_nobias_bf16_scratch(y: &mut [f32], x: &[f32], w_bf16: *cons
     linear_nobias(y, x, &scratch[..n], seq_len, in_dim, out_dim);
 }
 
+/// Like linear_bf16 but reuses caller-provided scratch for multi-token BF16->F32 conversion.
+/// # Safety
+/// Caller must ensure w_bf16 points to at least out_dim * in_dim valid bf16 values.
+pub unsafe fn linear_bf16_scratch(y: &mut [f32], x: &[f32], w_bf16: *const u16, b: Option<&[f32]>, seq_len: usize, in_dim: usize, out_dim: usize, scratch: &mut [f32]) {
+    if seq_len == 1 {
+        bf16_matvec_threaded(y, x, w_bf16, b, in_dim, out_dim);
+        return;
+    }
+    let n = out_dim * in_dim;
+    let src = unsafe { std::slice::from_raw_parts(w_bf16, n) };
+    bf16_to_f32_buf(&mut scratch[..n], src);
+    linear(y, x, &scratch[..n], b, seq_len, in_dim, out_dim);
+}
+
+/// Like linear_accumulate but reuses caller-provided scratch for BF16->F32 conversion.
+/// # Safety
+/// Caller must ensure w_bf16 points to at least out_dim * in_dim valid bf16 values.
+pub unsafe fn linear_accumulate_bf16_scratch(y: &mut [f32], x: &[f32], w_bf16: *const u16, b: Option<&[f32]>, seq_len: usize, in_dim: usize, out_dim: usize, scratch: &mut [f32]) {
+    let n = out_dim * in_dim;
+    let src = unsafe { std::slice::from_raw_parts(w_bf16, n) };
+    bf16_to_f32_buf(&mut scratch[..n], src);
+    linear_accumulate(y, x, &scratch[..n], b, seq_len, in_dim, out_dim);
+}
+
 pub fn linear_bf16(y: &mut [f32], x: &[f32], w_bf16: *const u16, b: Option<&[f32]>, seq_len: usize, in_dim: usize, out_dim: usize) {
     if seq_len == 1 {
         bf16_matvec_threaded(y, x, w_bf16, b, in_dim, out_dim);
