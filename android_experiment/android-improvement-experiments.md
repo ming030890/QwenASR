@@ -86,11 +86,23 @@ P0 phase-split findings (2026-05-25):
   Prefill is `~50-53%` of total inference (`70%` of legacy `decode_ms`).
   The autoregressive token loop is `~22%` of total inference at `46-53`
   ms/token over typically `7-13` tokens for these clips.
-- Kernel work that touches the BF16 GEMM call surface (encoder + prefill)
-  attacks `~75%` of total inference; pure token-loop work attacks `~22%`.
-- These shares come from cv_yue_003 and ptt_guardrail fast-gate runs; rerun
-  the phase split on a longer clip if a future experiment is specifically
-  about long-utterance behavior.
+- Kernel work that touches the encoder BF16 call surface attacks `~25%` of
+  total inference. Kernel work that touches the decoder prefill F32 SGEMM
+  call surface attacks `~50%` of total inference. Token-loop work attacks
+  `~22%`.
+
+Host vs Android single-thread comparison (2026-05-25):
+- Same binary, same fast-gate assets, threads=1 on both. Android/macOS ratio
+  by phase: encoder `9.6-10.5x`, prefill `9.6-11.3x`, decode loop `3.3x`.
+- The decode loop INT8/SDOT path is essentially hardware-limited on Pixel 9.
+  Encoder (bf16_matvec NEON without BFDOT) and prefill (F32 SGEMM via
+  OpenBLAS) are far past hardware — they don't tap available SIMD throughput.
+- Conclusion: the Pixel 9 has the arithmetic throughput, we are not using it
+  in the BF16-shift+FMA encoder path or the F32 SGEMM prefill path. Replacing
+  those paths with BFDOT (encoder) and INT8 SDOT (prefill, since weights are
+  already INT8 on disk) is the highest-leverage class of work.
+- See [P0 details](android-speed-results/p0-phase-split-benchmark-timing.md)
+  for the full table.
 
 Reranking notes (after M4 acceptance, 2026-05-25):
 - Memory is largely solved: peak RSS `1.15 GB`, load RSS `52.7 MB`, model load
@@ -123,15 +135,16 @@ Gate scripts: `bench/android_run.py` (collect numbers, waits for thermal interna
 
 | Rank | ID | ROI | Experiment | Main metrics |
 | --- | --- | ---: | --- | --- |
-| 1 | K1 | 5 | NEON `BFDOT`/`BFMMLA` BF16 matvec/matmul kernel for the bf16_matvec hotpath. | `bf16_matvec` profile share, `encoder_ms`/`prefill_ms` |
-| 2 | K3 | 4 | True packed GEMM path for prefill/encoder (replace matvec-in-a-loop matmat). | `encoder_ms`/`prefill_ms`, sgemm share |
-| 3 | P3 | 4 | Android SGEMM shape microbench across candidate kernels (K1/K3 vs OpenBLAS vs KleidiAI). | per-shape Android/macOS gap |
-| 4 | P1 | 3 | Isolate threaded OpenBLAS runtime settings. | `encoder_ms`/`prefill_ms` split, fast-gate latency |
-| 5 | K2 | 3 | KleidiAI (Arm) GEMM library probe for top shapes from P3. | per-shape latency vs OpenBLAS/K1 |
-| 6 | E1 | 3 | Encoder INT8 weights + native INT8 GEMM kernel (replaces Q3). | `encoder_ms`, RSS, CER |
-| 7 | P4 | 2 | Decoder token-loop matvec work — demoted by P0: token loop is only ~22% of total inference. | `decode_loop_ms_per_token` |
-| 8 | C1K | 2 | Replace `conv2d_op` with im2col+GEMM through the K1/K3 path. | `conv2d_op` profile share, `encoder_ms` |
-| 9 | P2 | 2 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. | fast-gate and acceptance latency |
+| 1 | K4 | 5 | INT8 SDOT packed matmat for decoder prefill — reuse the already-on-disk INT8 weights and the validated SDOT decode-loop path, skip dequant + OpenBLAS SGEMM. | `prefill_ms`, total inference |
+| 2 | K1 | 5 | NEON `BFDOT`/`BFMMLA` BF16 matvec/matmul kernel for the bf16_matvec encoder hotpath. | `bf16_matvec` profile share, `encoder_ms` |
+| 3 | K3 | 4 | True packed BF16 GEMM (BFMMLA) for encoder (replace bf16_matvec-in-a-loop). Pairs with K1. | `encoder_ms`, sgemm share |
+| 4 | P3 | 3 | Android SGEMM/INT8/BF16 shape microbench across candidate kernels (K1/K3/K4 vs OpenBLAS vs KleidiAI). | per-shape Android/macOS gap |
+| 5 | P1 | 3 | Isolate threaded OpenBLAS runtime settings. | `encoder_ms`/`prefill_ms` split, fast-gate latency |
+| 6 | K2 | 3 | KleidiAI (Arm) GEMM library probe for top shapes from P3. | per-shape latency vs OpenBLAS/K1/K4 |
+| 7 | E1 | 3 | Encoder INT8 weights + native INT8 GEMM kernel (replaces Q3). Now lower priority than K1 since K1 directly attacks encoder bf16_matvec without changing format. | `encoder_ms`, RSS, CER |
+| 8 | P4 | 2 | Decoder token-loop matvec work — demoted by P0: token loop is only ~22% of total inference and Android/macOS ratio is already 3.3x (close to hardware). | `decode_loop_ms_per_token` |
+| 9 | C1K | 2 | Replace `conv2d_op` with im2col+GEMM through the K1/K3 path. | `conv2d_op` profile share, `encoder_ms` |
+| 10 | P2 | 1 | Dynamic-arch single-thread OpenBLAS build if P1 requires it. K4 sidesteps OpenBLAS for the biggest phase, so this matters less than before. | fast-gate and acceptance latency |
 
 Removed from backlog:
 - **Q3** — reformulated as E1 (the probe form was too loose; we need a real INT8
@@ -256,11 +269,86 @@ bench/android_run.py \
 bench/android_check_gate.py --result "$LABEL" --baseline BASELINE_LABEL --stage 1
 ```
 
+### K4: INT8 SDOT packed matmat for decoder prefill
+
+Status:
+- New (added 2026-05-25 from the host-vs-Android P0 comparison). Highest
+  ROI in the current backlog.
+
+ROI:
+- 5/5.
+
+Purpose:
+- Replace the decoder prefill F32 matmul path (currently:
+  INT8 weights on mmap → transient dequant to F32 scratch (M1)
+  → `linear_nobias` → `cblas_sgemm` via static OpenBLAS) with a packed
+  multi-row INT8 matmat using the same `vdotq_s32` (SDOT) instructions
+  that already power the decoder single-token path on aarch64.
+
+Why this is the right next step (host-vs-Android evidence):
+- P0 phase split shows decoder prefill is `~50%` of total Android
+  inference — `893 ms` of `1672 ms` on cv_yue_003, `1459 ms` of `2852 ms`
+  on guardrail.
+- Host (macOS aarch64, threads=1) does the same prefill in `93-129 ms`,
+  i.e. the Android/macOS ratio for prefill is `9.6-11.3x`, far past raw
+  hardware.
+- The decoder single-token loop already runs on Pixel 9 via INT8 SDOT at
+  only `3.3x` macOS. The hardware can do better — the F32 SGEMM prefill
+  path simply doesn't tap it.
+- Decoder weights are **already INT8 on disk** (Q2B host pre-quantization
+  with per-row F32 scales). No new safetensors layout is required; this
+  experiment is purely a kernel/path swap on the Android side.
+- The current dequant-into-F32-scratch step (M1) becomes unnecessary,
+  saving the dequant cost and the F32 scratch buffer's working-set
+  pressure.
+
+Plan:
+- Add an aarch64 `int8_matmat_sdot` kernel that takes:
+  - `x_f32: &[f32]` activations of shape `(seq_len, in_dim)`.
+  - `w_i8: *const i8` per-row-packed INT8 weights of shape
+    `(out_dim, in_dim)` (same layout as the decode-loop matvec already
+    consumes).
+  - `w_scales: &[f32]` per-row F32 scales.
+  - Output `y_f32: &mut [f32]` of shape `(seq_len, out_dim)`.
+- Internal strategy: dynamically quantize the activation tile to INT8
+  with a per-tile F32 scale (same trick the decode-loop matvec uses),
+  pack into small register-friendly panels, accumulate with `vdotq_s32`,
+  scale back to F32 on the accumulator with `weight_scale * act_scale`.
+- Add a host unit test that diffs the new kernel against the existing
+  F32 SGEMM path on representative decoder shapes; tolerance ~`1e-2` for
+  the int8 quantization error, same level the decode loop already
+  accepts.
+- Wire the new path into decoder prefill behind a runtime flag or feature
+  so the F32 SGEMM path stays available as a fallback.
+
+Acceptance:
+- Stage 1 fast gate: `prefill_ms` improves by `>= 20%`, total median
+  improves, no transcript regression.
+- Stage 3 full Common Voice: median inference improves by `>= 5%`, CER
+  neutral.
+
+Run:
+
+```bash
+LABEL=android-fast-k4-int8-prefill-sdot-$(date -u +%Y%m%d-%H%M%S)
+bench/android_run.py \
+  --label "$LABEL" \
+  --assets-dir /Volumes/SSD/qwen-asr-android-fast-assets \
+  --threads "1" \
+  --runs 1 \
+  --profile
+bench/android_check_gate.py --result "$LABEL" --baseline BASELINE_LABEL --stage 1
+```
+
 ### K1: NEON BFDOT/BFMMLA BF16 matvec/matmul kernel
 
 Status:
-- Next after P0 (or in parallel — P0 doesn't block the kernel work, it just
-  scopes which call sites matter most).
+- Rank 2 in the backlog. K4 attacks a larger absolute slice (prefill ~50%)
+  with already-INT8 weights and an already-validated SDOT path; K1 attacks
+  the encoder slice (~25%) and requires Armv8.6 BF16 detection + new kernel
+  code. Run K1 after K4 unless the K4 prototype reveals it should pair with
+  K1 (e.g. if encoder bf16_matvec becomes the binding constraint after
+  prefill is fixed).
 
 ROI:
 - 5/5.

@@ -53,6 +53,46 @@ Guardrail transcript matched (`'哈喽，你好吗？已经坐低咗啦。'`).
 JSON:
 `bench/android-results/android-fast-p0-phase-split-20260525-165425/`
 
+## Host vs Android phase comparison (threads=1)
+
+Same binary built for darwin-aarch64 and run on the host with the same fast
+assets, threads=1, language=Auto, prompt=`音频是粤语，可能夹杂英语`. Median
+of 3 runs (run 1 dropped for cold-cache noise).
+
+| Phase                          | macOS cv_yue_003 | Android cv_yue_003 | Android/macOS |
+| ------------------------------ | ---------------: | -----------------: | ------------: |
+| total inference                |            250.9 |             1672.5 |          6.7x |
+| mel                            |              0.2 |                3.3 |         16.5x |
+| encoder (bf16_matvec NEON)     |             42.1 |              403.9 |          9.6x |
+| prefill (F32 SGEMM via OpenBLAS) |          93.4 |              893.2 |          9.6x |
+| decode loop (INT8 SDOT matvec) |            114.2 |              371.9 |          3.3x |
+
+| Phase                          | macOS guardrail | Android guardrail | Android/macOS |
+| ------------------------------ | --------------: | ----------------: | ------------: |
+| total                          |           385.8 |            2852.2 |          7.4x |
+| encoder                        |            75.3 |             788.0 |         10.5x |
+| prefill                        |           129.2 |            1459.5 |         11.3x |
+| decode loop                    |           181.4 |             599.7 |          3.3x |
+
+Key observation: the gap is **not uniform across phases**.
+
+- `decode_loop` is only `3.3x` slower on Android — the INT8/SDOT matvec path
+  is essentially hitting the hardware single-core ceiling on Pixel 9.
+- `encoder` (bf16_matvec NEON without BFDOT) and `prefill` (F32 SGEMM via
+  OpenBLAS) are `9.6-11.3x` slower — way past raw hardware.
+
+On macOS, `decode_loop` is the *largest* phase (more tokens × faster
+per-token math means the loop dominates). On Android, `prefill` is the
+largest by far. This is **not the same bottleneck shape**: optimizations
+proven on macOS will not translate proportionally to Android.
+
+The dramatic delta between the INT8/SDOT path (~3x) and the
+BF16-NEON / F32-SGEMM paths (~10x) is a direct signal: arithmetic
+throughput on Pixel 9 single-thread is roughly fine when we use the
+right SIMD path, and badly under-utilized when we use the BF16-shift +
+F32-FMA path or OpenBLAS F32 SGEMM. The INT8 SDOT kernel proves the
+hardware can do better — the encoder/prefill kernels just don't tap it.
+
 ## Findings that should steer the next experiments
 
 1. **Mel cost is negligible** (~3–5 ms out of ~400–800 ms of encode). The
@@ -70,16 +110,26 @@ JSON:
    cv_yue_003, `788 / 2852 = 28%` on guardrail) is meaningful but smaller than
    prefill (`53%` and `51%` respectively).
 
-Implication for the backlog:
+Implication for the backlog (revised after host comparison):
 
-- K1/K3 (BF16 NEON GEMM kernels) and E1 (encoder INT8 GEMM) attack both the
-  `encoder_ms` slice (~25%) and the `prefill_ms` slice (~50%+) because both
-  phases run the same BF16-weight projections through `bf16_matvec` /
-  `bf16_matmat`. So K1/K3 is the highest-leverage next item, as the backlog
-  already lists.
-- P4 (decoder token-loop matvec work) attacks only the `decode_loop_ms` slice
-  (~22% on cv_yue_003, ~21% on guardrail). With prefill more than 2× the
-  token-loop cost, P4 is correctly demoted: optimize prefill via K1/K3 first.
+- **K4 (new) — INT8 SDOT packed matmat for decoder prefill** is the new
+  rank-1 item. Decoder weights are already INT8 on disk (Q2B); single-token
+  decode already runs an INT8 SDOT matvec at only `3.3x` macOS speed; the
+  prefill path instead dequantizes to F32 and routes through OpenBLAS SGEMM,
+  which is `9.6-11.3x` macOS speed. K4 reuses the proven SDOT machinery to
+  attack `~50%` of total inference with no weight-format change.
+- K1 (BFDOT/BFMMLA BF16 kernel) drops to rank 2. It attacks `encoder_ms`
+  (~25% of total) and requires both runtime BF16 feature detection and a new
+  kernel; K4 attacks a larger slice with code that closely mirrors the
+  already-shipped INT8 decode-loop matvec.
+- E1 (encoder INT8 weight pre-quantization + INT8 GEMM) becomes a possible
+  K1 alternative: if K1 brings encoder within ~2x of macOS, E1 is unneeded;
+  if K1 leaves a gap, E1 + K4's same INT8 GEMM machinery is a natural
+  follow-up.
+- P4 (decoder token-loop matvec) stays demoted. Token loop is only ~22% of
+  total inference, and the Android/macOS ratio for that phase is already
+  `3.3x` — close to raw hardware. Little room to win without changing the
+  algorithm.
 
 ## Followups
 
