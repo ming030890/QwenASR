@@ -3,7 +3,7 @@
 use crate::audio;
 use crate::config::*;
 use crate::context::QwenCtx;
-use crate::decoder::{self, tok_embed_bf16_to_f32};
+use crate::decoder::{self, tok_embed_to_f32};
 use crate::kernels;
 use crate::tokenizer::QwenTokenizer;
 
@@ -40,10 +40,7 @@ fn elapsed_ms(t0: f64) -> f64 {
 /// English/space-delimited: split on whitespace.
 /// CJK (Chinese, Japanese, Korean, Cantonese): character-level split.
 fn split_words(text: &str, language: &str) -> Vec<String> {
-    let is_cjk = matches!(
-        language,
-        "Chinese" | "Japanese" | "Korean" | "Cantonese"
-    );
+    let is_cjk = matches!(language, "Chinese" | "Japanese" | "Korean" | "Cantonese");
 
     if is_cjk {
         // Character-level split (each Unicode character is a "word")
@@ -53,9 +50,7 @@ fn split_words(text: &str, language: &str) -> Vec<String> {
             .collect()
     } else {
         // Space-delimited split
-        text.split_whitespace()
-            .map(|s| s.to_string())
-            .collect()
+        text.split_whitespace().map(|s| s.to_string()).collect()
     }
 }
 
@@ -171,8 +166,16 @@ fn fix_timestamps(timestamps: &mut [f32]) {
         let block_len = block_end - block_start;
 
         // Get boundary values
-        let left_val = if block_start > 0 { timestamps[block_start - 1] } else { 0.0 };
-        let right_val = if block_end < n { timestamps[block_end] } else { left_val + block_len as f32 * 80.0 };
+        let left_val = if block_start > 0 {
+            timestamps[block_start - 1]
+        } else {
+            0.0
+        };
+        let right_val = if block_end < n {
+            timestamps[block_end]
+        } else {
+            left_val + block_len as f32 * 80.0
+        };
 
         if block_len <= 2 {
             // Small block: fill with nearest normal value
@@ -231,7 +234,11 @@ pub fn forced_align(
     let (words, text_tokens) = encode_timestamp(text, language, &tokenizer)?;
 
     if kernels::verbose() >= 2 {
-        eprintln!("  Align: {} words, {} text tokens", words.len(), text_tokens.len());
+        eprintln!(
+            "  Align: {} words, {} text tokens",
+            words.len(),
+            text_tokens.len()
+        );
     }
 
     // Step 2: Mel spectrogram + encoder
@@ -240,12 +247,16 @@ pub fn forced_align(
     let mel_ms = elapsed_ms(t0);
 
     let t0 = get_time_ms();
-    let (enc_output, enc_seq_len) = ctx.encoder.forward(cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))?;
+    let (enc_output, enc_seq_len) =
+        ctx.encoder
+            .forward(cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))?;
     let enc_ms = elapsed_ms(t0);
 
     if kernels::verbose() >= 2 {
-        eprintln!("  Mel: {} frames ({:.0} ms), Encoder: {} tokens ({:.0} ms)",
-                  mel_frames, mel_ms, enc_seq_len, enc_ms);
+        eprintln!(
+            "  Mel: {} frames ({:.0} ms), Encoder: {} tokens ({:.0} ms)",
+            mel_frames, mel_ms, enc_seq_len, enc_ms
+        );
     }
 
     // Step 3: Build input embeddings
@@ -256,15 +267,27 @@ pub fn forced_align(
     let total_seq = prefix_len + enc_seq_len + suffix_len + text_tokens.len();
 
     let mut input_embeds = vec![0.0f32; total_seq * dim];
-    let tok_emb = ctx.decoder.tok_embeddings_bf16;
-
     let mut off = 0;
     for &tok in PREFIX_HEAD {
-        unsafe { tok_embed_bf16_to_f32(&mut input_embeds[off * dim..(off + 1) * dim], tok_emb, tok, dim); }
+        unsafe {
+            tok_embed_to_f32(
+                &ctx.decoder,
+                &mut input_embeds[off * dim..(off + 1) * dim],
+                tok,
+                dim,
+            );
+        }
         off += 1;
     }
     for &tok in PREFIX_TAIL {
-        unsafe { tok_embed_bf16_to_f32(&mut input_embeds[off * dim..(off + 1) * dim], tok_emb, tok, dim); }
+        unsafe {
+            tok_embed_to_f32(
+                &ctx.decoder,
+                &mut input_embeds[off * dim..(off + 1) * dim],
+                tok,
+                dim,
+            );
+        }
         off += 1;
     }
 
@@ -277,19 +300,27 @@ pub fn forced_align(
     // Suffix
     let suffix_off = prefix_len + enc_seq_len;
     for (i, &tok) in SUFFIX_BASE.iter().enumerate() {
-        unsafe { tok_embed_bf16_to_f32(
-            &mut input_embeds[(suffix_off + i) * dim..(suffix_off + i + 1) * dim],
-            tok_emb, tok, dim,
-        ); }
+        unsafe {
+            tok_embed_to_f32(
+                &ctx.decoder,
+                &mut input_embeds[(suffix_off + i) * dim..(suffix_off + i + 1) * dim],
+                tok,
+                dim,
+            );
+        }
     }
 
     // Text tokens (with interleaved <timestamp> tokens)
     let text_off = suffix_off + suffix_len;
     for (i, &tok) in text_tokens.iter().enumerate() {
-        unsafe { tok_embed_bf16_to_f32(
-            &mut input_embeds[(text_off + i) * dim..(text_off + i + 1) * dim],
-            tok_emb, tok, dim,
-        ); }
+        unsafe {
+            tok_embed_to_f32(
+                &ctx.decoder,
+                &mut input_embeds[(text_off + i) * dim..(text_off + i + 1) * dim],
+                tok,
+                dim,
+            );
+        }
     }
 
     // Step 4: Single prefill pass → logits for all positions
@@ -297,8 +328,13 @@ pub fn forced_align(
     ctx.kv_cache.len = 0;
 
     let logits = decoder::decoder_prefill_logits(
-        &ctx.decoder, cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
-        &mut ctx.dec_bufs, &input_embeds, total_seq,
+        &ctx.decoder,
+        cfg,
+        &mut ctx.kv_cache,
+        &mut ctx.rope_cache,
+        &mut ctx.dec_bufs,
+        &input_embeds,
+        total_seq,
     );
     let prefill_ms = elapsed_ms(t0);
 

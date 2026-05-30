@@ -270,6 +270,8 @@ def main():
             pass  # already emitted as gate_up_fused when gate_proj was processed
         elif name == LM_HEAD and quantize_tied_lm_head:
             pass  # replaced below from embed_tokens so embedding lookup stays BF16
+        elif name == EMBED_TOKENS and quantize_tied_lm_head:
+            pass  # dropped to avoid duplicate storage; dequantized on-the-fly from lm_head instead
         else:
             # Copy as-is: raw bytes wrapped as uint8 ndarray.
             # Pass original shape explicitly — arr.shape would be [n_bytes], not the

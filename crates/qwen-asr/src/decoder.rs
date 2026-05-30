@@ -166,7 +166,7 @@ impl Decoder {
     pub fn load(ms: &MultiSafetensors, cfg: &QwenConfig) -> Option<Self> {
         use crate::safetensors::Dtype;
 
-        let tok_embeddings_bf16 = load_bf16_direct(ms, "thinker.model.embed_tokens.weight")?;
+        let tok_embeddings_bf16_opt = ms.get_bf16_direct("thinker.model.embed_tokens.weight");
 
         // Detect whether the model file stores decoder weights as pre-quantized INT8.
         // The Python host script prepare_int8_model.py creates a model where every
@@ -388,12 +388,14 @@ impl Decoder {
                 Some(load_f32(ms, "thinker.lm_head.weight_int8_scale")?),
             ),
             _ => {
-                let lm_weight = lm_head_bf16.unwrap_or(tok_embeddings_bf16);
+                let lm_weight = lm_head_bf16.unwrap_or(tok_embeddings_bf16_opt?);
                 let (lm_int8, lm_scales) =
                     kernels::quantize_bf16_weights_to_int8(lm_weight, lm_out_dim, lm_in_dim);
                 (Some(Int8Buf::from_owned(lm_int8)), Some(lm_scales))
             }
         };
+
+        let tok_embeddings_bf16 = tok_embeddings_bf16_opt.unwrap_or(std::ptr::null());
 
         Some(Decoder {
             tok_embeddings_bf16,
@@ -696,11 +698,11 @@ impl DecoderBuffers {
         self.pref_ffn_out.resize(new_cap * dim, 0.0);
         self.pref_gate_up.resize(new_cap * 2 * intermediate, 0.0);
         self.pref_gate.resize(new_cap * intermediate, 0.0);
-        
+
         let max_in_dim = dim.max(intermediate).max(q_dim);
         self.pref_x_int8.resize(new_cap * max_in_dim, 0);
         self.pref_x_scales.resize(new_cap, 0.0);
-        
+
         self.pref_seq_cap = new_cap;
     }
 }
@@ -1260,6 +1262,9 @@ pub fn decoder_forward(
     }
 
     let lm_weight = decoder.lm_head_bf16.unwrap_or(decoder.tok_embeddings_bf16);
+    if lm_weight.is_null() {
+        panic!("decoder: fallback BF16 argmax called but no BF16 weights are loaded!");
+    }
     kernels::argmax_matvec_bf16(&bufs.x[..dim], lm_weight, dim, lm_out_dim) as i32
 }
 
@@ -1288,6 +1293,9 @@ pub fn decoder_prefill_logits(
     kernels::rms_norm(&mut x_norm, x, &decoder.norm, seq_len, dim, eps);
 
     let lm_weight = decoder.lm_head_bf16.unwrap_or(decoder.tok_embeddings_bf16);
+    if lm_weight.is_null() {
+        panic!("decoder: fallback BF16 prefill logits called but no BF16 weights are loaded!");
+    }
 
     // Project each position through lm_head: [seq_len × dim] × [out_dim × dim]^T → [seq_len × out_dim]
     let mut logits = vec![0.0f32; seq_len * out_dim];
@@ -1318,4 +1326,39 @@ pub unsafe fn tok_embed_bf16_to_f32(
 ) {
     let src = unsafe { std::slice::from_raw_parts(tok_emb_bf16.add(token_id as usize * dim), dim) };
     kernels::bf16_to_f32_buf(dst, src);
+}
+
+/// Look up a token embedding and convert/dequantize to f32.
+/// If tok_embeddings_bf16 is valid (non-null), reads from it in BF16.
+/// Otherwise, dequantizes on-the-fly from lm_head_int8 (INT8) using its scales.
+///
+/// # Safety
+/// The decoder must have either a valid tok_embeddings_bf16 pointer or valid
+/// lm_head_int8 + scales pointers.
+pub unsafe fn tok_embed_to_f32(
+    decoder: &Decoder,
+    dst: &mut [f32],
+    token_id: i32,
+    dim: usize,
+) {
+    if !decoder.tok_embeddings_bf16.is_null() {
+        let src = std::slice::from_raw_parts(
+            decoder.tok_embeddings_bf16.add(token_id as usize * dim),
+            dim,
+        );
+        kernels::bf16_to_f32_buf(dst, src);
+    } else if let (Some(ref int8_buf), Some(ref scales)) =
+        (&decoder.lm_head_int8, &decoder.lm_head_int8_scales)
+    {
+        let src = std::slice::from_raw_parts(
+            int8_buf.as_ptr().add(token_id as usize * dim),
+            dim,
+        );
+        let scale = scales[token_id as usize];
+        for i in 0..dim {
+            dst[i] = (src[i] as f32) * scale;
+        }
+    } else {
+        panic!("decoder has no token embeddings!");
+    }
 }
