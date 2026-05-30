@@ -1,6 +1,6 @@
 use earshot::Detector;
 use jni::objects::{GlobalRef, JByteBuffer, JClass, JObject, JString, JValue};
-use jni::sys::{jboolean, jfloat, jint, jlong, jstring, JNI_TRUE};
+use jni::sys::{jboolean, jfloat, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 /// JNI API for Android integration.
 /// Build with: cargo ndk -t arm64-v8a build --release --features android
@@ -213,26 +213,82 @@ impl VadState {
     }
 }
 
+fn write_wav_file(path: &str, samples: &[i16], sample_rate: u32) -> std::io::Result<()> {
+    use std::fs::File;
+    use std::io::Write;
+
+    let mut file = File::create(path)?;
+    let data_size = (samples.len() * 2) as u32;
+    let chunk_size = 36 + data_size;
+
+    // RIFF Header
+    file.write_all(b"RIFF")?;
+    file.write_all(&chunk_size.to_le_bytes())?;
+    file.write_all(b"WAVE")?;
+
+    // fmt chunk
+    file.write_all(b"fmt ")?;
+    file.write_all(&16u32.to_le_bytes())?; // Subchunk1Size
+    file.write_all(&1u16.to_le_bytes())?;  // AudioFormat (PCM = 1)
+    file.write_all(&1u16.to_le_bytes())?;  // NumChannels (Mono = 1)
+    file.write_all(&sample_rate.to_le_bytes())?; // SampleRate
+    let byte_rate = sample_rate * 1 * 2;
+    file.write_all(&byte_rate.to_le_bytes())?; // ByteRate
+    file.write_all(&2u16.to_le_bytes())?;  // BlockAlign
+    file.write_all(&16u16.to_le_bytes())?; // BitsPerSample
+
+    // data chunk
+    file.write_all(b"data")?;
+    file.write_all(&data_size.to_le_bytes())?;
+
+    // Raw samples
+    for &sample in samples {
+        file.write_all(&sample.to_le_bytes())?;
+    }
+
+    Ok(())
+}
+
 fn start_asr_worker(
     engine_addr: usize,
     java_vm: jni::JavaVM,
     listener: GlobalRef,
     rx: mpsc::Receiver<Option<AsrTask>>,
     queued_samples: Arc<AtomicU64>,
+    save_audio_dir: Option<String>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        let session_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let mut transcript_prompt = String::new();
         while let Ok(message) = rx.recv() {
             let Some(task) = message else {
                 break;
             };
+
+            // Save the segment audio if save_audio_dir is provided
+            if let Some(ref dir) = save_audio_dir {
+                let wav_path = format!("{}/{}_seg{:03}.wav", dir, session_timestamp, task.segment_id);
+                if let Err(e) = write_wav_file(&wav_path, &task.samples, 16000) {
+                    eprintln!("qwen-asr worker: failed to save post-VAD audio segment: {}", e);
+                } else {
+                    eprintln!("qwen-asr worker: saved post-VAD audio segment to {}", wav_path);
+                }
+            }
+
             let samples_f32: Vec<f32> =
                 task.samples.iter().map(|&s| (s as f32) / 32768.0).collect();
             queued_samples.fetch_sub(task.samples.len() as u64, Ordering::Relaxed);
 
             let text = unsafe {
                 let engine = &mut *(engine_addr as *mut crate::c_api::QwenAsrEngine);
-                crate::transcribe::transcribe_audio(&mut engine.ctx, &samples_f32)
+                let old_skip_silence = engine.ctx.skip_silence;
+                engine.ctx.skip_silence = false;
+                let text = crate::transcribe::transcribe_audio(&mut engine.ctx, &samples_f32);
+                engine.ctx.skip_silence = old_skip_silence;
+                text
             };
 
             let Some(text) = text else {
@@ -351,25 +407,30 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeSetLanguage(
     _class: JClass,
     handle: jlong,
     language: JString,
-) {
+) -> jboolean {
     if handle == 0 {
-        return;
+        return JNI_FALSE;
     }
 
     let lang_str: String = match env.get_string(&language) {
         Ok(s) => s.into(),
-        Err(_) => return,
+        Err(_) => return JNI_FALSE,
     };
 
     let lang_c = match CString::new(lang_str) {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => return JNI_FALSE,
     };
 
-    crate::c_api::qwen_asr_set_language(
+    if crate::c_api::qwen_asr_set_language(
         handle as *mut crate::c_api::QwenAsrEngine,
         lang_c.as_ptr(),
-    );
+    ) == 0
+    {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
 }
 
 /// Set transcription prompt text configuration.
@@ -422,14 +483,31 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeFree(
 /// fun onTranscript(segmentId: Long, text: String, isFinal: Boolean)
 #[no_mangle]
 pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeStartVadSession(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
     listener: JObject,
+    save_audio_dir: JString,
 ) -> jlong {
     if handle == 0 || listener.is_null() {
         return 0;
     }
+
+    let save_dir_opt: Option<String> = if !save_audio_dir.is_null() {
+        match env.get_string(&save_audio_dir) {
+            Ok(s) => {
+                let s_str: String = s.into();
+                if s_str.trim().is_empty() {
+                    None
+                } else {
+                    Some(s_str)
+                }
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
 
     let engine = &mut *(handle as *mut crate::c_api::QwenAsrEngine);
     let _ = engine.ctx.set_prompt("");
@@ -451,6 +529,7 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeStartVadSession(
         listener_ref,
         rx,
         queued_samples.clone(),
+        save_dir_opt,
     );
 
     let session = VadAsrSession {

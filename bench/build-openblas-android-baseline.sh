@@ -14,9 +14,11 @@ JOBS="${JOBS:-10}"
 ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}"
 NDK_HOME="${NDK_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-$ANDROID_SDK_ROOT/ndk/$NDK_VERSION}}}"
 NDK_BIN="$NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin"
+export PATH="$PATH:$NDK_BIN"
 CC="${CC:-$NDK_BIN/aarch64-linux-android${ANDROID_API}-clang}"
 AR="${AR:-$NDK_BIN/llvm-ar}"
 RANLIB="${RANLIB:-$NDK_BIN/llvm-ranlib}"
+
 
 usage() {
     cat >&2 <<EOF
