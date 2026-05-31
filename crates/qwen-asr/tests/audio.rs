@@ -11,12 +11,23 @@ fn test_load_wav() {
     assert!(samples.is_some(), "Should load JFK WAV successfully");
     let s = samples.unwrap();
     // JFK clip is ~11s at 16kHz
-    assert!(s.len() > 160000, "Expected >10s of audio, got {} samples", s.len());
-    assert!(s.len() < 200000, "Expected <12.5s of audio, got {} samples", s.len());
+    assert!(
+        s.len() > 160000,
+        "Expected >10s of audio, got {} samples",
+        s.len()
+    );
+    assert!(
+        s.len() < 200000,
+        "Expected <12.5s of audio, got {} samples",
+        s.len()
+    );
     // Check values are in reasonable range
     let max_val = s.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
     assert!(max_val > 0.01, "Audio should not be silent");
-    assert!(max_val <= 1.0, "Audio values should be normalized to [-1, 1]");
+    assert!(
+        max_val <= 1.0,
+        "Audio values should be normalized to [-1, 1]"
+    );
 }
 
 #[test]
@@ -32,32 +43,88 @@ fn test_mel_spectrogram_shape() {
     let (mel, n_frames) = result.unwrap();
 
     // 128 mel bins * n_frames
-    assert_eq!(mel.len(), 128 * n_frames, "Mel shape should be [128, n_frames]");
+    assert_eq!(
+        mel.len(),
+        128 * n_frames,
+        "Mel shape should be [128, n_frames]"
+    );
     // ~11s of audio at 100fps = ~1100 frames (minus 1 dropped frame)
-    assert!(n_frames > 1000, "Expected >1000 mel frames for 11s audio, got {}", n_frames);
-    assert!(n_frames < 1200, "Expected <1200 mel frames for 11s audio, got {}", n_frames);
+    assert!(
+        n_frames > 1000,
+        "Expected >1000 mel frames for 11s audio, got {}",
+        n_frames
+    );
+    assert!(
+        n_frames < 1200,
+        "Expected <1200 mel frames for 11s audio, got {}",
+        n_frames
+    );
 
     // Check values are in reasonable range after normalization: (log10 + 4) / 4
     let min_val = mel.iter().cloned().fold(f32::INFINITY, f32::min);
     let max_val = mel.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    assert!(min_val >= -1.0, "Normalized mel values should be >= -1.0, got {}", min_val);
-    assert!(max_val <= 2.0, "Normalized mel values should be <= 2.0, got {}", max_val);
+    assert!(
+        min_val >= -1.0,
+        "Normalized mel values should be >= -1.0, got {}",
+        min_val
+    );
+    assert!(
+        max_val <= 2.0,
+        "Normalized mel values should be <= 2.0, got {}",
+        max_val
+    );
 }
 
 #[test]
 fn test_mel_spectrogram_short_audio() {
     // Generate 0.5s of 440Hz sine at 16kHz
     let n = 8000;
-    let samples: Vec<f32> = (0..n).map(|i| {
-        (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin() * 0.5
-    }).collect();
+    let samples: Vec<f32> = (0..n)
+        .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin() * 0.5)
+        .collect();
 
     let result = audio::mel_spectrogram(&samples);
-    assert!(result.is_some(), "mel_spectrogram should handle short audio");
+    assert!(
+        result.is_some(),
+        "mel_spectrogram should handle short audio"
+    );
     let (_mel, n_frames) = result.unwrap();
     // 0.5s at 100fps = ~50 frames
     assert!(n_frames > 20, "Expected >20 frames for 0.5s audio");
     assert!(n_frames < 80, "Expected <80 frames for 0.5s audio");
+}
+
+#[test]
+fn test_loudness_normalization_boosts_very_quiet_audio() {
+    let mut samples: Vec<f32> = (0..16000)
+        .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin() * 0.004)
+        .collect();
+    let before_peak = samples.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let applied = audio::normalize_loudness_in_place(&mut samples);
+    assert!(applied.is_some(), "very quiet non-silent audio should be boosted");
+    let after_peak = samples.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    assert!(after_peak > before_peak);
+    assert!(after_peak <= 0.95 + 1e-6);
+}
+
+#[test]
+fn test_loudness_normalization_leaves_normal_audio() {
+    let mut samples: Vec<f32> = (0..16000)
+        .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin() * 0.08)
+        .collect();
+    let original = samples.clone();
+    let applied = audio::normalize_loudness_in_place(&mut samples);
+    assert!(applied.is_none(), "normal-level audio should be left unchanged");
+    assert_eq!(samples, original);
+}
+
+#[test]
+fn test_loudness_normalization_leaves_near_silence() {
+    let mut samples = vec![0.0001f32; 16000];
+    let original = samples.clone();
+    let applied = audio::normalize_loudness_in_place(&mut samples);
+    assert!(applied.is_none(), "near-silence should not be amplified");
+    assert_eq!(samples, original);
 }
 
 #[test]
@@ -78,9 +145,15 @@ fn test_compact_silence() {
 
     let compacted = audio::compact_silence(&samples);
     // Compacted should be shorter than original (silence removed)
-    assert!(compacted.len() < samples.len(),
-        "Compacted audio should be shorter: {} vs {}", compacted.len(), samples.len());
+    assert!(
+        compacted.len() < samples.len(),
+        "Compacted audio should be shorter: {} vs {}",
+        compacted.len(),
+        samples.len()
+    );
     // But not too short (should keep some silence and both tone regions)
-    assert!(compacted.len() > tone_samples,
-        "Compacted audio should keep at least the tone regions");
+    assert!(
+        compacted.len() > tone_samples,
+        "Compacted audio should keep at least the tone regions"
+    );
 }

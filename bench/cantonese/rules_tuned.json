@@ -1,0 +1,32 @@
+{
+  "params": {
+    "p_high": 0.85,
+    "n_min": 10,
+    "max_ctx": 2,
+    "p_high_single": 0.9,
+    "n_min_single": 20
+  },
+  "rules": [
+    {
+      "from": "都系咁",
+      "to": "都系啖",
+      "count": 12,
+      "occ": 13,
+      "precision": 0.9230769230769231
+    },
+    {
+      "from": "咁你",
+      "to": "啖你",
+      "count": 33,
+      "occ": 33,
+      "precision": 1.0
+    },
+    {
+      "from": "翻工",
+      "to": "返工",
+      "count": 15,
+      "occ": 15,
+      "precision": 1.0
+    }
+  ]
+}

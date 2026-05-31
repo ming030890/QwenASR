@@ -18,6 +18,7 @@ name = "qwen_asr"
 earshot = "1.1"
 libc = "0.2"
 jni = { version = "0.21.1", optional = true }
+zhconv = "0.4.1"
 
 [package.metadata.docs.rs]
 no-default-features = true

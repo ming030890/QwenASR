@@ -2,8 +2,8 @@
 
 use crate::config::*;
 use crate::decoder::*;
-use crate::encoder::*;
 use crate::encoder::EncoderBuffers;
+use crate::encoder::*;
 use crate::kernels;
 use crate::safetensors::MultiSafetensors;
 use crate::tokenizer::QwenTokenizer;
@@ -60,6 +60,10 @@ pub struct QwenCtx {
     // Optional prompt/language
     pub prompt: Option<String>,
     pub force_language: Option<String>,
+
+    // Optional Simplified->Traditional (or other variant) output conversion.
+    // None = no conversion (raw model output).
+    pub chinese_variant: Option<zhconv::Variant>,
     pub prompt_tokens: Option<Vec<i32>>,
     pub force_prompt_tokens: Option<Vec<i32>>,
     pub prompt_tokens_ready: bool,
@@ -97,22 +101,41 @@ impl QwenCtx {
 
         // Detect model variant from tensor shapes
         let info = crate::config::DetectInfo {
-            has_enc_layer_18: ms.has_tensor("thinker.audio_tower.layers.18.self_attn.q_proj.weight"),
-            lm_head_shape: ms.find("thinker.lm_head.weight").map(|(_, t)| t.shape.as_slice()),
-            embed_tokens_shape: ms.find("thinker.model.embed_tokens.weight").map(|(_, t)| t.shape.as_slice()),
-            gate_proj_shape: ms.find("thinker.model.layers.0.mlp.gate_proj.weight").map(|(_, t)| t.shape.as_slice()),
+            has_enc_layer_18: ms
+                .has_tensor("thinker.audio_tower.layers.18.self_attn.q_proj.weight"),
+            lm_head_shape: ms
+                .find("thinker.lm_head.weight")
+                .map(|(_, t)| t.shape.as_slice()),
+            embed_tokens_shape: ms
+                .find("thinker.model.embed_tokens.weight")
+                .map(|(_, t)| t.shape.as_slice()),
+            gate_proj_shape: ms
+                .find("thinker.model.layers.0.mlp.gate_proj.weight")
+                .map(|(_, t)| t.shape.as_slice()),
         };
         let cfg = QwenConfig::detect(&info);
 
         if kernels::verbose() >= 1 {
-            let variant = if cfg.dec_hidden >= 2048 { "1.7B" } else { "0.6B" };
-            let model_type = if cfg.is_aligner() { "ForcedAligner" } else { "ASR" };
+            let variant = if cfg.dec_hidden >= 2048 {
+                "1.7B"
+            } else {
+                "0.6B"
+            };
+            let model_type = if cfg.is_aligner() {
+                "ForcedAligner"
+            } else {
+                "ASR"
+            };
             eprintln!("Detected: Qwen3-{}-{}", model_type, variant);
             if cfg.is_aligner() {
-                eprintln!("  classify_num={}, timestamp_segment_time={:.0}ms",
-                          cfg.classify_num, cfg.timestamp_segment_time);
-                eprintln!("  encoder: {}d {}L, decoder: {}d {}L",
-                          cfg.enc_d_model, cfg.enc_layers, cfg.dec_hidden, cfg.dec_layers);
+                eprintln!(
+                    "  classify_num={}, timestamp_segment_time={:.0}ms",
+                    cfg.classify_num, cfg.timestamp_segment_time
+                );
+                eprintln!(
+                    "  encoder: {}d {}L, decoder: {}d {}L",
+                    cfg.enc_d_model, cfg.enc_layers, cfg.dec_hidden, cfg.dec_layers
+                );
             }
         }
 
@@ -156,6 +179,7 @@ impl QwenCtx {
             skip_silence: true,
             prompt: None,
             force_language: None,
+            chinese_variant: None,
             prompt_tokens: None,
             force_prompt_tokens: None,
             prompt_tokens_ready: false,
@@ -200,6 +224,37 @@ impl QwenCtx {
                 Ok(())
             }
             None => Err(()),
+        }
+    }
+
+    /// Enable conversion of decoded text to a Chinese variant.
+    ///
+    /// Qwen3-ASR emits Simplified Chinese; set e.g. `"zh-Hant"`, `"zh-TW"`, or
+    /// `"zh-HK"` to convert the output to Traditional Chinese. Pass an empty
+    /// string, `"off"`, or `"none"` to disable conversion. Returns `Err(())` if
+    /// the variant string is not recognized.
+    #[allow(clippy::result_unit_err)]
+    pub fn set_chinese_variant(&mut self, variant: &str) -> Result<(), ()> {
+        let v = variant.trim();
+        if v.is_empty() || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") {
+            self.chinese_variant = None;
+            return Ok(());
+        }
+        match v.parse::<zhconv::Variant>() {
+            Ok(parsed) => {
+                self.chinese_variant = Some(parsed);
+                Ok(())
+            }
+            Err(_) => Err(()),
+        }
+    }
+
+    /// Apply the configured Chinese conversion to `text`. Returns `text`
+    /// unchanged when no variant is set.
+    pub fn convert_chinese(&self, text: &str) -> String {
+        match self.chinese_variant {
+            Some(v) => zhconv::zhconv(text, v),
+            None => text.to_string(),
         }
     }
 

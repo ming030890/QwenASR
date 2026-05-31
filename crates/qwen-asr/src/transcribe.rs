@@ -323,8 +323,9 @@ fn transcribe_segment(
             n_text_tokens += 1;
 
             if let Some(ref cb) = ctx.token_cb {
-                // For the callback, provide lossy UTF-8 for display purposes
-                cb(&String::from_utf8_lossy(piece_bytes));
+                // For the callback, provide lossy UTF-8 for display purposes,
+                // converting Simplified->Traditional per-piece if configured.
+                cb(&ctx.convert_chinese(&String::from_utf8_lossy(piece_bytes)));
             }
 
             if n_text_tokens >= 24 && matches!(piece_bytes, b"." | b"!" | b"?") {
@@ -433,25 +434,35 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
     ctx.reset_perf();
     ctx.perf_audio_ms = 1000.0 * samples.len() as f64 / SAMPLE_RATE as f64;
 
+    let mut normalized_samples = samples.to_vec();
+    if let Some((rms, peak, gain)) = audio::normalize_loudness_in_place(&mut normalized_samples) {
+        if kernels::verbose() >= 1 {
+            eprintln!(
+                "Audio gain normalization: rms={:.5}, peak={:.5}, gain={:.1}x",
+                rms, peak, gain
+            );
+        }
+    }
+
     let audio_samples = if ctx.skip_silence {
         let compacted = if ctx.segment_sec > 0.0 {
-            audio::compact_silence_fast(samples)
+            audio::compact_silence_fast(&normalized_samples)
         } else {
-            audio::compact_silence(samples)
+            audio::compact_silence(&normalized_samples)
         };
         if kernels::verbose() >= 1 {
-            let used_pct = 100.0 * compacted.len() as f32 / samples.len().max(1) as f32;
+            let used_pct = 100.0 * compacted.len() as f32 / normalized_samples.len().max(1) as f32;
             eprintln!(
                 "Silence skip: used {:.1}%, skipped {:.1}% ({} -> {} samples)",
                 used_pct,
                 100.0 - used_pct,
-                samples.len(),
+                normalized_samples.len(),
                 compacted.len()
             );
         }
         compacted
     } else {
-        samples.to_vec()
+        normalized_samples
     };
 
     if kernels::verbose() >= 2 {
@@ -474,7 +485,7 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
     // No splitting if segment_sec is 0 or audio fits in one segment
     if ctx.segment_sec <= 0.0 || audio_samples.len() <= target_samples + margin_samples {
         let (text, _) = transcribe_segment(ctx, &audio_samples, &tokenizer, None)?;
-        return Some(text);
+        return Some(ctx.convert_chinese(&text));
     }
 
     // Build split points
@@ -565,14 +576,14 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 
         if let Some(ref cb) = ctx.token_cb {
             if ctx.past_text_conditioning {
-                cb(&seg_text);
+                cb(&ctx.convert_chinese(&seg_text));
             }
         }
 
         result.push_str(&seg_text);
     }
 
-    Some(result)
+    Some(ctx.convert_chinese(&result))
 }
 
 /// Convenience wrapper: load a WAV file and transcribe it.
@@ -623,7 +634,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         let tokenizer = load_tokenizer(&ctx.model_dir)?;
         ctx.prepare_prompt_tokens(&tokenizer);
         let (text, _) = transcribe_segment(ctx, &audio_samples, &tokenizer, None)?;
-        return Some(text);
+        return Some(ctx.convert_chinese(&text));
     }
 
     let audio_samples = if ctx.skip_silence {
@@ -1023,7 +1034,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
                 }
                 let piece_bytes = tokenizer.decode_bytes(candidate_tokens[i]);
                 if let Some(ref cb) = ctx.token_cb {
-                    cb(&String::from_utf8_lossy(piece_bytes));
+                    cb(&ctx.convert_chinese(&String::from_utf8_lossy(piece_bytes)));
                 }
                 ctx.perf_text_tokens += 1;
                 result_bytes.extend_from_slice(piece_bytes);
@@ -1034,7 +1045,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         chunk_idx += 1;
     }
 
-    Some(String::from_utf8_lossy(&result_bytes).trim().to_string())
+    Some(ctx.convert_chinese(String::from_utf8_lossy(&result_bytes).trim()))
 } // ========================================================================
   // Incremental Streaming API
   // ========================================================================

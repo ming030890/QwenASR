@@ -5,6 +5,11 @@ use crate::kernels;
 
 const N_FFT: usize = 400;
 const N_FREQ: usize = N_FFT / 2 + 1; // 201
+const LOUDNESS_TARGET_RMS: f32 = 0.05;
+const LOUDNESS_BOOST_BELOW_RMS: f32 = 0.005;
+const LOUDNESS_MIN_PEAK: f32 = 0.003;
+const LOUDNESS_PEAK_CAP: f32 = 0.95;
+const LOUDNESS_MAX_GAIN: f32 = 32.0;
 
 fn read_u16_le(data: &[u8]) -> u16 {
     u16::from_le_bytes([data[0], data[1]])
@@ -197,6 +202,43 @@ pub fn resample(samples: &[f32], from_rate: i32, to_rate: i32) -> Vec<f32> {
     }
 
     resampled
+}
+
+/// Conservatively boost very quiet non-silent audio before ASR feature
+/// extraction. This protects against low-level recordings whose log-mel
+/// features otherwise look close to silence, while leaving normal recordings
+/// untouched and capping peaks to avoid clipping.
+///
+/// Returns `(rms_before, peak_before, gain)` when a gain was applied.
+pub fn normalize_loudness_in_place(samples: &mut [f32]) -> Option<(f32, f32, f32)> {
+    if samples.is_empty() {
+        return None;
+    }
+
+    let mut sum_sq = 0.0f64;
+    let mut peak = 0.0f32;
+    for &sample in samples.iter() {
+        let abs = sample.abs();
+        peak = peak.max(abs);
+        sum_sq += (sample as f64) * (sample as f64);
+    }
+    let rms = (sum_sq / samples.len() as f64).sqrt() as f32;
+
+    if rms <= 0.0 || rms >= LOUDNESS_BOOST_BELOW_RMS || peak < LOUDNESS_MIN_PEAK {
+        return None;
+    }
+
+    let rms_gain = LOUDNESS_TARGET_RMS / rms;
+    let peak_gain = LOUDNESS_PEAK_CAP / peak.max(1e-12);
+    let gain = rms_gain.min(peak_gain).min(LOUDNESS_MAX_GAIN);
+    if gain <= 1.0 {
+        return None;
+    }
+
+    for sample in samples.iter_mut() {
+        *sample *= gain;
+    }
+    Some((rms, peak, gain))
 }
 
 // ========================================================================

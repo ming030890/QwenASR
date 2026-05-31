@@ -2,12 +2,28 @@ mod download;
 #[cfg(target_os = "macos")]
 mod live_capture;
 
-use qwen_asr::{audio, config, context, kernels, transcribe, align};
 use config::*;
 use context::QwenCtx;
+use qwen_asr::{align, audio, config, context, kernels, transcribe};
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 fn stream_token(piece: &str) {
     use std::io::Write;
@@ -17,16 +33,23 @@ fn stream_token(piece: &str) {
 
 fn usage(prog: &str) {
     eprintln!("qwen-asr — Qwen3-ASR speech-to-text (pure Rust)\n");
-    eprintln!("Usage: {} -d <model_dir> (-i <input.wav> | --stdin | --live) [options]\n", prog);
+    eprintln!(
+        "Usage: {} -d <model_dir> (-i <input.wav> | --stdin | --live) [options]\n",
+        prog
+    );
     eprintln!("Required:");
     eprintln!("  -d <dir>      Model directory (with *.safetensors, vocab.json)");
     eprintln!("  -i <file>     Input WAV file (16-bit PCM, any sample rate)");
     eprintln!("  --stdin       Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)");
+    eprintln!("  --manifest <file>  Batch mode: transcribe newline-separated WAV paths,");
+    eprintln!("                     emitting one JSON line per clip (loads model once)");
     eprintln!("\nLive capture (macOS only):");
     eprintln!("  --live                      Capture from audio input device in real time");
     eprintln!("  --device <name>             Input device name (default: system default)");
     eprintln!("  --list-devices              List available audio input devices and exit");
-    eprintln!("  --vad                       Live VAD mode: detect speech segments, transcribe each");
+    eprintln!(
+        "  --vad                       Live VAD mode: detect speech segments, transcribe each"
+    );
     eprintln!("\nOptions:");
     eprintln!("  -t <n>        Number of threads (default: all CPUs)");
     eprintln!("  -S <secs>     Segment target seconds (default: 0 = full-audio decode)");
@@ -39,6 +62,9 @@ fn usage(prog: &str) {
     eprintln!("  --skip-silence              Drop long silent spans before inference");
     eprintln!("  --prompt <text>            System prompt for biasing");
     eprintln!("  --language <lang>          Force output language");
+    eprintln!("  --traditional [variant]    Convert Simplified->Traditional Chinese output");
+    eprintln!("                             (default zh-Hant; e.g. zh-TW, zh-HK)");
+    eprintln!("  --zh-variant <variant>     Convert output to a Chinese variant (zh-Hant/zh-TW/zh-CN/...)");
     eprintln!("\nAlignment mode (requires ForcedAligner model):");
     eprintln!("  --align <text>             Align transcript to audio (word-level timestamps)");
     eprintln!("  --align-language <lang>    Language for word splitting (default: English)");
@@ -84,6 +110,7 @@ fn main() {
 
     let mut model_dir: Option<String> = None;
     let mut input_wav: Option<String> = None;
+    let mut manifest_path: Option<String> = None;
     let mut verbosity = 1i32;
     let mut use_stdin = false;
     let mut live_mode = false;
@@ -98,6 +125,7 @@ fn main() {
     let mut enc_window_sec: f32 = -1.0;
     let mut prompt_text: Option<String> = None;
     let mut force_language: Option<String> = None;
+    let mut chinese_variant: Option<String> = None;
     let mut past_text_mode: i32 = -1; // -1 auto, 0 off, 1 on
     let mut skip_silence = false;
     let mut profile = false;
@@ -114,6 +142,10 @@ fn main() {
             "-i" => {
                 i += 1;
                 input_wav = args.get(i).cloned();
+            }
+            "--manifest" => {
+                i += 1;
+                manifest_path = args.get(i).cloned();
             }
             "-t" => {
                 i += 1;
@@ -167,6 +199,20 @@ fn main() {
             "--language" => {
                 i += 1;
                 force_language = args.get(i).cloned();
+            }
+            "--traditional" => {
+                // Optional variant argument; defaults to zh-Hant.
+                if let Some(next) = args.get(i + 1) {
+                    if !next.starts_with('-') {
+                        chinese_variant = Some(next.clone());
+                        i += 1;
+                    }
+                }
+                chinese_variant.get_or_insert_with(|| "zh-Hant".to_string());
+            }
+            "--zh-variant" => {
+                i += 1;
+                chinese_variant = args.get(i).cloned();
             }
             "--align" => {
                 i += 1;
@@ -240,13 +286,16 @@ fn main() {
         }
     }
 
-    if input_wav.is_none() && !use_stdin && !live_mode {
+    if input_wav.is_none() && !use_stdin && !live_mode && manifest_path.is_none() {
         usage(&args[0]);
         std::process::exit(1);
     }
 
     // Check mutual exclusivity of input modes
-    let input_count = [input_wav.is_some(), use_stdin, live_mode].iter().filter(|&&x| x).count();
+    let input_count = [input_wav.is_some(), use_stdin, live_mode, manifest_path.is_some()]
+        .iter()
+        .filter(|&&x| x)
+        .count();
     if input_count > 1 {
         eprintln!("Error: -i, --stdin, and --live are mutually exclusive");
         std::process::exit(1);
@@ -319,12 +368,54 @@ fn main() {
     if let Some(ref lang) = force_language {
         if ctx.set_force_language(lang).is_err() {
             eprintln!("Unsupported language for --language: {}", lang);
-            eprintln!(
-                "Supported languages: {}",
-                SUPPORTED_LANGUAGES.join(",")
-            );
+            eprintln!("Supported languages: {}", SUPPORTED_LANGUAGES.join(","));
             std::process::exit(1);
         }
+    }
+    if let Some(ref variant) = chinese_variant {
+        if ctx.set_chinese_variant(variant).is_err() {
+            eprintln!("Unsupported Chinese variant: {}", variant);
+            eprintln!("Supported variants: zh-Hant, zh-TW, zh-HK, zh-MO, zh-Hans, zh-CN, zh-SG");
+            std::process::exit(1);
+        }
+    }
+
+    // Batch manifest mode: load once, transcribe each WAV path, emit JSONL.
+    if let Some(ref mpath) = manifest_path {
+        let contents = match std::fs::read_to_string(mpath) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to read manifest {}: {}", mpath, e);
+                std::process::exit(1);
+            }
+        };
+        let paths: Vec<&str> = contents
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if verbosity >= 1 {
+            eprintln!("Batch: {} clips from {}", paths.len(), mpath);
+        }
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        for (idx, path) in paths.iter().enumerate() {
+            let text = transcribe::transcribe(&mut ctx, path).unwrap_or_default();
+            let infer_ms = ctx.perf_total_ms;
+            let mut lock = stdout.lock();
+            let _ = writeln!(
+                lock,
+                "{{\"path\":\"{}\",\"text\":\"{}\",\"infer_ms\":{:.1}}}",
+                json_escape(path),
+                json_escape(&text),
+                infer_ms
+            );
+            let _ = lock.flush();
+            if verbosity >= 1 && (idx + 1) % 50 == 0 {
+                eprintln!("  {} / {}", idx + 1, paths.len());
+            }
+        }
+        return;
     }
 
     // Alignment mode
@@ -402,7 +493,14 @@ fn main() {
 
         #[cfg(target_os = "macos")]
         {
-            run_live_capture(&mut ctx, device_name.as_deref(), stream_mode, vad_mode, verbosity, profile);
+            run_live_capture(
+                &mut ctx,
+                device_name.as_deref(),
+                stream_mode,
+                vad_mode,
+                verbosity,
+                profile,
+            );
             return;
         }
     }
@@ -454,7 +552,9 @@ fn main() {
             let infer_s = ctx.perf_total_ms / 1000.0;
             eprintln!(
                 "Audio: {:.1} s processed in {:.1} s ({:.2}x realtime)",
-                audio_s, infer_s, audio_s / infer_s
+                audio_s,
+                infer_s,
+                audio_s / infer_s
             );
         }
     }
@@ -484,7 +584,10 @@ fn run_live_capture(
         match live_capture::find_device_by_name(name) {
             Some(dev) => {
                 if verbosity >= 1 {
-                    eprintln!("Using input device: {} ({} ch)", dev.name, dev.input_channels);
+                    eprintln!(
+                        "Using input device: {} ({} ch)",
+                        dev.name, dev.input_channels
+                    );
                 }
                 dev.id
             }
@@ -529,7 +632,13 @@ fn run_live_capture(
         }
     };
 
-    let mode_label = if stream_mode { "streaming" } else if vad_mode { "VAD" } else { "segmented" };
+    let mode_label = if stream_mode {
+        "streaming"
+    } else if vad_mode {
+        "VAD"
+    } else {
+        "segmented"
+    };
     if verbosity >= 1 {
         if vad_mode {
             eprintln!("Listening (VAD segmented)... press Ctrl+C to stop\n");
@@ -537,7 +646,11 @@ fn run_live_capture(
             eprintln!(
                 "Listening ({}, {:.1}s chunks)... press Ctrl+C to stop\n",
                 mode_label,
-                if stream_mode { ctx.stream_chunk_sec } else { ctx.segment_sec }
+                if stream_mode {
+                    ctx.stream_chunk_sec
+                } else {
+                    ctx.segment_sec
+                }
             );
         }
     }
@@ -594,9 +707,8 @@ fn run_live_capture(
             // Resample
             if needs_resample {
                 if !raw_buf.is_empty() {
-                    let resampled = qwen_asr::audio::resample(
-                        &raw_buf, device_rate as i32, target_rate,
-                    );
+                    let resampled =
+                        qwen_asr::audio::resample(&raw_buf, device_rate as i32, target_rate);
                     resampled_buf.extend_from_slice(&resampled);
                     raw_buf.clear();
                 }
@@ -607,9 +719,9 @@ fn run_live_capture(
             // Reset window if buffer exceeds max
             if resampled_buf.len() > max_window_samples {
                 // Flush rollback tokens before reset
-                if let Some(delta) = transcribe::stream_push_audio(
-                    ctx, &resampled_buf, &mut stream_state, true
-                ) {
+                if let Some(delta) =
+                    transcribe::stream_push_audio(ctx, &resampled_buf, &mut stream_state, true)
+                {
                     if !delta.is_empty() {
                         print!("{}", delta);
                     }
@@ -629,9 +741,9 @@ fn run_live_capture(
 
             // Process all available full chunks
             if resampled_buf.len() > stream_state.audio_cursor() {
-                if let Some(delta) = transcribe::stream_push_audio(
-                    ctx, &resampled_buf, &mut stream_state, finalize
-                ) {
+                if let Some(delta) =
+                    transcribe::stream_push_audio(ctx, &resampled_buf, &mut stream_state, finalize)
+                {
                     if !delta.is_empty() {
                         print!("{}", delta);
                         std::io::Write::flush(&mut std::io::stdout()).ok();
@@ -646,9 +758,7 @@ fn run_live_capture(
 
         // Final flush
         if !raw_buf.is_empty() && needs_resample {
-            let resampled = qwen_asr::audio::resample(
-                &raw_buf, device_rate as i32, target_rate,
-            );
+            let resampled = qwen_asr::audio::resample(&raw_buf, device_rate as i32, target_rate);
             resampled_buf.extend_from_slice(&resampled);
         } else {
             resampled_buf.append(&mut raw_buf);
@@ -656,7 +766,10 @@ fn run_live_capture(
 
         if resampled_buf.len() > stream_state.audio_cursor() {
             if let Some(delta) = transcribe::stream_push_audio(
-                ctx, &resampled_buf, &mut stream_state, true // finalize: flush rollback
+                ctx,
+                &resampled_buf,
+                &mut stream_state,
+                true, // finalize: flush rollback
             ) {
                 if !delta.is_empty() {
                     print!("{}", delta);
@@ -707,9 +820,8 @@ fn run_live_capture(
             // Resample
             if needs_resample {
                 if !raw_buf.is_empty() {
-                    let resampled = qwen_asr::audio::resample(
-                        &raw_buf, device_rate as i32, target_rate,
-                    );
+                    let resampled =
+                        qwen_asr::audio::resample(&raw_buf, device_rate as i32, target_rate);
                     resampled_buf.extend_from_slice(&resampled);
                     raw_buf.clear();
                 }
@@ -730,8 +842,12 @@ fn run_live_capture(
 
             // Periodic RMS debug output
             if verbosity >= 2 && buf_len % (target_rate as usize * 2) < check_samples {
-                eprintln!("  [VAD] rms={:.6} threshold={:.4} speech={}",
-                    rms, speech_threshold, if speech_active { "active" } else { "inactive" });
+                eprintln!(
+                    "  [VAD] rms={:.6} threshold={:.4} speech={}",
+                    rms,
+                    speech_threshold,
+                    if speech_active { "active" } else { "inactive" }
+                );
             }
 
             if !speech_active {
@@ -741,8 +857,10 @@ fn run_live_capture(
                     silence_start = None;
                     speech_start_idx = buf_len.saturating_sub(pre_speech_samples);
                     if verbosity >= 2 {
-                        eprintln!("  [VAD] speech start at {:.1}s",
-                            buf_len as f32 / target_rate as f32);
+                        eprintln!(
+                            "  [VAD] speech start at {:.1}s",
+                            buf_len as f32 / target_rate as f32
+                        );
                     }
                 } else {
                     // No speech — bound buffer to avoid unlimited growth
@@ -764,8 +882,10 @@ fn run_live_capture(
                     // Force-flush if segment exceeds max duration
                     if segment_len >= max_segment_samples {
                         if verbosity >= 2 {
-                            eprintln!("  [VAD] max segment reached ({:.1}s), flushing",
-                                segment_len as f32 / target_rate as f32);
+                            eprintln!(
+                                "  [VAD] max segment reached ({:.1}s), flushing",
+                                segment_len as f32 / target_rate as f32
+                            );
                         }
                         let segment = &resampled_buf[speech_start_idx..];
                         // Set previous text as context
@@ -799,8 +919,10 @@ fn run_live_capture(
                                 let segment = &resampled_buf[speech_start_idx..seg_end];
 
                                 if verbosity >= 2 {
-                                    eprintln!("  [VAD] speech end, segment {:.1}s",
-                                        segment.len() as f32 / target_rate as f32);
+                                    eprintln!(
+                                        "  [VAD] speech end, segment {:.1}s",
+                                        segment.len() as f32 / target_rate as f32
+                                    );
                                 }
 
                                 ctx.reset_perf();
@@ -815,19 +937,23 @@ fn run_live_capture(
                                         println!("{}", text);
                                         accumulated_text.push_str(&text);
                                         if verbosity >= 1 {
-                                            let audio_secs = segment.len() as f32 / target_rate as f32;
+                                            let audio_secs =
+                                                segment.len() as f32 / target_rate as f32;
                                             let compute_secs = t0.elapsed().as_secs_f32();
                                             eprintln!(
                                                 "  ({:.1}s audio in {:.1}s, {:.1}x realtime)",
-                                                audio_secs, compute_secs,
+                                                audio_secs,
+                                                compute_secs,
                                                 audio_secs / compute_secs.max(0.001)
                                             );
                                         }
                                     }
                                 }
                             } else if verbosity >= 2 {
-                                eprintln!("  [VAD] segment too short ({:.2}s), discarding",
-                                    segment_len as f32 / target_rate as f32);
+                                eprintln!(
+                                    "  [VAD] segment too short ({:.2}s), discarding",
+                                    segment_len as f32 / target_rate as f32
+                                );
                             }
 
                             resampled_buf.clear();
@@ -868,9 +994,8 @@ fn run_live_capture(
 
             if needs_resample {
                 if !raw_buf.is_empty() {
-                    let resampled = qwen_asr::audio::resample(
-                        &raw_buf, device_rate as i32, target_rate,
-                    );
+                    let resampled =
+                        qwen_asr::audio::resample(&raw_buf, device_rate as i32, target_rate);
                     resampled_buf.extend_from_slice(&resampled);
                     raw_buf.clear();
                 }
@@ -890,9 +1015,7 @@ fn run_live_capture(
 
         // Flush remaining
         if !raw_buf.is_empty() && needs_resample {
-            let resampled = qwen_asr::audio::resample(
-                &raw_buf, device_rate as i32, target_rate,
-            );
+            let resampled = qwen_asr::audio::resample(&raw_buf, device_rate as i32, target_rate);
             resampled_buf.extend_from_slice(&resampled);
         } else {
             resampled_buf.append(&mut raw_buf);
@@ -926,7 +1049,10 @@ fn run_live_capture(
             let infer_s = ctx.perf_total_ms / 1000.0;
             eprintln!(
                 "Audio: {:.1} s processed in {:.1} s compute ({:.2}x realtime), {:.1} s wall clock",
-                audio_s, infer_s, audio_s / infer_s, wall_ms / 1000.0
+                audio_s,
+                infer_s,
+                audio_s / infer_s,
+                wall_ms / 1000.0
             );
         }
     }

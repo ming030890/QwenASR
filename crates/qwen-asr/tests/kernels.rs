@@ -2,7 +2,10 @@ use qwen_asr::kernels;
 use qwen_asr::kernels::generic;
 
 fn max_abs_err(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 #[test]
@@ -11,8 +14,13 @@ fn test_bf16_roundtrip() {
     for &v in &values {
         let bf16 = ((v.to_bits() + 0x8000) >> 16) as u16;
         let back = kernels::bf16_to_f32(bf16);
-        assert!((v - back).abs() < 0.02 * v.abs().max(1.0),
-            "BF16 roundtrip failed: {} -> {} -> {}", v, bf16, back);
+        assert!(
+            (v - back).abs() < 0.02 * v.abs().max(1.0),
+            "BF16 roundtrip failed: {} -> {} -> {}",
+            v,
+            bf16,
+            back
+        );
     }
 }
 
@@ -31,7 +39,16 @@ fn test_bf16_matvec_vs_generic() {
     let bias: Vec<f32> = (0..out_dim).map(|i| i as f32 * 0.1).collect();
 
     let mut y_generic = vec![0.0f32; out_dim];
-    unsafe { generic::bf16_matvec_fused(&mut y_generic, &x, w_bf16.as_ptr(), Some(&bias), in_dim, out_dim); }
+    unsafe {
+        generic::bf16_matvec_fused(
+            &mut y_generic,
+            &x,
+            w_bf16.as_ptr(),
+            Some(&bias),
+            in_dim,
+            out_dim,
+        );
+    }
 
     let mut y_dispatch = vec![0.0f32; out_dim];
     kernels::linear_nobias_bf16(&mut y_dispatch, &x, w_bf16.as_ptr(), 1, in_dim, out_dim);
@@ -40,7 +57,11 @@ fn test_bf16_matvec_vs_generic() {
     }
 
     let err = max_abs_err(&y_generic, &y_dispatch);
-    assert!(err < 0.01, "bf16 matvec dispatch vs generic mismatch: max_err={}", err);
+    assert!(
+        err < 0.01,
+        "bf16 matvec dispatch vs generic mismatch: max_err={}",
+        err
+    );
 }
 
 #[test]
@@ -53,8 +74,13 @@ fn test_dot_f32_vs_generic() {
     let result_dispatch = kernels::dot_f32(&a, &b, n);
 
     let err = (result_generic - result_dispatch).abs();
-    assert!(err < 0.01 * result_generic.abs().max(1.0),
-        "dot_f32 mismatch: generic={}, dispatch={}, err={}", result_generic, result_dispatch, err);
+    assert!(
+        err < 0.01 * result_generic.abs().max(1.0),
+        "dot_f32 mismatch: generic={}, dispatch={}, err={}",
+        result_generic,
+        result_dispatch,
+        err
+    );
 }
 
 #[test]
@@ -68,7 +94,11 @@ fn test_rms_norm() {
     kernels::rms_norm(&mut out, &x, &w, 1, dim, eps);
 
     let rms: f32 = (out.iter().map(|v| v * v).sum::<f32>() / dim as f32).sqrt();
-    assert!((rms - 1.0).abs() < 0.01, "RMS norm output should have RMS ~1.0, got {}", rms);
+    assert!(
+        (rms - 1.0).abs() < 0.01,
+        "RMS norm output should have RMS ~1.0, got {}",
+        rms
+    );
 }
 
 #[test]
@@ -84,8 +114,16 @@ fn test_layer_norm() {
 
     let mean: f32 = out.iter().sum::<f32>() / dim as f32;
     let var: f32 = out.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / dim as f32;
-    assert!(mean.abs() < 0.01, "LayerNorm mean should be ~0, got {}", mean);
-    assert!((var - 1.0).abs() < 0.02, "LayerNorm variance should be ~1, got {}", var);
+    assert!(
+        mean.abs() < 0.01,
+        "LayerNorm mean should be ~0, got {}",
+        mean
+    );
+    assert!(
+        (var - 1.0).abs() < 0.02,
+        "LayerNorm variance should be ~1, got {}",
+        var
+    );
 }
 
 #[test]
@@ -95,11 +133,21 @@ fn test_softmax() {
     kernels::softmax(&mut x, 1, n);
 
     let sum: f32 = x.iter().sum();
-    assert!((sum - 1.0).abs() < 1e-5, "Softmax should sum to 1.0, got {}", sum);
+    assert!(
+        (sum - 1.0).abs() < 1e-5,
+        "Softmax should sum to 1.0, got {}",
+        sum
+    );
     for i in 1..n {
-        assert!(x[i] >= x[i - 1], "Softmax should be monotonically increasing");
+        assert!(
+            x[i] >= x[i - 1],
+            "Softmax should be monotonically increasing"
+        );
     }
-    assert!(x[0] > 0.0 && x[9] > 0.0, "All softmax values should be positive");
+    assert!(
+        x[0] > 0.0 && x[9] > 0.0,
+        "All softmax values should be positive"
+    );
 }
 
 #[test]
@@ -219,5 +267,9 @@ fn test_linear_nobias_int8_matmat() {
 
     let err = max_abs_err(&y_ref, &y_test);
     // Allow small tolerance for double activation+weight quantization (usually < 0.15)
-    assert!(err < 0.15, "linear_nobias_int8_matmat mismatch vs ref: max_err={}", err);
+    assert!(
+        err < 0.15,
+        "linear_nobias_int8_matmat mismatch vs ref: max_err={}",
+        err
+    );
 }

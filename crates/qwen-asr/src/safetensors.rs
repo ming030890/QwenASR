@@ -83,13 +83,17 @@ impl SafetensorsFile {
 
         let mut stat_buf = unsafe { std::mem::zeroed::<stat>() };
         if unsafe { fstat(fd, &mut stat_buf) } < 0 {
-            unsafe { close(fd); }
+            unsafe {
+                close(fd);
+            }
             return None;
         }
 
         let file_size = stat_buf.st_size as usize;
         if file_size < 8 {
-            unsafe { close(fd); }
+            unsafe {
+                close(fd);
+            }
             return None;
         }
 
@@ -106,7 +110,9 @@ impl SafetensorsFile {
         // Keep fd open for mmap lifetime? Actually mmap doesn't need it.
         // But we close it since MAP_PRIVATE doesn't need fd after mmap.
         let raw_fd = fd;
-        unsafe { close(fd); }
+        unsafe {
+            close(fd);
+        }
 
         if data == libc::MAP_FAILED {
             return None;
@@ -121,7 +127,9 @@ impl SafetensorsFile {
         };
 
         if header_size > file_size - 8 {
-            unsafe { munmap(data as *mut _, file_size); }
+            unsafe {
+                munmap(data as *mut _, file_size);
+            }
             return None;
         }
 
@@ -167,11 +175,7 @@ impl SafetensorsFile {
             Dtype::F32 => {
                 let mut out = vec![0.0f32; n];
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        ptr as *const f32,
-                        out.as_mut_ptr(),
-                        n,
-                    );
+                    std::ptr::copy_nonoverlapping(ptr as *const f32, out.as_mut_ptr(), n);
                 }
                 Some(out)
             }
@@ -206,7 +210,9 @@ impl SafetensorsFile {
         }
         let ptr = self.data_ptr(tensor) as *const i8;
         let mut out = vec![0i8; n];
-        unsafe { std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), n); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), n);
+        }
         Some(out)
     }
 
@@ -259,7 +265,10 @@ impl MultiSafetensors {
         }
 
         if shard_names.is_empty() {
-            eprintln!("multi_safetensors_open: no safetensors files in {}", model_dir);
+            eprintln!(
+                "multi_safetensors_open: no safetensors files in {}",
+                model_dir
+            );
             return None;
         }
 
@@ -634,7 +643,11 @@ fn skip_json_value(bytes: &[u8], pos: &mut usize) {
         }
         _ => {
             // Number, bool, null
-            while *pos < bytes.len() && bytes[*pos] != b',' && bytes[*pos] != b'}' && bytes[*pos] != b']' {
+            while *pos < bytes.len()
+                && bytes[*pos] != b','
+                && bytes[*pos] != b'}'
+                && bytes[*pos] != b']'
+            {
                 *pos += 1;
             }
         }

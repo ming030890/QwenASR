@@ -433,6 +433,42 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeSetLanguage(
     }
 }
 
+/// Set the output Chinese variant for Simplified->Traditional conversion.
+///
+/// Pass e.g. "zh-Hant", "zh-TW", or "zh-HK". Empty string disables conversion.
+/// Returns true on success, false on error/unrecognized variant.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeSetChineseVariant(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    variant: JString,
+) -> jboolean {
+    if handle == 0 {
+        return JNI_FALSE;
+    }
+
+    let variant_str: String = match env.get_string(&variant) {
+        Ok(s) => s.into(),
+        Err(_) => return JNI_FALSE,
+    };
+
+    let variant_c = match CString::new(variant_str) {
+        Ok(c) => c,
+        Err(_) => return JNI_FALSE,
+    };
+
+    if crate::c_api::qwen_asr_set_chinese_variant(
+        handle as *mut crate::c_api::QwenAsrEngine,
+        variant_c.as_ptr(),
+    ) == 0
+    {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
 /// Set transcription prompt text configuration.
 #[no_mangle]
 pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeSetPrompt(

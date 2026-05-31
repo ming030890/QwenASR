@@ -1,0 +1,18 @@
+{
+  "params": {
+    "p_high": 0.9,
+    "n_min": 20,
+    "max_ctx": 2,
+    "p_high_single": 0.97,
+    "n_min_single": 40
+  },
+  "rules": [
+    {
+      "from": "咁你",
+      "to": "啖你",
+      "count": 33,
+      "occ": 33,
+      "precision": 1.0
+    }
+  ]
+}

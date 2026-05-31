@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/qwen-asr", "crates/qwen-asr-cli"]
+members = ["crates/qwen-asr", "crates/qwen-asr-cli", "crates/yue-tools"]
 exclude = ["flutter/qwen_asr/rust"]  # Cargokit builds independently
 
 [workspace.package]

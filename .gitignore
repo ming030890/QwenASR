@@ -27,10 +27,14 @@
 # Bench scratch
 /bench/results/
 /bench/compare-results/
+/bench/android-results/
 /bench/run_mlx_audio.py
 /bench/generate_unified_charts.py
 /tmp/qwen3_asr_rs/
 /tmp/
+
+# Cantonese bench generated ASR outputs and decoded audio cache
+/bench/cantonese/out/
 
 # Librispeech — keep only scripts and readme
 /librispeech-wer-bench/*
@@ -44,3 +48,6 @@
 
 # Saved baseline binaries for same-session gate comparisons
 /bench/android-baselines/
+
+# Local terminal/session logs
+/screenlog.*
