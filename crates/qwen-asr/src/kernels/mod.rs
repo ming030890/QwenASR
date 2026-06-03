@@ -2964,3 +2964,17 @@ pub fn argmax_matvec_bf16(x: &[f32], w_bf16: *const u16, in_dim: usize, out_dim:
     }
     best
 }
+
+/// Compute the full logit vector `y = x @ W^T` for INT8-quantized weights
+/// (single input vector, threaded). Mirrors [`argmax_matvec_int8`] but writes
+/// every logit instead of only the argmax. Used by the LM rescorer; aarch64 only.
+pub fn logits_matvec_int8(
+    x: &[f32],
+    w_int8: &[i8],
+    w_scales: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+    y: &mut [f32],
+) {
+    int8_matvec_threaded(&mut y[..out_dim], x, w_int8, w_scales, None, in_dim, out_dim);
+}

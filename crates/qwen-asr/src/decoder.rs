@@ -1027,14 +1027,14 @@ pub fn decoder_prefill(
 }
 
 /// Decoder single-token forward: returns greedy token ID.
-pub fn decoder_forward(
+pub fn decoder_forward_hidden(
     decoder: &Decoder,
     cfg: &QwenConfig,
     kv_cache: &mut KvCache,
     rope: &mut RopeCache,
     bufs: &mut DecoderBuffers,
     input_embed: &[f32],
-) -> i32 {
+) {
     let dim = cfg.dec_hidden;
     let n_heads = cfg.dec_heads;
     let n_kv_heads = cfg.dec_kv_heads;
@@ -1240,7 +1240,8 @@ pub fn decoder_forward(
 
     kv_cache.len = pos + 1;
 
-    // Final norm + streaming argmax (use x_norm as temp to avoid heap allocation)
+    // Final norm — leave the normalized hidden state in bufs.x so callers can
+    // either argmax it (decoder_forward) or project full logits (rescorer).
     kernels::rms_norm(
         &mut bufs.x_norm[..dim],
         &bufs.x[..dim],
@@ -1250,22 +1251,67 @@ pub fn decoder_forward(
         eps,
     );
     bufs.x[..dim].copy_from_slice(&bufs.x_norm[..dim]);
+}
+
+/// Argmax of the lm_head projection of an already-normalized hidden state.
+/// INT8 streaming argmax on aarch64 (2x less bandwidth), BF16 elsewhere.
+fn project_argmax(decoder: &Decoder, cfg: &QwenConfig, x_norm: &[f32]) -> i32 {
+    let dim = cfg.dec_hidden;
     let lm_out_dim = cfg.lm_head_dim();
 
-    // Use INT8 quantized argmax on aarch64 (2x less bandwidth), BF16 on x86_64
     #[cfg(target_arch = "aarch64")]
     if let (Some(ref int8_data), Some(ref scales)) =
         (&decoder.lm_head_int8, &decoder.lm_head_int8_scales)
     {
-        return kernels::argmax_matvec_int8(&bufs.x[..dim], int8_data, scales, dim, lm_out_dim)
-            as i32;
+        return kernels::argmax_matvec_int8(x_norm, int8_data, scales, dim, lm_out_dim) as i32;
     }
 
     let lm_weight = decoder.lm_head_bf16.unwrap_or(decoder.tok_embeddings_bf16);
     if lm_weight.is_null() {
         panic!("decoder: fallback BF16 argmax called but no BF16 weights are loaded!");
     }
-    kernels::argmax_matvec_bf16(&bufs.x[..dim], lm_weight, dim, lm_out_dim) as i32
+    kernels::argmax_matvec_bf16(x_norm, lm_weight, dim, lm_out_dim) as i32
+}
+
+/// Run one decoder step and return the argmax next-token id.
+pub fn decoder_forward(
+    decoder: &Decoder,
+    cfg: &QwenConfig,
+    kv_cache: &mut KvCache,
+    rope: &mut RopeCache,
+    bufs: &mut DecoderBuffers,
+    input_embed: &[f32],
+) -> i32 {
+    decoder_forward_hidden(decoder, cfg, kv_cache, rope, bufs, input_embed);
+    project_argmax(decoder, cfg, &bufs.x[..cfg.dec_hidden])
+}
+
+/// Project an already-normalized hidden state (e.g. `bufs.x` after
+/// [`decoder_forward_hidden`]) through lm_head into `out` (full vocab logits).
+/// `out.len()` must be >= `cfg.lm_head_dim()`. No huge scratch is allocated:
+/// the single-vector matvec streams the weights. Used by the LM rescorer.
+pub fn decoder_project_logits(
+    decoder: &Decoder,
+    cfg: &QwenConfig,
+    x_norm: &[f32],
+    out: &mut [f32],
+) {
+    let dim = cfg.dec_hidden;
+    let lm_out_dim = cfg.lm_head_dim();
+
+    #[cfg(target_arch = "aarch64")]
+    if let (Some(ref int8_data), Some(ref scales)) =
+        (&decoder.lm_head_int8, &decoder.lm_head_int8_scales)
+    {
+        kernels::logits_matvec_int8(x_norm, int8_data, scales, dim, lm_out_dim, out);
+        return;
+    }
+
+    let lm_weight = decoder.lm_head_bf16.unwrap_or(decoder.tok_embeddings_bf16);
+    if lm_weight.is_null() {
+        panic!("decoder: project_logits called but no BF16 weights are loaded!");
+    }
+    kernels::linear_nobias_bf16(&mut out[..lm_out_dim], x_norm, lm_weight, 1, dim, lm_out_dim);
 }
 
 /// Decoder prefill that returns per-position logits (for forced aligner).
@@ -1287,27 +1333,21 @@ pub fn decoder_prefill_logits(
     decoder_prefill(decoder, cfg, kv_cache, rope, bufs, input_embeds, seq_len);
 
     // After prefill, pref_x contains the final hidden states for all positions.
-    // Apply final RMS norm and lm_head projection.
-    let x = &bufs.pref_x[..seq_len * dim];
-    let mut x_norm = vec![0.0f32; seq_len * dim];
-    kernels::rms_norm(&mut x_norm, x, &decoder.norm, seq_len, dim, eps);
-
-    let lm_weight = decoder.lm_head_bf16.unwrap_or(decoder.tok_embeddings_bf16);
-    if lm_weight.is_null() {
-        panic!("decoder: fallback BF16 prefill logits called but no BF16 weights are loaded!");
-    }
-
-    // Project each position through lm_head: [seq_len × dim] × [out_dim × dim]^T → [seq_len × out_dim]
+    // Project each position one at a time using the single-vector lm_head matvec
+    // (INT8-streaming on aarch64). This avoids materializing/dequantizing the
+    // entire lm_head into a scratch buffer — which for the full ASR vocab would
+    // need hundreds of MB and panics — so only the [seq_len × out_dim] output is
+    // allocated.
     let mut logits = vec![0.0f32; seq_len * out_dim];
-    unsafe {
-        kernels::linear_nobias_bf16_scratch(
-            &mut logits,
+    let mut x_norm = vec![0.0f32; dim];
+    for p in 0..seq_len {
+        let x = &bufs.pref_x[p * dim..(p + 1) * dim];
+        kernels::rms_norm(&mut x_norm, x, &decoder.norm, 1, dim, eps);
+        decoder_project_logits(
+            decoder,
+            cfg,
             &x_norm,
-            lm_weight,
-            seq_len,
-            dim,
-            out_dim,
-            &mut bufs.bf16_scratch,
+            &mut logits[p * out_dim..(p + 1) * out_dim],
         );
     }
 

@@ -64,6 +64,7 @@ pub mod encoder;
 #[cfg(feature = "android")]
 pub mod jni_api;
 pub mod kernels;
+pub mod rescore;
 pub mod safetensors;
 pub mod tokenizer;
 pub mod transcribe;
