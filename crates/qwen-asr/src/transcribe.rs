@@ -5,7 +5,6 @@ use crate::config::*;
 use crate::context::QwenCtx;
 use crate::decoder::{self, tok_embed_to_f32};
 use crate::kernels;
-use crate::rescore;
 use crate::tokenizer::QwenTokenizer;
 
 use std::time::Instant;
@@ -124,52 +123,6 @@ fn load_tokenizer(model_dir: &str) -> Option<QwenTokenizer> {
 }
 
 /// Transcribe a single segment. Returns (text, n_text_tokens).
-/// Produce the next decode token. When LM rescoring is enabled and the acoustic
-/// top-2 candidates are close ("a confusion"), runs a K=1 width-2 fork and lets
-/// the pure-text LM pick the winner; otherwise returns the plain acoustic argmax.
-fn decode_next_token(ctx: &mut QwenCtx, embed: &[f32], history: &[i32]) -> i32 {
-    if !ctx.rescorer.enabled {
-        return decoder::decoder_forward(
-            &ctx.decoder,
-            &ctx.config,
-            &mut ctx.kv_cache,
-            &mut ctx.rope_cache,
-            &mut ctx.dec_bufs,
-            embed,
-        );
-    }
-
-    // Compute the hidden state, then inspect the acoustic top-2 for confusion.
-    decoder::decoder_forward_hidden(
-        &ctx.decoder,
-        &ctx.config,
-        &mut ctx.kv_cache,
-        &mut ctx.rope_cache,
-        &mut ctx.dec_bufs,
-        embed,
-    );
-    let (c0, v0, c1, v1) = ctx
-        .rescorer
-        .top2_from_hidden(&ctx.decoder, &ctx.config, &ctx.dec_bufs);
-
-    if rescore::is_text_token(c0)
-        && rescore::is_text_token(c1)
-        && (v0 - v1) < ctx.rescorer.gap_threshold
-    {
-        return ctx.rescorer.pick(
-            &ctx.decoder,
-            &ctx.config,
-            &mut ctx.kv_cache,
-            &mut ctx.rope_cache,
-            &mut ctx.dec_bufs,
-            history,
-            c0,
-            c1,
-        );
-    }
-    c0
-}
-
 fn transcribe_segment(
     ctx: &mut QwenCtx,
     samples: &[f32],
@@ -319,23 +272,6 @@ fn transcribe_segment(
     // Decoder prefill
     let t0 = get_time_ms();
     ctx.kv_cache.len = 0;
-    ctx.rescorer.reset();
-    if ctx.rescorer.enabled {
-        // Seed the text-LM with the same no-audio prompt scaffold the decoder sees
-        // (system/user turn + `language <lang>` + <asr_text>), so its prior is
-        // conditioned identically — minus the audio embeddings.
-        let mut scaffold: Vec<i32> = Vec::new();
-        scaffold.extend_from_slice(PREFIX_HEAD);
-        if let Some(ref p) = ctx.prompt_tokens {
-            scaffold.extend_from_slice(p);
-        }
-        scaffold.extend_from_slice(PREFIX_TAIL);
-        scaffold.extend_from_slice(SUFFIX_BASE);
-        if let Some(ref f) = ctx.force_prompt_tokens {
-            scaffold.extend_from_slice(f);
-        }
-        ctx.rescorer.set_prefix(&scaffold);
-    }
     let prefill_len = total_seq - 1;
     decoder::decoder_prefill(
         &ctx.decoder,
@@ -347,14 +283,15 @@ fn transcribe_segment(
         prefill_len,
     );
 
-    // Pure-text LM rescoring history: the text tokens emitted so far this segment.
-    let mut history: Vec<i32> = Vec::new();
-
     // First token from last prefill position
-    let mut token = decode_next_token(
-        ctx,
-        &input_embeds[prefill_len * dim..(prefill_len + 1) * dim],
-        &history,
+    let last_embed = &input_embeds[prefill_len * dim..(prefill_len + 1) * dim];
+    let mut token = decoder::decoder_forward(
+        &ctx.decoder,
+        cfg,
+        &mut ctx.kv_cache,
+        &mut ctx.rope_cache,
+        &mut ctx.dec_bufs,
+        last_embed,
     );
 
     let prefill_ms = elapsed_ms(t0);
@@ -385,11 +322,6 @@ fn transcribe_segment(
             text_bytes.extend_from_slice(piece_bytes);
             n_text_tokens += 1;
 
-            // Track committed text tokens as the LM-rescoring history.
-            if rescore::is_text_token(token) {
-                history.push(token);
-            }
-
             if let Some(ref cb) = ctx.token_cb {
                 // For the callback, provide lossy UTF-8 for display purposes,
                 // converting Simplified->Traditional per-piece if configured.
@@ -402,7 +334,14 @@ fn transcribe_segment(
         }
 
         unsafe { tok_embed_to_f32(&ctx.decoder, &mut tmp_embed, token, dim) };
-        token = decode_next_token(ctx, &tmp_embed, &history);
+        token = decoder::decoder_forward(
+            &ctx.decoder,
+            cfg,
+            &mut ctx.kv_cache,
+            &mut ctx.rope_cache,
+            &mut ctx.dec_bufs,
+            &tmp_embed,
+        );
     }
 
     let decode_ms = elapsed_ms(t0);

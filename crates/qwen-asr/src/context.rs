@@ -5,7 +5,6 @@ use crate::decoder::*;
 use crate::encoder::EncoderBuffers;
 use crate::encoder::*;
 use crate::kernels;
-use crate::rescore::LmRescorer;
 use crate::safetensors::MultiSafetensors;
 use crate::tokenizer::QwenTokenizer;
 
@@ -42,9 +41,6 @@ pub struct QwenCtx {
 
     // RoPE cache
     pub rope_cache: RopeCache,
-
-    // Pure-text LM rescorer (homophone confusion correction)
-    pub rescorer: LmRescorer,
 
     // Token streaming callback
     pub token_cb: Option<TokenCallback>,
@@ -157,7 +153,6 @@ impl QwenCtx {
 
         let kv_cache = KvCache::new(cfg.dec_layers, 2048, cfg.dec_kv_heads, cfg.dec_head_dim);
         let dec_bufs = DecoderBuffers::new(&cfg);
-        let rescorer = LmRescorer::new(&cfg);
 
         if kernels::verbose() >= 1 {
             eprintln!("Model loaded.");
@@ -173,7 +168,6 @@ impl QwenCtx {
             dec_bufs,
             enc_bufs: EncoderBuffers::new(),
             rope_cache: RopeCache::new(),
-            rescorer,
             token_cb: None,
             segment_sec: 0.0,
             search_sec: 3.0,
