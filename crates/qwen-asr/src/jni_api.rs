@@ -256,13 +256,14 @@ fn start_asr_worker(
     rx: mpsc::Receiver<Option<AsrTask>>,
     queued_samples: Arc<AtomicU64>,
     save_audio_dir: Option<String>,
+    initial_prompt: String,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let session_timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let mut transcript_prompt = String::new();
+        let mut transcript_prompt = initial_prompt;
         while let Ok(message) = rx.recv() {
             let Some(task) = message else {
                 break;
@@ -298,6 +299,9 @@ fn start_asr_worker(
                 continue;
             }
 
+            if !transcript_prompt.is_empty() && !transcript_prompt.ends_with('\n') {
+                transcript_prompt.push('\n');
+            }
             transcript_prompt.push_str(text.trim());
             unsafe {
                 let engine = &mut *(engine_addr as *mut crate::c_api::QwenAsrEngine);
@@ -546,7 +550,7 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeStartVadSession(
     };
 
     let engine = &mut *(handle as *mut crate::c_api::QwenAsrEngine);
-    let _ = engine.ctx.set_prompt("");
+    let initial_prompt = engine.ctx.prompt.clone().unwrap_or_default();
 
     let java_vm = match env.get_java_vm() {
         Ok(vm) => vm,
@@ -566,6 +570,7 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeStartVadSession(
         rx,
         queued_samples.clone(),
         save_dir_opt,
+        initial_prompt,
     );
 
     let session = VadAsrSession {
