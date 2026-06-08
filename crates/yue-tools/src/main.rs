@@ -5,6 +5,7 @@
 //!   cer         report CER (with/without punct); optionally apply a rule set
 //!   mine        mine correction rules from a transcribed split -> rules.json
 //!   tune        sweep mining constants on train+dev, emit the chosen rule set
+//!   zhconv      stream Chinese variant conversion as JSON string lines
 
 mod decode;
 mod rules;
@@ -40,7 +41,7 @@ fn arg_usize(args: &[String], flag: &str, default: usize) -> usize {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: yue-tools <transcribe|cer|mine|tune|score> [opts]");
+        eprintln!("usage: yue-tools <transcribe|cer|mine|tune|score|zhconv> [opts]");
         std::process::exit(1);
     }
     let cmd = args[1].clone();
@@ -51,10 +52,35 @@ fn main() {
         "mine" => cmd_mine(rest),
         "tune" => cmd_tune(rest),
         "score" => cmd_score(rest),
+        "zhconv" => cmd_zhconv(rest),
         other => {
             eprintln!("unknown subcommand: {}", other);
             std::process::exit(1);
         }
+    }
+}
+
+fn cmd_zhconv(args: &[String]) {
+    let variant_name = arg(args, "--variant").unwrap_or_else(|| "zh-HK".to_string());
+    let variant = match variant_name.parse::<zhconv::Variant>() {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("unsupported zh variant: {}", variant_name);
+            std::process::exit(1);
+        }
+    };
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::BufWriter::new(std::io::stdout());
+    for line in stdin.lock().lines() {
+        let line = line.expect("read stdin");
+        let text = match serde_json::from_str::<String>(&line) {
+            Ok(text) => text,
+            Err(_) => line,
+        };
+        let converted = zhconv::zhconv(&text, variant);
+        writeln!(stdout, "{}", serde_json::to_string(&converted).unwrap()).unwrap();
+        stdout.flush().ok();
     }
 }
 
@@ -101,6 +127,7 @@ fn cmd_transcribe(args: &[String]) {
     let clips = arg(args, "--clips").expect("--clips required");
     let out_path = arg(args, "--out").expect("--out required");
     let language = arg(args, "--language").unwrap_or_else(|| "Cantonese".to_string());
+    let zh_variant = arg(args, "--zh-variant").unwrap_or_else(|| "zh-HK".to_string());
     let limit = arg(args, "--limit").and_then(|s| s.parse::<usize>().ok());
     let threads = arg(args, "--threads")
         .and_then(|s| s.parse::<usize>().ok())
@@ -120,6 +147,10 @@ fn cmd_transcribe(args: &[String]) {
     let mut ctx = qwen_asr::context::QwenCtx::load(&model).expect("load model");
     if ctx.set_force_language(&language).is_err() {
         eprintln!("unsupported language: {}", language);
+        std::process::exit(1);
+    }
+    if ctx.set_chinese_variant(&zh_variant).is_err() {
+        eprintln!("unsupported zh variant: {}", zh_variant);
         std::process::exit(1);
     }
 
