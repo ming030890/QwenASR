@@ -16,9 +16,9 @@ const VAD_FRAME_SAMPLES: usize = 256;
 const SAMPLE_RATE: usize = 16_000;
 const VAD_THRESHOLD: f32 = 0.5;
 const START_VOICED_FRAMES: usize = 4; // ~64 ms; avoids triggering on a breath/click.
-const END_SILENCE_FRAMES: usize = 50; // ~800 ms; less aggressive splitting on short pauses.
+const END_SILENCE_FRAMES: usize = 32; // ~512 ms; faster keyboard commit after speech ends.
 const PRE_ROLL_FRAMES: usize = 19; // ~304 ms.
-const POST_ROLL_FRAMES: usize = 13; // ~208 ms.
+const POST_ROLL_FRAMES: usize = 10; // ~160 ms; keeps word endings without the old 1s tail.
 const MAX_SEGMENT_SAMPLES: usize = SAMPLE_RATE * 12;
 const MAX_QUEUED_SAMPLES: u64 = (SAMPLE_RATE * 90) as u64;
 
