@@ -1,26 +1,38 @@
-use earshot::Detector;
 use jni::objects::{GlobalRef, JByteBuffer, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jfloat, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
+use silero_vad_rust::RawDetector;
 /// JNI API for Android integration.
 /// Build with: cargo ndk -t arm64-v8a build --release --features android
 ///
 /// Java class: com.qwenasr.QAsrEngine
 ///
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-const VAD_FRAME_SAMPLES: usize = 256;
+const VAD_FRAME_SAMPLES: usize = 512;
 const SAMPLE_RATE: usize = 16_000;
 const VAD_THRESHOLD: f32 = 0.5;
-const START_VOICED_FRAMES: usize = 4; // ~64 ms; avoids triggering on a breath/click.
-const END_SILENCE_FRAMES: usize = 32; // ~512 ms; faster keyboard commit after speech ends.
-const PRE_ROLL_FRAMES: usize = 19; // ~304 ms.
-const POST_ROLL_FRAMES: usize = 10; // ~160 ms; keeps word endings without the old 1s tail.
+const VAD_NEG_THRESHOLD: f32 = 0.35;
+const MIN_SILENCE_DURATION_MS: usize = 100;
+const SPEECH_PAD_MS: usize = 30;
+const MIN_SILENCE_SAMPLES: usize = SAMPLE_RATE * MIN_SILENCE_DURATION_MS / 1000;
+const SPEECH_PAD_SAMPLES: usize = SAMPLE_RATE * SPEECH_PAD_MS / 1000;
 const MAX_SEGMENT_SAMPLES: usize = SAMPLE_RATE * 12;
 const MAX_QUEUED_SAMPLES: u64 = (SAMPLE_RATE * 90) as u64;
+
+fn silero_stream_start_sample(current_sample: u64) -> u64 {
+    current_sample.saturating_sub((SPEECH_PAD_SAMPLES + VAD_FRAME_SAMPLES) as u64)
+}
+
+fn silero_stream_end_sample(temp_end_sample: u64) -> u64 {
+    temp_end_sample
+        .saturating_add(SPEECH_PAD_SAMPLES as u64)
+        .saturating_sub(VAD_FRAME_SAMPLES as u64)
+}
 
 struct AsrTask {
     segment_id: u64,
@@ -38,14 +50,14 @@ struct VadAsrSession {
 }
 
 struct VadState {
-    detector: Detector,
+    detector: RawDetector,
     frame_buf: Vec<i16>,
-    pre_roll: std::collections::VecDeque<[i16; VAD_FRAME_SAMPLES]>,
+    speech_pad_history: VecDeque<i16>,
     active_segment: Vec<i16>,
     triggered: bool,
-    voiced_run: usize,
-    voiced_frames_in_segment: usize,
-    silence_run: usize,
+    temp_end_sample: Option<u64>,
+    current_sample: u64,
+    speech_start_sample: u64,
     segment_id: u64,
     samples_received: u64,
     samples_vad_processed: u64,
@@ -56,14 +68,14 @@ struct VadState {
 impl VadState {
     fn new() -> Self {
         Self {
-            detector: Detector::default(),
+            detector: RawDetector::default(),
             frame_buf: Vec::with_capacity(VAD_FRAME_SAMPLES),
-            pre_roll: std::collections::VecDeque::with_capacity(PRE_ROLL_FRAMES),
+            speech_pad_history: VecDeque::with_capacity(SPEECH_PAD_SAMPLES),
             active_segment: Vec::with_capacity(SAMPLE_RATE * 4),
             triggered: false,
-            voiced_run: 0,
-            voiced_frames_in_segment: 0,
-            silence_run: 0,
+            temp_end_sample: None,
+            current_sample: 0,
+            speech_start_sample: 0,
             segment_id: 0,
             samples_received: 0,
             samples_vad_processed: 0,
@@ -122,43 +134,79 @@ impl VadState {
         is_final: bool,
     ) -> bool {
         self.samples_vad_processed += VAD_FRAME_SAMPLES as u64;
-        let score = self.detector.predict_i16(&frame);
-        let voiced = score >= VAD_THRESHOLD;
+        let frame_start_sample = self.current_sample;
+        self.current_sample += VAD_FRAME_SAMPLES as u64;
 
-        if !self.triggered {
-            self.pre_roll.push_back(frame);
-            while self.pre_roll.len() > PRE_ROLL_FRAMES {
-                self.pre_roll.pop_front();
-            }
+        let score = self.detector.predict_i16(&frame).unwrap_or(0.0);
 
-            self.voiced_run = if voiced { self.voiced_run + 1 } else { 0 };
-            if self.voiced_run >= START_VOICED_FRAMES {
-                self.triggered = true;
-                self.silence_run = 0;
-                self.voiced_frames_in_segment = START_VOICED_FRAMES;
-                self.active_segment.clear();
-                for old_frame in self.pre_roll.drain(..) {
-                    self.active_segment.extend_from_slice(&old_frame);
-                }
-            }
+        if score >= VAD_THRESHOLD && self.temp_end_sample.is_some() {
+            self.temp_end_sample = None;
+        }
+
+        if score >= VAD_THRESHOLD && !self.triggered {
+            self.start_speech(&frame, frame_start_sample);
             return false;
         }
 
-        self.active_segment.extend_from_slice(&frame);
-        if voiced {
-            self.voiced_frames_in_segment += 1;
-            self.silence_run = 0;
+        if self.triggered {
+            self.active_segment.extend_from_slice(&frame);
         } else {
-            self.silence_run += 1;
+            self.remember_for_speech_pad(&frame);
+            return false;
         }
 
-        let reached_silence = self.silence_run >= END_SILENCE_FRAMES + POST_ROLL_FRAMES;
         let reached_max = self.active_segment.len() >= MAX_SEGMENT_SAMPLES;
-        if reached_silence || reached_max || is_final {
+        if reached_max || is_final {
             self.enqueue_segment(task_tx, queued_samples, is_final);
+            self.remember_for_speech_pad(&frame);
             return true;
         }
+
+        if score < VAD_NEG_THRESHOLD {
+            let temp_end_sample = *self.temp_end_sample.get_or_insert(self.current_sample);
+            if self.current_sample.saturating_sub(temp_end_sample) >= MIN_SILENCE_SAMPLES as u64 {
+                let speech_end_sample = silero_stream_end_sample(temp_end_sample);
+                self.truncate_active_segment_at(speech_end_sample);
+                self.enqueue_segment(task_tx, queued_samples, false);
+                self.remember_for_speech_pad(&frame);
+                return true;
+            }
+        }
+
         false
+    }
+
+    fn remember_for_speech_pad(&mut self, samples: &[i16]) {
+        for &sample in samples {
+            self.speech_pad_history.push_back(sample);
+            while self.speech_pad_history.len() > SPEECH_PAD_SAMPLES {
+                self.speech_pad_history.pop_front();
+            }
+        }
+    }
+
+    fn start_speech(&mut self, frame: &[i16; VAD_FRAME_SAMPLES], frame_start_sample: u64) {
+        let start_sample = silero_stream_start_sample(self.current_sample);
+        let history_samples_to_copy = frame_start_sample.saturating_sub(start_sample) as usize;
+        let history_skip = self
+            .speech_pad_history
+            .len()
+            .saturating_sub(history_samples_to_copy);
+
+        self.triggered = true;
+        self.temp_end_sample = None;
+        self.speech_start_sample = start_sample;
+        self.active_segment.clear();
+        self.active_segment
+            .extend(self.speech_pad_history.iter().skip(history_skip).copied());
+        self.active_segment.extend_from_slice(frame);
+    }
+
+    fn truncate_active_segment_at(&mut self, end_sample: u64) {
+        let keep = end_sample.saturating_sub(self.speech_start_sample) as usize;
+        if keep < self.active_segment.len() {
+            self.active_segment.truncate(keep);
+        }
     }
 
     fn enqueue_segment(
@@ -171,19 +219,7 @@ impl VadState {
             return;
         }
 
-        if self.voiced_frames_in_segment < START_VOICED_FRAMES {
-            self.reset_segment_state();
-            return;
-        }
-
-        let mut segment = std::mem::take(&mut self.active_segment);
-        let trailing_silence_to_drop = self
-            .silence_run
-            .saturating_sub(POST_ROLL_FRAMES)
-            .saturating_mul(VAD_FRAME_SAMPLES);
-        if trailing_silence_to_drop > 0 && trailing_silence_to_drop < segment.len() {
-            segment.truncate(segment.len() - trailing_silence_to_drop);
-        }
+        let segment = std::mem::take(&mut self.active_segment);
 
         let n = segment.len() as u64;
         let previous = queued_samples.fetch_add(n, Ordering::Relaxed);
@@ -205,10 +241,8 @@ impl VadState {
 
     fn reset_segment_state(&mut self) {
         self.triggered = false;
-        self.voiced_run = 0;
-        self.voiced_frames_in_segment = 0;
-        self.silence_run = 0;
-        self.pre_roll.clear();
+        self.temp_end_sample = None;
+        self.speech_start_sample = 0;
         self.active_segment.clear();
     }
 }
@@ -229,12 +263,12 @@ fn write_wav_file(path: &str, samples: &[i16], sample_rate: u32) -> std::io::Res
     // fmt chunk
     file.write_all(b"fmt ")?;
     file.write_all(&16u32.to_le_bytes())?; // Subchunk1Size
-    file.write_all(&1u16.to_le_bytes())?;  // AudioFormat (PCM = 1)
-    file.write_all(&1u16.to_le_bytes())?;  // NumChannels (Mono = 1)
+    file.write_all(&1u16.to_le_bytes())?; // AudioFormat (PCM = 1)
+    file.write_all(&1u16.to_le_bytes())?; // NumChannels (Mono = 1)
     file.write_all(&sample_rate.to_le_bytes())?; // SampleRate
     let byte_rate = sample_rate * 1 * 2;
     file.write_all(&byte_rate.to_le_bytes())?; // ByteRate
-    file.write_all(&2u16.to_le_bytes())?;  // BlockAlign
+    file.write_all(&2u16.to_le_bytes())?; // BlockAlign
     file.write_all(&16u16.to_le_bytes())?; // BitsPerSample
 
     // data chunk
@@ -271,11 +305,20 @@ fn start_asr_worker(
 
             // Save the segment audio if save_audio_dir is provided
             if let Some(ref dir) = save_audio_dir {
-                let wav_path = format!("{}/{}_seg{:03}.wav", dir, session_timestamp, task.segment_id);
+                let wav_path = format!(
+                    "{}/{}_seg{:03}.wav",
+                    dir, session_timestamp, task.segment_id
+                );
                 if let Err(e) = write_wav_file(&wav_path, &task.samples, 16000) {
-                    eprintln!("qwen-asr worker: failed to save post-VAD audio segment: {}", e);
+                    eprintln!(
+                        "qwen-asr worker: failed to save post-VAD audio segment: {}",
+                        e
+                    );
                 } else {
-                    eprintln!("qwen-asr worker: saved post-VAD audio segment to {}", wav_path);
+                    eprintln!(
+                        "qwen-asr worker: saved post-VAD audio segment to {}",
+                        wav_path
+                    );
                 }
             }
 
@@ -645,5 +688,33 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeStopVadSession(
     };
     if let Some(handle) = worker_handle {
         let _ = handle.join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn silero_stream_uses_512_sample_frames() {
+        assert_eq!(VAD_FRAME_SAMPLES, 512);
+        assert_eq!(VAD_FRAME_SAMPLES * 1000 / SAMPLE_RATE, 32);
+    }
+
+    #[test]
+    fn silero_stream_start_matches_vad_iterator_padding() {
+        assert_eq!(SPEECH_PAD_SAMPLES, 480);
+
+        // First frame: upstream VADIterator saturates start at 0.
+        assert_eq!(silero_stream_start_sample(512), 0);
+
+        // Later frames: start = current_sample - speech_pad - window_size.
+        assert_eq!(silero_stream_start_sample(2048), 1056);
+    }
+
+    #[test]
+    fn silero_stream_end_matches_vad_iterator_padding() {
+        // Upstream VADIterator reports end = temp_end + speech_pad - window_size.
+        assert_eq!(silero_stream_end_sample(4096), 4064);
     }
 }

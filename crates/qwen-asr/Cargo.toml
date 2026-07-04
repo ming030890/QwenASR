@@ -15,9 +15,9 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 name = "qwen_asr"
 
 [dependencies]
-earshot = "1.1"
 libc = "0.2"
 jni = { version = "0.21.1", optional = true }
+silero_vad_rust = { path = "../../../silero_vad_rust" }
 zhconv = "0.4.1"
 
 [package.metadata.docs.rs]
