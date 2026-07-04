@@ -16,7 +16,7 @@ on-device BF16→INT8 quantization at model-load time.
 Naming convention in the output file:
   {layer}.{proj}.weight          dtype I8   [out_dim, in_dim]   (replaces BF16)
   {layer}.{proj}.weight_int8_scale  dtype F32  [out_dim]         (new)
-  thinker.lm_head.weight         dtype I8   [vocab, hidden]     (new for tied head)
+  thinker.lm_head.weight         dtype I8   [vocab, hidden]     (new/replaced tied head)
   thinker.lm_head.weight_int8_scale dtype F32 [vocab]           (new)
 
 Usage:
@@ -197,6 +197,8 @@ def main():
                     help="Source model directory (contains model.safetensors)")
     ap.add_argument("--output-dir", default="/Volumes/SSD/qwen-asr-int8dec",
                     help="Output directory for INT8 model")
+    ap.add_argument("--drop-embed-tokens", action="store_true",
+                    help="Drop BF16 thinker.model.embed_tokens.weight and use INT8 lm_head for token embeddings")
     args = ap.parse_args()
 
     src = Path(args.model_dir)
@@ -222,6 +224,8 @@ def main():
     print(f"  individual projections to quantize: {len(decoder_proj_names)}, "
           f"gate+up pairs to fuse: {len(gate_proj_names)}", flush=True)
     print(f"  tied lm_head pre-quantization: {'yes' if quantize_tied_lm_head else 'no'}",
+          flush=True)
+    print(f"  drop BF16 token embeddings: {'yes' if args.drop_embed_tokens else 'no'}",
           flush=True)
 
     # Build the output tensor list
@@ -269,9 +273,16 @@ def main():
         elif is_decoder_up_proj(name):
             pass  # already emitted as gate_up_fused when gate_proj was processed
         elif name == LM_HEAD and quantize_tied_lm_head:
-            pass  # replaced below from embed_tokens so embedding lookup stays BF16
-        elif name == EMBED_TOKENS and quantize_tied_lm_head:
-            pass  # dropped to avoid duplicate storage; dequantized on-the-fly from lm_head instead
+            assert dtype_str == "BF16", f"Expected BF16 for {name}, got {dtype_str}"
+            lm_bf16 = get_tensor_np(header, data_mmap, name)
+            assert lm_bf16.ndim == 2, f"Expected 2D weight for {name}"
+            print(f"  quantizing tied lm_head from {name} {lm_bf16.shape} …", flush=True)
+            lm_int8, lm_scales = quantize_bf16_to_int8(lm_bf16)
+            out_tensors.append((LM_HEAD, "I8", lm_int8))
+            out_tensors.append((LM_HEAD_SCALE, "F32", lm_scales))
+            quantized_count += 1
+        elif name == EMBED_TOKENS and args.drop_embed_tokens and quantize_tied_lm_head:
+            pass
         else:
             # Copy as-is: raw bytes wrapped as uint8 ndarray.
             # Pass original shape explicitly — arr.shape would be [n_bytes], not the
@@ -280,7 +291,7 @@ def main():
             raw = np.array(data_mmap[start:end], dtype=np.uint8)
             out_tensors.append((name, dtype_str, raw, list(meta["shape"])))
 
-        if name == EMBED_TOKENS and quantize_tied_lm_head:
+        if name == EMBED_TOKENS and quantize_tied_lm_head and LM_HEAD not in header:
             assert dtype_str == "BF16", f"Expected BF16 for {name}, got {dtype_str}"
             embed_bf16 = get_tensor_np(header, data_mmap, name)
             assert embed_bf16.ndim == 2, f"Expected 2D weight for {name}"

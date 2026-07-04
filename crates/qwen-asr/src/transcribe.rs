@@ -306,6 +306,8 @@ fn transcribe_segment(
     let mut past_asr_text = n_force_prompt_tokens > 0 || n_past > 0;
 
     let mut text_bytes: Vec<u8> = Vec::new();
+    let mut direct_text_bytes: Vec<u8> = Vec::new();
+    let mut saw_asr_text = n_force_prompt_tokens > 0;
     let mut tmp_embed = vec![0.0f32; dim];
 
     while n_generated < max_tokens {
@@ -317,6 +319,7 @@ fn transcribe_segment(
 
         if token == TOKEN_ASR_TEXT {
             past_asr_text = true;
+            saw_asr_text = true;
         } else if past_asr_text {
             let piece_bytes = tokenizer.decode_bytes(token);
             text_bytes.extend_from_slice(piece_bytes);
@@ -331,6 +334,8 @@ fn transcribe_segment(
             if n_text_tokens >= 24 && matches!(piece_bytes, b"." | b"!" | b"?") {
                 break;
             }
+        } else if n_force_prompt_tokens == 0 {
+            direct_text_bytes.extend_from_slice(tokenizer.decode_bytes(token));
         }
 
         unsafe { tok_embed_to_f32(&ctx.decoder, &mut tmp_embed, token, dim) };
@@ -359,7 +364,12 @@ fn transcribe_segment(
     }
 
     // Trim whitespace — convert accumulated bytes to UTF-8 first
-    let text = String::from_utf8_lossy(&text_bytes);
+    let output_bytes = if text_bytes.is_empty() && !saw_asr_text {
+        &direct_text_bytes
+    } else {
+        &text_bytes
+    };
+    let text = String::from_utf8_lossy(output_bytes);
     let trimmed = text.trim().to_string();
 
     ctx.perf_total_ms += elapsed_ms(seg_t0);
