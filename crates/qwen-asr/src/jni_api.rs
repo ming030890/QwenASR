@@ -37,7 +37,6 @@ fn silero_stream_end_sample(temp_end_sample: u64) -> u64 {
 struct AsrTask {
     segment_id: u64,
     samples: Vec<i16>,
-    is_final: bool,
 }
 
 struct VadAsrSession {
@@ -120,7 +119,7 @@ impl VadState {
             self.process_frame(frame, task_tx, queued_samples, false);
         }
         if !self.active_segment.is_empty() {
-            self.enqueue_segment(task_tx, queued_samples, true);
+            self.enqueue_segment(task_tx, queued_samples);
             return 1;
         }
         0
@@ -157,7 +156,7 @@ impl VadState {
 
         let reached_max = self.active_segment.len() >= MAX_SEGMENT_SAMPLES;
         if reached_max || is_final {
-            self.enqueue_segment(task_tx, queued_samples, is_final);
+            self.enqueue_segment(task_tx, queued_samples);
             self.remember_for_speech_pad(&frame);
             return true;
         }
@@ -167,7 +166,7 @@ impl VadState {
             if self.current_sample.saturating_sub(temp_end_sample) >= MIN_SILENCE_SAMPLES as u64 {
                 let speech_end_sample = silero_stream_end_sample(temp_end_sample);
                 self.truncate_active_segment_at(speech_end_sample);
-                self.enqueue_segment(task_tx, queued_samples, false);
+                self.enqueue_segment(task_tx, queued_samples);
                 self.remember_for_speech_pad(&frame);
                 return true;
             }
@@ -213,7 +212,6 @@ impl VadState {
         &mut self,
         task_tx: &mpsc::Sender<Option<AsrTask>>,
         queued_samples: &AtomicU64,
-        is_final: bool,
     ) {
         if self.active_segment.is_empty() {
             return;
@@ -232,7 +230,6 @@ impl VadState {
             let _ = task_tx.send(Some(AsrTask {
                 segment_id: self.segment_id,
                 samples: segment,
-                is_final,
             }));
         }
 
@@ -285,7 +282,7 @@ fn write_wav_file(path: &str, samples: &[i16], sample_rate: u32) -> std::io::Res
 
 fn start_asr_worker(
     engine_addr: usize,
-    java_vm: jni::JavaVM,
+    java_vm: Arc<jni::JavaVM>,
     listener: GlobalRef,
     rx: mpsc::Receiver<Option<AsrTask>>,
     queued_samples: Arc<AtomicU64>,
@@ -324,38 +321,41 @@ fn start_asr_worker(
                 task.samples.iter().map(|&s| (s as f32) / 32768.0).collect();
             queued_samples.fetch_sub(task.samples.len() as u64, Ordering::Relaxed);
 
+            let callback_vm = java_vm.clone();
+            let callback_listener = listener.clone();
             let text = unsafe {
                 let engine = &mut *(engine_addr as *mut crate::c_api::QwenAsrEngine);
                 let old_skip_silence = engine.ctx.skip_silence;
                 engine.ctx.skip_silence = false;
+                engine.ctx.token_cb = Some(Box::new(move |delta| {
+                    let Ok(mut env) = callback_vm.attach_current_thread() else {
+                        return;
+                    };
+                    let Ok(j_delta) = env.new_string(delta) else {
+                        return;
+                    };
+                    let _ = env.call_method(
+                        callback_listener.as_obj(),
+                        "onTranscriptDelta",
+                        "(Ljava/lang/String;)V",
+                        &[JValue::Object(&JObject::from(j_delta))],
+                    );
+                }));
                 let text = crate::transcribe::transcribe_audio(&mut engine.ctx, &samples_f32);
+                engine.ctx.token_cb = None;
                 engine.ctx.skip_silence = old_skip_silence;
                 text
             };
 
-            let Some(text) = text else {
-                continue;
-            };
-            if text.trim().is_empty() {
-                continue;
-            }
-
             let Ok(mut env) = java_vm.attach_current_thread() else {
                 continue;
             };
-            let Ok(j_text) = env.new_string(text) else {
-                continue;
+            let method = if text.is_some() {
+                "onTranscriptComplete"
+            } else {
+                "onTranscriptError"
             };
-            let _ = env.call_method(
-                listener.as_obj(),
-                "onTranscript",
-                "(JLjava/lang/String;Z)V",
-                &[
-                    JValue::Long(task.segment_id as jlong),
-                    JValue::Object(&JObject::from(j_text)),
-                    JValue::Bool(if task.is_final { JNI_TRUE } else { 0 } as jboolean),
-                ],
-            );
+            let _ = env.call_method(listener.as_obj(), method, "()V", &[]);
         }
     })
 }
@@ -552,7 +552,9 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeFree(
 }
 
 /// Start a native VAD + ASR session. The listener must implement:
-/// fun onTranscript(segmentId: Long, text: String, isFinal: Boolean)
+/// fun onTranscriptDelta(textDelta: String)
+/// fun onTranscriptComplete()
+/// fun onTranscriptError()
 #[no_mangle]
 pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeStartVadSession(
     mut env: JNIEnv,
@@ -594,7 +596,7 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeStartVadSession(
     let queued_samples = Arc::new(AtomicU64::new(0));
     let worker = start_asr_worker(
         handle as usize,
-        java_vm,
+        Arc::new(java_vm),
         listener_ref,
         rx,
         queued_samples.clone(),

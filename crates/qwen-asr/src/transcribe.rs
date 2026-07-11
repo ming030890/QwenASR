@@ -123,6 +123,13 @@ fn load_tokenizer(model_dir: &str) -> Option<QwenTokenizer> {
 }
 
 /// Transcribe a single segment. Returns (text, n_text_tokens).
+fn push_utf8_piece(pending: &mut Vec<u8>, piece: &[u8]) -> Option<String> {
+    pending.extend_from_slice(piece);
+    let text = std::str::from_utf8(pending).ok()?.to_owned();
+    pending.clear();
+    Some(text)
+}
+
 fn transcribe_segment(
     ctx: &mut QwenCtx,
     samples: &[f32],
@@ -307,6 +314,7 @@ fn transcribe_segment(
 
     let mut text_bytes: Vec<u8> = Vec::new();
     let mut direct_text_bytes: Vec<u8> = Vec::new();
+    let mut callback_bytes: Vec<u8> = Vec::new();
     let mut saw_asr_text = n_force_prompt_tokens > 0;
     let mut tmp_embed = vec![0.0f32; dim];
 
@@ -325,10 +333,10 @@ fn transcribe_segment(
             text_bytes.extend_from_slice(piece_bytes);
             n_text_tokens += 1;
 
-            if let Some(ref cb) = ctx.token_cb {
-                // For the callback, provide lossy UTF-8 for display purposes,
-                // converting Simplified->Traditional per-piece if configured.
-                cb(&ctx.convert_chinese(&String::from_utf8_lossy(piece_bytes)));
+            if let Some(piece) = push_utf8_piece(&mut callback_bytes, piece_bytes) {
+                if let Some(ref cb) = ctx.token_cb {
+                    cb(&ctx.convert_chinese(&piece));
+                }
             }
 
             if n_text_tokens >= 24 && matches!(piece_bytes, b"." | b"!" | b"?") {
@@ -1684,4 +1692,25 @@ pub fn stream_push_audio(
     } // end while loop
 
     Some(String::from_utf8_lossy(&delta_bytes).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::push_utf8_piece;
+
+    #[test]
+    fn token_callback_waits_for_complete_utf8() {
+        let mut pending = Vec::new();
+        assert_eq!(push_utf8_piece(&mut pending, &[0xe9]), None);
+        assert_eq!(push_utf8_piece(&mut pending, &[0xa6]), None);
+        assert_eq!(
+            push_utf8_piece(&mut pending, &[0x99]),
+            Some("香".to_string())
+        );
+        assert!(pending.is_empty());
+        assert_eq!(
+            push_utf8_piece(&mut pending, "港".as_bytes()),
+            Some("港".to_string())
+        );
+    }
 }
