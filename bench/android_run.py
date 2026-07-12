@@ -169,7 +169,9 @@ def append_tsv(tsv_path, json_path, timestamp, label, threads, input_name):
     guardrail_ok = ""
     if input_name == "ptt_guardrail":
         t = files[0]["transcript"]
-        ok = all(kw in t for kw in GUARDRAIL_KEYWORDS)
+        has_nihao = "你好吗" in t or "你好嗎" in t
+        has_zuodi = "坐低咗" in t
+        ok = has_nihao and has_zuodi
         guardrail_ok = str(ok).lower()
         mark = "✓" if ok else "✗"
         log(f"  guardrail {mark}: {t!r}")

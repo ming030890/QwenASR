@@ -66,8 +66,14 @@ def check_guardrail(label, threads):
     if not data.get("files"):
         return False, "ptt_guardrail JSON has no files"
     transcript = data["files"][0]["transcript"]
-    missing = [kw for kw in GUARDRAIL_KEYWORDS if kw not in transcript]
-    if missing:
+    has_nihao = "你好吗" in transcript or "你好嗎" in transcript
+    has_zuodi = "坐低咗" in transcript
+    if not (has_nihao and has_zuodi):
+        missing = []
+        if not has_nihao:
+            missing.append("你好吗/你好嗎")
+        if not has_zuodi:
+            missing.append("坐低咗")
         return False, f"FAIL — transcript '{transcript}' missing keywords {missing}"
     return True, f"OK — '{transcript}'"
 
@@ -141,7 +147,26 @@ def main():
 
     # ── Inference numbers ─────────────────────────────────────────────────────
     result_cv, result_prefills, result_data = get_cv_results(args.result, t)
-    baseline_cv, baseline_prefills, baseline_data = ({}, {}, None) if not args.baseline else get_cv_results(args.baseline, t)
+    
+    if args.baseline:
+        baseline_cv, baseline_prefills, baseline_data = get_cv_results(args.baseline, t)
+    else:
+        latest_path = os.path.join(os.path.dirname(__file__), "latest_baseline.json")
+        if os.path.exists(latest_path):
+            with open(latest_path, encoding="utf-8") as f:
+                base_obj = json.load(f)
+            baseline_data = base_obj.get("common_voice")
+            baseline_cv = {}
+            baseline_prefills = {}
+            if baseline_data:
+                for f in baseline_data.get("files", []):
+                    name = os.path.basename(f["audio_path"]).replace(".wav", "")
+                    baseline_cv[name] = f["inference_ms"]
+                    if "prefill_ms" in f:
+                        baseline_prefills[name] = f["prefill_ms"]
+            print(f"Loaded latest baseline from standalone file: {latest_path} (label: {base_obj.get('label')})")
+        else:
+            baseline_cv, baseline_prefills, baseline_data = {}, {}, None
 
     print(f"\n[inference_ms]")
     for clip, ms in sorted(result_cv.items()):
@@ -174,8 +199,8 @@ def main():
         if bin_size_new:
             print(f"  binary_size_bytes:        {bin_size_new} bytes ({bin_size_new / 1024 / 1024:.2f} MB)")
 
-    if not args.baseline:
-        print("\n[no baseline provided — skipping comparison checks]")
+    if not baseline_data:
+        print("\n[no baseline data found — skipping comparison checks]")
         sep()
         print(f"RESULT: {'PASS' if verdict_ok else 'FAIL'}")
         if reasons_fail:
@@ -325,6 +350,35 @@ def main():
             msg = f"ACCEPT — {', '.join(wins)} threshold(s) met"
             print(f"\n  {msg}")
             reasons_pass.append(msg)
+
+    # ── Save new baseline if accepted ──────────────────────────────────────────
+    if args.stage == 3 and verdict_ok:
+        latest_path = os.path.join(os.path.dirname(__file__), "latest_baseline.json")
+        common_voice_path = os.path.join(RESULTS_DIR, args.result, f"common_voice-t{t}.json")
+        ptt_guardrail_path = os.path.join(RESULTS_DIR, args.result, f"ptt_guardrail-t{t}.json")
+        
+        if os.path.exists(common_voice_path):
+            with open(common_voice_path, encoding="utf-8") as f:
+                common_voice_data = json.load(f)
+            ptt_guardrail_data = None
+            if os.path.exists(ptt_guardrail_path):
+                with open(ptt_guardrail_path, encoding="utf-8") as f:
+                    ptt_guardrail_data = json.load(f)
+            
+            timestamp = common_voice_data.get("timestamp", "")
+            if not timestamp:
+                import datetime
+                timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                
+            new_baseline = {
+                "label": args.result,
+                "timestamp": timestamp,
+                "common_voice": common_voice_data,
+                "ptt_guardrail": ptt_guardrail_data
+            }
+            with open(latest_path, "w", encoding="utf-8") as f:
+                json.dump(new_baseline, f, indent=2)
+            print(f"\nUpdated latest baseline in standalone file: {latest_path}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print()

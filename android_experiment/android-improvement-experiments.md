@@ -33,36 +33,54 @@ Each completed or evaluated experiment has its own markdown file in the `android
 
 ## Active Backlog (Idea Bank)
 
-This list acts as a plan of upcoming optimizations to be evaluated. Once run, each will be documented in a corresponding `.md` result file.
+This list acts as a prioritized backlog of upcoming optimization experiments. Each item targets one or more core metrics (Latency, First Token Latency, Binary Size, Memory Usage).
+
+### Priority Backlog
 
 1. **NEON BFDOT/BFMMLA BF16 matvec/matmul kernel (K1 / K3)**
-   - **Target**: `encoder_ms`
-   - **Why**: Use native Armv8.6 hardware instructions for BF16 math to bypass F32 software-unpacking.
+   - **Targets**: 1. Latency, 4. Memory usage (`encoder_ms`, `peak_rss_kb`)
+   - **Why**: Use native Armv8.6 hardware instructions (FEAT_BF16) for BF16 math to execute forward passes directly on BF16 weights. This avoids the F32 unpacking step, allowing us to keep the encoder weights in memory-mapped BF16 (M3-style memory savings) without paying the 3.5% latency conversion penalty.
 
-2. **Android SGEMM shape microbench (P3)**
-   - **Target**: BLAS diagnostic
-   - **Why**: Identify exact shapes with poor packing efficiency under OpenBLAS on Tensor G4.
+2. **Encoder INT8 weights + native INT8 GEMM kernel (E1)**
+   - **Targets**: 1. Latency, 4. Memory usage (`encoder_ms`, `model_load_ms`, `memory_after_model_load_kb`)
+   - **Why**: Similar to the K4 decoder prefill optimization, pre-quantize encoder weights to INT8 on the host and run parallelized INT8 matrix-multiplication using native hardware `SDOT` (vdotq_s32) instructions. This reduces the encoder model footprint by 50% and leverages optimized SIMD INT8 execution.
 
-3. **Isolate threaded OpenBLAS runtime settings (P1)**
-   - **Target**: Threading diagnostic
-   - **Why**: Diagnose exact overhead of OpenBLAS dynamic selection under single-thread constraints.
+3. **KleidiAI (Arm) GEMM library integration (K2)**
+   - **Targets**: 1. Latency, 2. First token latency (`encoder_ms`, `prefill_ms`)
+   - **Why**: Integrate Arm's specialized KleidiAI library designed specifically for micro-architectural transformer GEMM optimization on Arm CPUs, serving as a high-performance alternative to OpenBLAS.
 
-4. **KleidiAI (Arm) GEMM library integration (K2)**
-   - **Target**: `encoder_ms` and `prefill_ms`
-   - **Why**: Test Arm's optimized transformer GEMM library as an alternative to OpenBLAS.
+4. **INT8/FP16 KV Cache Quantization (KV1)**
+   - **Targets**: 1. Latency, 4. Memory usage (`peak_rss_kb`, `decode_loop_ms_per_token`)
+   - **Why**: The 2048-token KV cache allocates up to ~470 MB of F32 buffer space across 28 layers. Quantizing KV cache keys and values to FP16 or INT8 (group-wise/channel-wise) reduces maximum cache memory overhead by 50-75% and improves memory bandwidth during the autoregressive decode loop.
 
-5. **Encoder INT8 weights + native INT8 GEMM kernel (E1)**
-   - **Target**: `encoder_ms`
-   - **Why**: Quantize encoder weights to INT8 and execute via hardware `SDOT`.
+5. **Cargo Release Profile Tweaks: Debug Stripping & Panic Abort (CT2)**
+   - **Targets**: 3. Binary size, 1. Latency (`binary_size_bytes`)
+   - **Why**: Currently, the release profile does not strip symbols or abort on panic. Adding `strip = true` and `panic = "abort"` in `Cargo.toml` strips debugging information and removes panic unwinding tables from the dynamic library. This can reduce the dynamic library (.so) binary footprint on Android by 50-80% and generate tighter, faster assembly.
 
 6. **Compile-time LTO and codegen units optimization (CT1)**
-   - **Target**: `binary_size_bytes` & E2E Latency
-   - **Why**: Enable fat link-time optimization (LTO) to force inter-crate inlining.
+   - **Targets**: 1. Latency, 3. Binary size (`binary_size_bytes`)
+   - **Why**: Upgrade release profile from `lto = "thin"` to `lto = "fat"` and set `codegen-units = 1`. This forces inter-crate compiler optimization and inlining across the crate boundaries (`qwen-asr` vs `qwen-asr-cli`), improving code efficiency.
 
-7. **Cache line alignment for weight buffers (CL1)**
-   - **Target**: Latency
-   - **Why**: Align weights to 64/128-byte boundaries to reduce cache misses.
+7. **FP16 Activation/Quantization for Encoder (E2)**
+   - **Targets**: 1. Latency, 4. Memory usage (`encoder_ms`)
+   - **Why**: Keep intermediate activation buffers in FP16 instead of F32. On CPUs with native FP16 (`+fp16`), this cuts memory bandwidth usage in half, reduces cache line pressure, and doubles FLOPS throughput.
 
-8. **Overlapped Mel extraction and encoder forward (OL1)**
-   - **Target**: Latency
-   - **Why**: Move Mel spectrogram computation to a background thread to overlap ingestion and network feed-forward.
+8. **Cache line alignment for weight buffers (CL1)**
+   - **Targets**: 1. Latency (`encoder_ms`, `prefill_ms`)
+   - **Why**: Align memory-mapped weights and internal buffers to 64/128-byte boundaries to prevent split cache line loads and cache bank conflicts on the CPU.
+
+9. **Custom vectorized Softmax kernel (K5)**
+   - **Targets**: 1. Latency (`encoder_ms`, `decode_loop_ms_per_token`)
+   - **Why**: Attention layers perform row-wise softmax. Implementing a custom vectorized Softmax kernel with ARM NEON intrinsics (and math approximations for exp) will speed up attention overhead compared to scalar code.
+
+---
+
+### Punted / Irrelevant Ideas
+
+- **Android SGEMM shape microbench (P3)** (OpenBLAS Diagnostic)
+  - *Reason for punting*: We are moving away from OpenBLAS F32 SGEMM for critical hot paths (prefill uses INT8 SDOT via K4, encoder will use native BF16 or INT8). Spending time profiling OpenBLAS SGEMM shapes is no longer a high-leverage activity.
+- **Isolate threaded OpenBLAS runtime settings (P1)** (Threading Diagnostic)
+  - *Reason for punting*: The thread sweeps in C2/C3 already isolated single-thread execution (`threads=1`) as optimal and rejected multi-threading. With custom kernels, OpenBLAS is being bypassed anyway.
+- **Overlapped Mel extraction and encoder forward (OL1)** (Latency)
+  - *Reason for punting*: P0 phase timing proved that Mel extraction takes < 5 ms (under 1% of total inference time). Overlapping it would yield no noticeable performance gains.
+
