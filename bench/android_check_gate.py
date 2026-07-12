@@ -46,6 +46,8 @@ STAGE2_PROMOTION_THRESHOLD = 0.03
 STAGE3_INFERENCE_THRESHOLD = 0.05
 STAGE3_LOAD_THRESHOLD      = 0.05
 STAGE3_MEMORY_THRESHOLD    = 0.10
+STAGE3_FIRST_TOKEN_THRESHOLD = 0.05
+STAGE3_BINARY_SIZE_THRESHOLD = 0.05
 STAGE3_INFERENCE_REGRESSION_LIMIT = 0.02
 
 
@@ -71,15 +73,18 @@ def check_guardrail(label, threads):
 
 
 def get_cv_results(label, threads):
-    """Returns {clip_name: inference_ms} from common_voice JSON."""
+    """Returns ({clip_name: inference_ms}, {clip_name: prefill_ms}, data) from common_voice JSON."""
     data = load_json(label, f"common_voice-t{threads}.json")
     if not data:
-        return {}, data
+        return {}, {}, data
     clips = {}
+    prefills = {}
     for f in data["files"]:
         name = os.path.basename(f["audio_path"]).replace(".wav", "")
         clips[name] = f["inference_ms"]
-    return clips, data
+        if "prefill_ms" in f:
+            prefills[name] = f["prefill_ms"]
+    return clips, prefills, data
 
 
 def get_peak_rss_kb(data):
@@ -135,8 +140,8 @@ def main():
         reasons_fail.append(f"Guardrail failed: {gmsg}")
 
     # ── Inference numbers ─────────────────────────────────────────────────────
-    result_cv, result_data = get_cv_results(args.result, t)
-    baseline_cv, baseline_data = ({}, None) if not args.baseline else get_cv_results(args.baseline, t)
+    result_cv, result_prefills, result_data = get_cv_results(args.result, t)
+    baseline_cv, baseline_prefills, baseline_data = ({}, {}, None) if not args.baseline else get_cv_results(args.baseline, t)
 
     print(f"\n[inference_ms]")
     for clip, ms in sorted(result_cv.items()):
@@ -147,14 +152,27 @@ def main():
         else:
             print(f"  {clip}: {ms:.1f} ms")
 
+    if result_prefills:
+        print(f"\n[first_token_latency_ms (prefill)]")
+        for clip, ms in sorted(result_prefills.items()):
+            if clip in baseline_prefills:
+                d = pct(ms, baseline_prefills[clip])
+                direction = "faster ✓" if d < 0 else "slower"
+                print(f"  {clip}: {ms:.1f} ms  (baseline {baseline_prefills[clip]:.1f} ms, {fmt_pct(d)} {direction})")
+            else:
+                print(f"  {clip}: {ms:.1f} ms")
+
     if result_data:
         load_new = result_data.get("model_load_ms")
         mem_new  = result_data.get("memory_after_model_load_kb")
         rss_new  = get_peak_rss_kb(result_data)
-        print(f"\n[startup/memory]")
+        bin_size_new = result_data.get("binary_size_bytes")
+        print(f"\n[startup/memory/binary_size]")
         print(f"  model_load_ms:            {load_new:.1f}" if load_new else "  model_load_ms:            n/a")
         print(f"  memory_after_model_load:  {mem_new} KB" if mem_new else "  memory_after_model_load:  n/a")
         print(f"  peak_inference_rss:       {rss_new:.0f} KB" if rss_new else "  peak_inference_rss:       n/a")
+        if bin_size_new:
+            print(f"  binary_size_bytes:        {bin_size_new} bytes ({bin_size_new / 1024 / 1024:.2f} MB)")
 
     if not args.baseline:
         print("\n[no baseline provided — skipping comparison checks]")
@@ -222,6 +240,7 @@ def main():
         load_base = baseline_data.get("model_load_ms") if baseline_data else None
         mem_base  = baseline_data.get("memory_after_model_load_kb") if baseline_data else None
         rss_base  = get_peak_rss_kb(baseline_data) if baseline_data else None
+        bin_size_base = baseline_data.get("binary_size_bytes") if baseline_data else None
 
         common5 = sorted(set(result_cv) & set(baseline_cv))
         inf_ok = False
@@ -235,6 +254,18 @@ def main():
         else:
             print(f"  inference_ms:    insufficient clips ({len(common5)}/5)")
             inf_d = 0.0
+
+        prefill_ok = False
+        common_pre = sorted(set(result_prefills) & set(baseline_prefills))
+        if common_pre:
+            median_pre_new  = statistics.median(result_prefills[c] for c in common_pre)
+            median_pre_base = statistics.median(baseline_prefills[c] for c in common_pre)
+            prefill_d = pct(median_pre_new, median_pre_base)
+            prefill_ok = prefill_d <= -STAGE3_FIRST_TOKEN_THRESHOLD
+            label_pre = "MEETS" if prefill_ok else "does not meet"
+            print(f"  first_token_ms:  {median_pre_new:.1f} vs {median_pre_base:.1f} ({fmt_pct(prefill_d)}) — {label_pre} >={STAGE3_FIRST_TOKEN_THRESHOLD*100:.0f}% threshold")
+        else:
+            print(f"  first_token_ms:  missing/insufficient data")
 
         load_ok = False
         if load_new and load_base:
@@ -260,8 +291,16 @@ def main():
         else:
             print(f"  peak_rss_kb:     missing data")
 
-        any_meets = inf_ok or load_ok or mem_ok or rss_ok
-        # Check if a memory/load win comes with an inference regression
+        bin_ok = False
+        if bin_size_new and bin_size_base:
+            bin_d = pct(bin_size_new, bin_size_base)
+            bin_ok = bin_d <= -STAGE3_BINARY_SIZE_THRESHOLD
+            print(f"  binary_size:     {bin_size_new} vs {bin_size_base} ({fmt_pct(bin_d)}) — {'MEETS' if bin_ok else 'does not meet'} >={STAGE3_BINARY_SIZE_THRESHOLD*100:.0f}% threshold")
+        else:
+            print(f"  binary_size:     missing data")
+
+        any_meets = inf_ok or prefill_ok or load_ok or mem_ok or rss_ok or bin_ok
+        # Check if a memory/load/binary size win comes with an inference regression
         inf_regressed = inf_d > STAGE3_INFERENCE_REGRESSION_LIMIT if common5 else False
 
         if not any_meets:
@@ -270,12 +309,19 @@ def main():
             verdict_ok = False
             reasons_fail.append(msg)
         elif inf_regressed and not inf_ok:
-            msg = f"memory/load win but inference regressed {fmt_pct(inf_d)} (limit +{STAGE3_INFERENCE_REGRESSION_LIMIT*100:.0f}%)"
+            msg = f"win on secondary metric but inference latency regressed {fmt_pct(inf_d)} (limit +{STAGE3_INFERENCE_REGRESSION_LIMIT*100:.0f}%)"
             print(f"\n  REJECT — {msg}")
             verdict_ok = False
             reasons_fail.append(msg)
         else:
-            wins = [m for ok, m in [(inf_ok, "inference"), (load_ok, "model_load"), (mem_ok, "memory"), (rss_ok, "peak_rss")] if ok]
+            wins = [m for ok, m in [
+                (inf_ok, "inference"),
+                (prefill_ok, "first_token_prefill"),
+                (load_ok, "model_load"),
+                (mem_ok, "memory"),
+                (rss_ok, "peak_rss"),
+                (bin_ok, "binary_size")
+            ] if ok]
             msg = f"ACCEPT — {', '.join(wins)} threshold(s) met"
             print(f"\n  {msg}")
             reasons_pass.append(msg)

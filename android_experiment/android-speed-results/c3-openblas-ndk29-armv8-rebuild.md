@@ -12,10 +12,10 @@ git clone /private/tmp/OpenBLAS /private/tmp/OpenBLAS-ndk29-armv8
 make TARGET=ARMV8 \
   OSNAME=Android \
   BINARY=64 \
-  CC=/Users/tony/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android35-clang \
+  CC=~/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android35-clang \
   HOSTCC=clang \
-  AR=/Users/tony/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar \
-  RANLIB=/Users/tony/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ranlib \
+  AR=~/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar \
+  RANLIB=~/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ranlib \
   NOFORTRAN=1 \
   ONLY_CBLAS=1 \
   USE_THREAD=0 \
@@ -87,9 +87,9 @@ make -j10 \
   TARGET=ARMV8 \
   DYNAMIC_ARCH=1 \
   BINARY=64 \
-  CC=/Users/tony/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android33-clang \
-  AR=/Users/tony/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar \
-  RANLIB=/Users/tony/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ranlib \
+  CC=~/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android33-clang \
+  AR=~/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar \
+  RANLIB=~/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ranlib \
   HOSTCC=clang \
   NOFORTRAN=1 \
   ONLY_CBLAS=1 \

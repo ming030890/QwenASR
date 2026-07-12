@@ -201,17 +201,17 @@ def main():
     p.add_argument("--runs",       type=int, default=3)
     p.add_argument("--threads",    default="1", help='space-separated thread counts, e.g. "1 2 4"')
     p.add_argument("--remote-dir", default="/data/local/tmp/qwen-asr-bench")
-    p.add_argument("--adb",        default=env("ADB", "/Users/tony/Library/Android/sdk/platform-tools/adb"))
+    p.add_argument("--adb",        default=env("ADB", os.path.expanduser("~/Library/Android/sdk/platform-tools/adb")))
     p.add_argument("--profile",     action="store_true", help="Enable kernel profiling counters")
     p.add_argument("--save-binary", metavar="PATH",
                    help="Copy the compiled binary to PATH after build (e.g. bench/android-baselines/my-baseline)")
     args = p.parse_args()
 
     ndk_home     = env("NDK_HOME", env("ANDROID_NDK_HOME", env("ANDROID_NDK_ROOT",
-                       "/Users/tony/Library/Android/sdk/ndk/29.0.14206865")))
+                       os.path.expanduser("~/Library/Android/sdk/ndk/29.0.14206865"))))
     ndk_bin      = env("NDK_BIN", str(Path(ndk_home) / "toolchains/llvm/prebuilt/darwin-x86_64/bin"))
     rust_bin     = env("RUST_TOOLCHAIN_BIN",
-                       "/Users/tony/.rustup/toolchains/stable-aarch64-apple-darwin/bin")
+                       os.path.expanduser("~/.rustup/toolchains/stable-aarch64-apple-darwin/bin"))
     rustflags    = env("RUSTFLAGS_EXTRA", "-C target-feature=+dotprod")
     cargo_feats  = env("CARGO_FEATURES_EXTRA", "android-blas")
     bench_lang   = env("BENCH_LANGUAGE", "Auto")
@@ -344,7 +344,13 @@ def main():
                 capture_output=True,
                 text=True,
             )
-            json_path.write_text(result.stdout, encoding="utf-8")
+            try:
+                payload = json.loads(result.stdout)
+                if bin_path.exists():
+                    payload["binary_size_bytes"] = bin_path.stat().st_size
+                json_path.write_text(json.dumps(payload), encoding="utf-8")
+            except Exception as e:
+                json_path.write_text(result.stdout, encoding="utf-8")
             append_tsv(results_tsv, json_path, timestamp, args.label, threads, input_name)
 
     log(f"\nJSON results : {out_dir}")

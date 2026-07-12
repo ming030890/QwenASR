@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import shutil
 import subprocess
 import tarfile
@@ -16,7 +17,7 @@ from pathlib import Path
 DATASET = "ming030890/common_voice_21_0_yue"
 API = "https://datasets-server.huggingface.co"
 TRANSCRIPT_BASE = "https://huggingface.co/datasets/ming030890/common_voice_21_0/resolve/main/transcript/yue"
-PTT_SOURCE = Path("/Users/tony/Downloads/PTT-20241208-WA0011.opus")
+PTT_SOURCE = Path(os.environ.get("PTT_SOURCE", os.path.expanduser("~/Downloads/PTT-20241208-WA0011.opus")))
 
 
 def get_json(url: str) -> dict:

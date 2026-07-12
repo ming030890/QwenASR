@@ -30,10 +30,10 @@ Run conditions:
 Commands:
 
 ```bash
-/Users/tony/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 \
+python3 \
   bench/prepare_int8_model.py \
-  --model-dir /Volumes/SSD/qwen3-asr-0.6b \
-  --output-dir /Volumes/SSD/qwen-asr-m4-lmhead-int8
+  --model-dir ./model \
+  --output-dir ./qwen-asr-m4-lmhead-int8
 
 THERMAL_TIMEOUT=0 \
 bench/android_run.py \

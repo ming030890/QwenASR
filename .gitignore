@@ -51,3 +51,7 @@
 
 # Local terminal/session logs
 /screenlog.*
+
+# Temporary fast-gate and candidate-gate assets
+/bench/android-fast-assets/
+/bench/android-candidate-assets/

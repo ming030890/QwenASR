@@ -162,7 +162,7 @@ def append_tsv(tsv_path, json_path, timestamp, label, threads, input_name):
 def run_binary_on_device(
     adb, remote_dir, remote_bin, remote_model, remote_assets, remote_cv,
     label, threads_list, runs, bench_lang, bench_prompt, remote_env,
-    out_dir, tsv_path, timestamp,
+    out_dir, tsv_path, timestamp, local_bin_path=None
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     for threads in threads_list:
@@ -189,7 +189,13 @@ def run_binary_on_device(
                            check=False, capture_output=True)
             result = subprocess.run([adb, "shell", remote_cmd],
                                     capture_output=True, text=True, check=True)
-            json_path.write_text(result.stdout, encoding="utf-8")
+            try:
+                payload = json.loads(result.stdout)
+                if local_bin_path and os.path.exists(local_bin_path):
+                    payload["binary_size_bytes"] = os.path.getsize(local_bin_path)
+                json_path.write_text(json.dumps(payload), encoding="utf-8")
+            except Exception as e:
+                json_path.write_text(result.stdout, encoding="utf-8")
             append_tsv(tsv_path, json_path, timestamp, label, threads, input_name)
 
 
@@ -211,7 +217,7 @@ def main():
     p.add_argument("--model-dir",  default=env("MODEL_DIR", "/Volumes/SSD/qwen3-asr-0.6b"))
     p.add_argument("--assets-dir", default=str(PROJECT_DIR / "bench" / "android-assets"))
     p.add_argument("--remote-dir", default="/data/local/tmp/qwen-asr-bench")
-    p.add_argument("--adb",        default=env("ADB", "/Users/tony/Library/Android/sdk/platform-tools/adb"))
+    p.add_argument("--adb",        default=env("ADB", os.path.expanduser("~/Library/Android/sdk/platform-tools/adb")))
     args = p.parse_args()
 
     baseline_binary = Path(args.baseline_binary)
@@ -220,10 +226,10 @@ def main():
                  f"Save one with: bench/android_run.py --save-binary bench/android-baselines/NAME [...]")
 
     ndk_home    = env("NDK_HOME", env("ANDROID_NDK_HOME", env("ANDROID_NDK_ROOT",
-                      "/Users/tony/Library/Android/sdk/ndk/29.0.14206865")))
+                      os.path.expanduser("~/Library/Android/sdk/ndk/29.0.14206865"))))
     ndk_bin     = env("NDK_BIN", str(Path(ndk_home) / "toolchains/llvm/prebuilt/darwin-x86_64/bin"))
     rust_bin    = env("RUST_TOOLCHAIN_BIN",
-                      "/Users/tony/.rustup/toolchains/stable-aarch64-apple-darwin/bin")
+                      os.path.expanduser("~/.rustup/toolchains/stable-aarch64-apple-darwin/bin"))
     rustflags   = env("RUSTFLAGS_EXTRA", "-C target-feature=+dotprod")
     cargo_feats = env("CARGO_FEATURES_EXTRA", "android-blas")
     bench_lang  = env("BENCH_LANGUAGE", "Auto")
@@ -297,7 +303,7 @@ def main():
     run_binary_on_device(
         args.adb, remote_dir, remote_bin, remote_model, remote_assets, remote_cv,
         ctrl_label, threads_list, args.runs, bench_lang, bench_prompt, remote_env,
-        results_dir / ctrl_label, tsv_path, timestamp,
+        results_dir / ctrl_label, tsv_path, timestamp, local_bin_path=baseline_binary,
     )
 
     # ── 2. Build candidate ────────────────────────────────────────────────────
@@ -337,7 +343,7 @@ def main():
     run_binary_on_device(
         args.adb, remote_dir, remote_bin, remote_model, remote_assets, remote_cv,
         cand_label, threads_list, args.runs, bench_lang, bench_prompt, remote_env,
-        results_dir / cand_label, tsv_path, timestamp,
+        results_dir / cand_label, tsv_path, timestamp, local_bin_path=candidate_bin,
     )
 
     # ── 4. Gate check ─────────────────────────────────────────────────────────

@@ -16,8 +16,8 @@ Fast gate command:
 
 ```bash
 THERMAL_TIMEOUT=0 \
-MODEL_DIR=/Volumes/SSD/qwen-asr-int8dec \
-PATH=/Users/tony/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH \
+MODEL_DIR=./model \
+PATH=$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH \
 bench/android_run.py \
   --label android-fast-m2-lazy-kv-cache-20260525-1525 \
   --assets-dir /Volumes/SSD/qwen-asr-android-fast-assets \
@@ -41,8 +41,8 @@ Acceptance command:
 
 ```bash
 THERMAL_TIMEOUT=0 \
-MODEL_DIR=/Volumes/SSD/qwen-asr-int8dec \
-PATH=/Users/tony/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH \
+MODEL_DIR=./model \
+PATH=$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH \
 bench/android_run.py \
   --label android-accept-m2-lazy-kv-cache-20260525-1530 \
   --assets-dir bench/android-assets \

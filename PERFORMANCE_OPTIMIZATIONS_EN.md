@@ -2,6 +2,12 @@
 
 This document catalogs the performance optimizations implemented in the pure-Rust QwenASR CPU inference engine, achieving 41+ RTF on Apple M5.
 
+## Production Inference Model
+The current production release runs using the **`qwen-asr-m4-lmhead-int8-v16-manual-code-switching-cp4000`** model configuration. This integrates:
+- Host-side pre-quantized tied `lm_head` (M4 format) for zero-copy startup loading.
+- On-device zero-copy memory-mapped INT8 weight loading.
+- Manual language code-switching thresholds.
+
 ## 1. Memory Traffic & Allocation Reduction
 
 - **INT8 Quantization for Decoder**: Decoder weights (`QKV`, `O`-projection, `FFN` gate/up/down, `lm_head`) are quantized to INT8 with per-row scales at load time. This cuts memory traffic by ~4x compared to FP32 and avoids BF16-to-F32 conversion overhead. Implemented via NEON INT8 matvec/argmax kernels.

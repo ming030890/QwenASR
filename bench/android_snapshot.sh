@@ -16,7 +16,7 @@ EOF
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-ADB="${ADB:-/Users/tony/Library/Android/sdk/platform-tools/adb}"
+ADB="${ADB:-$HOME/Library/Android/sdk/platform-tools/adb}"
 LABEL=""
 PHASE=""
 

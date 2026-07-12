@@ -2,16 +2,28 @@
 
 [![OctoCounts](https://api.octocounts.com/badge/huanglizhuo/QwenASR/branch/main)](https://octocounts.com/?q=https%3A%2F%2Fgithub.com%2Fhuanglizhuo%2FQwenASR&ref=main)
 
-A **blazing fast**, pure Rust, CPU-only inference engine for [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) speech-to-text. It features zero heavy runtime dependencies (only `libc`) and is ported from [antirez/qwen-asr](https://github.com/antirez/qwen-asr).
+A **blazing fast**, pure Rust, CPU-only inference engine for [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) speech-to-text. It features zero heavy runtime dependencies (only `libc`).
+
+This repository is a highly-optimized fork of [antirez/qwen-asr](https://github.com/antirez/qwen-asr) with significant enhancements for performance, memory efficiency, and mobile (Android) compatibility.
+
+### Major Changes Since Fork
+
+* **Zero-Copy Memory-Mapped Loading (`mmap`):** Implemented zero-copy memory-mapped loading for INT8 weights (`M4`/`Q2B`) to drastically reduce startup latency and initialization memory overhead.
+* **Host-Side Pre-Quantized Tied `lm_head`:** Added host-side pre-quantization of the tied `lm_head` vocabulary projection into INT8 format, avoiding on-device quantization overhead at startup.
+* **Dynamic Prefill Activation Quantization (`K4`):** Developed a custom dynamic quantization prefill kernel utilizing NEON `SDOT` (`vdotq_s32`) on `aarch64`, significantly accelerating prompt ingestion.
+* **Transient Prefill Dequantization (`M1`):** Optimized memory bandwidth by transiently dequantizing INT8 weights into a shared thread-local F32 scratch buffer during compute.
+* **Static OpenBLAS on Android:** Ported and optimized the engine for Android `arm64-v8a` environments, linking with a customized CBLAS-only static OpenBLAS target configuration.
+* **Same-Session Mobile Benchmark & Gate Checks:** Created an automated on-device testing and gate-check harness (`bench/android_run.py`, `bench/android_compare.py`, `bench/android_check_gate.py`) that monitors device thermals, enforces phonetic guardrails, and compares baseline vs. candidate builds on E2E latency, first-token latency, RSS/peak memory, and binary footprint.
 
 Supports 0.6B and 1.7B models with multiple modes: offline, segmented, streaming, live capture, VAD live, and forced alignment.
 
 **🚀 Extreme Performance:** On Apple Silicon (M5), the highly optimized CPU implementation transcribes a 28.2s audio sample in just **676ms** (**41.69x realtime**), outperforming both the upstream pure C implementation and measured MLX GPU baselines.
 
 
+
 ## Auto Research
 
-Performance optimizations were discovered autonomously using the [autoresearch](https://github.com/karpathy/autoresearch) pattern: an AI agent loops over hypothesize-implement-benchmark-keep/revert cycles on the inference code. The experiment protocol is defined in [`program.md`](program.md).
+Performance optimizations were discovered autonomously using the [autoresearch](https://github.com/karpathy/autoresearch) pattern: an AI agent loops over hypothesize-implement-benchmark-keep/revert cycles on the inference code. The experiment protocol is defined in [`android_experiment/android-autoresearch-program.md`](android_experiment/android-autoresearch-program.md).
 
 ## Benchmark
 

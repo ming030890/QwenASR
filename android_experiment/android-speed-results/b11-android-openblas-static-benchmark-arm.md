@@ -14,7 +14,7 @@ Build/setup notes:
 - Built OpenBLAS from `/private/tmp/OpenBLAS` for Android arm64 using the
   OpenBLAS Android wiki guidance. The NDK 30 wrapper in this environment drops
   arguments through its `clang` shim, so the working target compiler was:
-  `CC='/Users/tony/Library/Android/sdk/ndk/30.0.14904198/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang-21 --target=aarch64-linux-android35'`
+  `CC='~/Library/Android/sdk/ndk/30.0.14904198/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang-21 --target=aarch64-linux-android35'`
   with `HOSTCC=/usr/bin/clang`, `TARGET=ARMV8`, `ONLY_CBLAS=1`,
   `NOFORTRAN=1`, `USE_THREAD=0`, and `NUM_THREADS=1`.
 - Follow-up wrapper check: NDK `28.2.13676358` and `30.0.14904198` have a text

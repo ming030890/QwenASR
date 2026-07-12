@@ -33,7 +33,7 @@ Run notes:
 Commands:
 
 ```bash
-export ADB=/Users/tony/Library/Android/sdk/platform-tools/adb
+export ADB=$HOME/Library/Android/sdk/platform-tools/adb
 export PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
 
 # Wait until this is clean before each arm.

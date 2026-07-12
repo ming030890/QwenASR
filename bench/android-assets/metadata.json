@@ -2,7 +2,7 @@
   "ptt_guardrail": {
     "name": "ptt_guardrail.wav",
     "reference": "Hello,你好吗？已经坐低咗啦。",
-    "source": "/Users/tony/Downloads/PTT-20241208-WA0011.opus"
+    "source": "~/Downloads/PTT-20241208-WA0011.opus"
   },
   "common_voice": [
     {
