@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.0] - 2026-07-12
+
+### Performance & Quantization
+- **Memory-Mapped Weight Loading (mmap):** Added support for zero-copy memory-mapped loading of pre-quantized INT8 weight files (`M4` format / `Q2B` optimization) to avoid memory allocations and drastically speed up model load times (31% faster load, 25% lower memory footprint).
+- **Host-Side Pre-Quantized Tied `lm_head`:** Moved the tied vocabulary classification projection (`lm_head`) quantization to the host, storing it pre-quantized in Safetensors, completely avoiding on-device startup quantization overhead.
+- **Dynamic Prefill Activation Quantization (`K4`):** Implemented a high-performance dynamic quantization prefill kernel on `aarch64` that quantizes activations on-the-fly and utilizes NEON `SDOT` (`vdotq_s32`) instruction sets, lowering RSS memory usage by 33% and improving prefill execution times.
+- **Transient Prefill Dequantization (`M1`):** Optimizes memory bandwidth on mobile devices by keeping projection weights in INT8 and dequantizing them transiently into a shared thread-local F32 scratch buffer during compute.
+- **Static OpenBLAS on Android:** Standardized compilation and static linking configurations for single-threaded CBLAS static OpenBLAS libraries on Android `arm64-v8a` target builds.
+
+### Mobile & Testing Infrastructure
+- **Same-Session Mobile Benchmark Comparison:** Developed a back-to-back testing and comparison harness (`bench/android_run.py` and `bench/android_compare.py`) to run baseline and candidate builds in immediate succession, eliminating thermal and CPU throttling noise on Android devices.
+- **Phonetic & Semantic Guardrails:** Integrated transcript correctness tests with keyword checks (`你好吗`, `坐低咗`) into the mobile benchmark verification loop to prevent regressions on Cantonese live caption flows.
+- **Multi-Stage Mobile Gate Checks:** Built `bench/android_check_gate.py` to evaluate candidates against a control baseline across all performance dimensions: end-to-end latency, first-token latency, memory usage (RSS/peak), and target binary size.
+
+### Project & Documentation Cleanups
+- **Sanitized Paths:** Removed all hardcoded personal paths (e.g. `/Users/tony` and `/Volumes/SSD/`) from scripts, result tables, and configurations to make execution user-agnostic.
+- **Refined Autoresearch Ledger:** Merged mobile experiment instructions and history tables into unified `android-autoresearch-program.md` and `android-improvement-experiments.md` references.
+- **Pruned Redundancies:** Cleaned up unused Flutter directories, old experimental notes, and duplicate document files to reduce repository weight.
+
+---
+
 ## [0.2.3] - 2026-02-23
 
 ### Features
@@ -19,6 +40,8 @@
 - Debug messages (`[stream degen]`, `[stream reanchor]`) now only appear in `--debug` mode
 - Project restructured into workspace: `crates/qwen-asr` (library), `crates/qwen-asr-cli` (CLI binary)
 - Removed WIP banner from all README files
+
+---
 
 ## [0.2.0] - 2026-02-15
 
@@ -47,6 +70,8 @@
 - Thread pool workers recover from poisoned mutex instead of panicking
 - Regression tests serialized via `Mutex` to prevent thread pool race conditions
 - README updated with per-platform build instructions (macOS, Linux, iOS, Android)
+
+---
 
 ## [0.1.0] - 2026-02-15
 

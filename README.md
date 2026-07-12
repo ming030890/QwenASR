@@ -27,56 +27,9 @@ Performance optimizations were discovered autonomously using the [autoresearch](
 
 ## Benchmark
 
-Offline ASR benchmark on macOS (Apple M5, 10 standalone rounds, 28.2s audio using `bench/samples/audio.wav`). Implementations are benchmarked sequentially, not in parallel. The primary metric is median inference time, so model loading and process startup do not dominate comparisons.
+> [!NOTE]
+> **TODO:** Provide the latest macOS (Apple Silicon M-series) and Android (Pixel 9 / Tensor G4) CPU benchmarks.
 
-> **Note:** This is an ad-hoc, offline performance reference limited specifically to the Apple M5 architecture and a single audio sample. It is designed to quickly validate optimization efforts, rather than serving as a comprehensive industry-standard benchmark (such as LibriSpeech).
-
-| Implementation | Commit | Median inference ms | Mean ms | Best ms | RTF |
-|---|---:|---:|---:|---:|---:|
-| qwen-asr (first) | [`bf52daf`](https://github.com/huanglizhuo/QwenASR/commit/bf52daf) | 1,842 | 1,853 | 1,820 | 15.31x |
-| qwen-asr (latest) | [`0f5f065`](https://github.com/huanglizhuo/QwenASR/commit/0f5f065) | 676 | 678 | 668 | 41.69x |
-| pure C upstream | [`b00b789`](https://github.com/antirez/qwen-asr/commit/b00b789) | 1,885 | 1,885 | 1,861 | 14.94x |
-| [second-state/qwen3_asr_rs](https://github.com/second-state/qwen3_asr_rs) with MLX backend | [`3fa6734`](https://github.com/second-state/qwen3_asr_rs/commit/3fa6734) | 2,785 | 2,808 | 2,745 | 10.11x |
-| [mlx-audio](https://github.com/Blaizzy/mlx-audio) Python MLX | [`v0.4.3`](https://github.com/Blaizzy/mlx-audio/tree/v0.4.3) | 801 | 820 | 788 | 35.16x |
-
-qwen-asr and pure C use internal inference timers. MLX-based implementations are timed after model load with explicit GPU synchronization. Wall-clock time is still recorded for diagnostics and end-to-end command cost.
-
-<details>
-<summary>Wall-clock timing</summary>
-
-| Implementation | Commit | Median wall-clock ms | Mean ms | Best ms | Wall-clock RTF |
-|---|---:|---:|---:|---:|---:|
-| qwen-asr (first) | [`bf52daf`](https://github.com/huanglizhuo/QwenASR/commit/bf52daf) | 2,171 | 2,205 | 2,150 | 12.99x |
-| qwen-asr (latest) | [`0f5f065`](https://github.com/huanglizhuo/QwenASR/commit/0f5f065) | 1,263 | 1,289 | 1,252 | 22.34x |
-| pure C upstream | [`b00b789`](https://github.com/antirez/qwen-asr/commit/b00b789) | 2,154 | 2,148 | 2,125 | 13.08x |
-| [second-state/qwen3_asr_rs](https://github.com/second-state/qwen3_asr_rs) MLX GPU | [`3fa6734`](https://github.com/second-state/qwen3_asr_rs/commit/3fa6734) | 2,982 | 3,049 | 2,940 | 9.44x |
-| [mlx-audio](https://github.com/Blaizzy/mlx-audio) Python MLX | [`v0.4.3`](https://github.com/Blaizzy/mlx-audio/tree/v0.4.3) | 1,855 | 1,918 | 1,806 | 15.18x |
-
-</details>
-
-![Latency](bench/charts/benchmark-unified-latency.png)
-
-![Realtime factor](bench/charts/benchmark-unified-rtf.png)
-
-- 🏆 **Fastest overall**: `qwen-asr` latest (`0f5f065`)
-- 🚀 **2.72x faster** than the initial Rust port (`bf52daf`)
-- 🔥 **2.79x faster** than the upstream pure C implementation (`b00b789`)
-- 💥 **4.12x faster** than [second-state/qwen3_asr_rs](https://github.com/second-state/qwen3_asr_rs) MLX GPU
-- ⚡️ **1.18x faster** than [mlx-audio](https://github.com/Blaizzy/mlx-audio) Python MLX (8-bit)
-
-Reproduce all results:
-
-```bash
-# qwen-asr first + latest + pure C + second-state/qwen3_asr_rs + mlx-audio
-./bench/benchmark-all.sh --runs 10
-```
-
-### ⚡️ Why does pure CPU Rust beat GPU baselines?
-
-1. **Hand-optimized NEON kernels** — Custom `vDSP`/`Accelerate`, hand-written `neon_dotprod` matmul, and fused fast-attention specifically tuned for the 0.6B model and Apple Silicon cache hierarchy.
-2. **Zero framework overhead** — No tensor dispatch, memory pools, or FFI bridging. 100% Rust end-to-end.
-3. **Model too small for GPU** — A 0.6B model can't saturate the Metal GPU. Kernel launch overhead and CPU↔GPU copies dominate. Both MLX backends are ~2–4× slower than the CPU path.
-4. **mlx-audio 8-bit overhead** — Quantization saves memory but dequantization during compute adds extra work.
 
 ## Quick Start
 
