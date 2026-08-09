@@ -6,9 +6,12 @@ Reads the BF16 model.safetensors, replaces all decoder layer projection weights
 pre-quantized tied lm_head tensor, and writes the result to
 OUTPUT_DIR/model.safetensors.
 
-All non-decoder tensors (encoder weights, embeddings, norms, etc.) are copied
-unchanged as BF16.  Vocabulary files (vocab.json, merges.txt) are symlinked or
-copied as-is.
+All non-decoder tensors (encoder weights, norms, etc.) are copied unchanged as
+BF16.  For the tied Qwen checkpoint used by the Android app, the redundant BF16
+token embedding is dropped by default: the runtime uses the quantized tied
+lm_head for both input embeddings and output logits.  Use --keep-embed-tokens
+only for a research export that explicitly needs the redundant tensor.
+Vocabulary files (vocab.json, merges.txt) are copied as-is.
 
 The resulting model file is ~380 MB smaller than the original, eliminating
 on-device BF16→INT8 quantization at model-load time.
@@ -197,8 +200,20 @@ def main():
                     help="Source model directory (contains model.safetensors)")
     ap.add_argument("--output-dir", default="/Volumes/SSD/qwen-asr-int8dec",
                     help="Output directory for INT8 model")
-    ap.add_argument("--drop-embed-tokens", action="store_true",
-                    help="Drop BF16 thinker.model.embed_tokens.weight and use INT8 lm_head for token embeddings")
+    embed_group = ap.add_mutually_exclusive_group()
+    embed_group.add_argument(
+        "--drop-embed-tokens",
+        dest="drop_embed_tokens",
+        action="store_true",
+        help="(Default) drop tied BF16 token embeddings and use INT8 lm_head for token embeddings",
+    )
+    embed_group.add_argument(
+        "--keep-embed-tokens",
+        dest="drop_embed_tokens",
+        action="store_false",
+        help="research-only: retain the redundant tied BF16 token embeddings",
+    )
+    ap.set_defaults(drop_embed_tokens=True)
     args = ap.parse_args()
 
     src = Path(args.model_dir)
@@ -304,6 +319,17 @@ def main():
     print(f"\nQuantized {quantized_count} tensors.", flush=True)
     print(f"Writing {model_dst} …", flush=True)
     write_safetensors(model_dst, out_tensors)
+
+    output_names = {entry[0] for entry in out_tensors}
+    if quantize_tied_lm_head and args.drop_embed_tokens:
+        if EMBED_TOKENS in output_names:
+            raise RuntimeError(
+                "mobile INT8 invariant failed: tied BF16 token embeddings were retained"
+            )
+        if LM_HEAD not in output_names or LM_HEAD_SCALE not in output_names:
+            raise RuntimeError(
+                "mobile INT8 invariant failed: quantized tied lm_head is incomplete"
+            )
 
     # Copy vocabulary files
     for fname in ("vocab.json", "merges.txt"):
