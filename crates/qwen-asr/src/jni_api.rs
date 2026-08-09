@@ -9,6 +9,8 @@ use silero_vad_rust::RawDetector;
 ///
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -37,6 +39,13 @@ fn silero_stream_end_sample(temp_end_sample: u64) -> u64 {
 struct AsrTask {
     segment_id: u64,
     samples: Vec<i16>,
+    start_sample: u64,
+    end_sample: u64,
+    end_reason: &'static str,
+    vad_score_min: f32,
+    vad_score_max: f32,
+    vad_score_mean: f32,
+    vad_frame_count: u64,
 }
 
 struct VadAsrSession {
@@ -46,6 +55,7 @@ struct VadAsrSession {
     queued_samples: Arc<AtomicU64>,
     closed: AtomicBool,
     worker: Mutex<Option<JoinHandle<()>>>,
+    save_audio_dir: Option<String>,
 }
 
 struct VadState {
@@ -62,6 +72,10 @@ struct VadState {
     samples_vad_processed: u64,
     samples_enqueued_for_asr: u64,
     queue_overflow: u64,
+    active_score_min: f32,
+    active_score_max: f32,
+    active_score_sum: f64,
+    active_score_count: u64,
 }
 
 impl VadState {
@@ -80,6 +94,10 @@ impl VadState {
             samples_vad_processed: 0,
             samples_enqueued_for_asr: 0,
             queue_overflow: 0,
+            active_score_min: 1.0,
+            active_score_max: 0.0,
+            active_score_sum: 0.0,
+            active_score_count: 0,
         }
     }
 
@@ -119,7 +137,7 @@ impl VadState {
             self.process_frame(frame, task_tx, queued_samples, false);
         }
         if !self.active_segment.is_empty() {
-            self.enqueue_segment(task_tx, queued_samples);
+            self.enqueue_segment(task_tx, queued_samples, "session_finalized");
             return 1;
         }
         0
@@ -143,12 +161,13 @@ impl VadState {
         }
 
         if score >= VAD_THRESHOLD && !self.triggered {
-            self.start_speech(&frame, frame_start_sample);
+            self.start_speech(&frame, frame_start_sample, score);
             return false;
         }
 
         if self.triggered {
             self.active_segment.extend_from_slice(&frame);
+            self.record_active_score(score);
         } else {
             self.remember_for_speech_pad(&frame);
             return false;
@@ -156,7 +175,15 @@ impl VadState {
 
         let reached_max = self.active_segment.len() >= MAX_SEGMENT_SAMPLES;
         if reached_max || is_final {
-            self.enqueue_segment(task_tx, queued_samples);
+            self.enqueue_segment(
+                task_tx,
+                queued_samples,
+                if reached_max {
+                    "max_duration"
+                } else {
+                    "session_finalized"
+                },
+            );
             self.remember_for_speech_pad(&frame);
             return true;
         }
@@ -166,7 +193,7 @@ impl VadState {
             if self.current_sample.saturating_sub(temp_end_sample) >= MIN_SILENCE_SAMPLES as u64 {
                 let speech_end_sample = silero_stream_end_sample(temp_end_sample);
                 self.truncate_active_segment_at(speech_end_sample);
-                self.enqueue_segment(task_tx, queued_samples);
+                self.enqueue_segment(task_tx, queued_samples, "silence");
                 self.remember_for_speech_pad(&frame);
                 return true;
             }
@@ -184,7 +211,12 @@ impl VadState {
         }
     }
 
-    fn start_speech(&mut self, frame: &[i16; VAD_FRAME_SAMPLES], frame_start_sample: u64) {
+    fn start_speech(
+        &mut self,
+        frame: &[i16; VAD_FRAME_SAMPLES],
+        frame_start_sample: u64,
+        score: f32,
+    ) {
         let start_sample = silero_stream_start_sample(self.current_sample);
         let history_samples_to_copy = frame_start_sample.saturating_sub(start_sample) as usize;
         let history_skip = self
@@ -199,6 +231,18 @@ impl VadState {
         self.active_segment
             .extend(self.speech_pad_history.iter().skip(history_skip).copied());
         self.active_segment.extend_from_slice(frame);
+        self.active_score_min = score_sentinel();
+        self.active_score_max = 0.0;
+        self.active_score_sum = 0.0;
+        self.active_score_count = 0;
+        self.record_active_score(score);
+    }
+
+    fn record_active_score(&mut self, score: f32) {
+        self.active_score_min = self.active_score_min.min(score);
+        self.active_score_max = self.active_score_max.max(score);
+        self.active_score_sum += score as f64;
+        self.active_score_count += 1;
     }
 
     fn truncate_active_segment_at(&mut self, end_sample: u64) {
@@ -212,6 +256,7 @@ impl VadState {
         &mut self,
         task_tx: &mpsc::Sender<Option<AsrTask>>,
         queued_samples: &AtomicU64,
+        end_reason: &'static str,
     ) {
         if self.active_segment.is_empty() {
             return;
@@ -230,6 +275,21 @@ impl VadState {
             let _ = task_tx.send(Some(AsrTask {
                 segment_id: self.segment_id,
                 samples: segment,
+                start_sample: self.speech_start_sample,
+                end_sample: self.speech_start_sample + n,
+                end_reason,
+                vad_score_min: if self.active_score_count == 0 {
+                    0.0
+                } else {
+                    self.active_score_min
+                },
+                vad_score_max: self.active_score_max,
+                vad_score_mean: if self.active_score_count == 0 {
+                    0.0
+                } else {
+                    (self.active_score_sum / self.active_score_count as f64) as f32
+                },
+                vad_frame_count: self.active_score_count,
             }));
         }
 
@@ -241,7 +301,15 @@ impl VadState {
         self.temp_end_sample = None;
         self.speech_start_sample = 0;
         self.active_segment.clear();
+        self.active_score_min = score_sentinel();
+        self.active_score_max = 0.0;
+        self.active_score_sum = 0.0;
+        self.active_score_count = 0;
     }
+}
+
+fn score_sentinel() -> f32 {
+    1.0
 }
 
 fn write_wav_file(path: &str, samples: &[i16], sample_rate: u32) -> std::io::Result<()> {
@@ -280,6 +348,75 @@ fn write_wav_file(path: &str, samples: &[i16], sample_rate: u32) -> std::io::Res
     Ok(())
 }
 
+fn json_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => escaped.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped.push('"');
+    escaped
+}
+
+fn append_vad_segment_metadata(
+    directory: &str,
+    task: &AsrTask,
+    audio_file: &str,
+    transcript: Option<&str>,
+) -> std::io::Result<()> {
+    let path = format!("{}/vad_segments.jsonl", directory);
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let transcript_json = transcript
+        .map(json_string)
+        .unwrap_or_else(|| "null".to_string());
+    writeln!(
+        file,
+        "{{\"segment_id\":{},\"start_sample\":{},\"end_sample\":{},\"start_ms\":{},\"end_ms\":{},\"sample_count\":{},\"audio_file\":{},\"end_reason\":{},\"vad_score_min\":{:.6},\"vad_score_max\":{:.6},\"vad_score_mean\":{:.6},\"vad_frame_count\":{},\"transcript\":{},\"asr_success\":{}}}",
+        task.segment_id,
+        task.start_sample,
+        task.end_sample,
+        task.start_sample * 1000 / SAMPLE_RATE as u64,
+        task.end_sample * 1000 / SAMPLE_RATE as u64,
+        task.samples.len(),
+        json_string(audio_file),
+        json_string(task.end_reason),
+        task.vad_score_min,
+        task.vad_score_max,
+        task.vad_score_mean,
+        task.vad_frame_count,
+        transcript_json,
+        transcript.is_some(),
+    )
+}
+
+fn write_vad_session_metadata(directory: &str, vad: &VadState) -> std::io::Result<()> {
+    let path = format!("{}/vad_session.json", directory);
+    let json = format!(
+        "{{\n  \"sample_rate_hz\": {},\n  \"frame_samples\": {},\n  \"positive_threshold\": {},\n  \"negative_threshold\": {},\n  \"minimum_silence_ms\": {},\n  \"speech_padding_ms\": {},\n  \"maximum_segment_samples\": {},\n  \"samples_received\": {},\n  \"samples_vad_processed\": {},\n  \"samples_enqueued_for_asr\": {},\n  \"segment_count\": {},\n  \"queue_overflow_count\": {}\n}}\n",
+        SAMPLE_RATE,
+        VAD_FRAME_SAMPLES,
+        VAD_THRESHOLD,
+        VAD_NEG_THRESHOLD,
+        MIN_SILENCE_DURATION_MS,
+        SPEECH_PAD_MS,
+        MAX_SEGMENT_SAMPLES,
+        vad.samples_received,
+        vad.samples_vad_processed,
+        vad.samples_enqueued_for_asr,
+        vad.segment_id,
+        vad.queue_overflow,
+    );
+    fs::write(path, json)
+}
+
 fn start_asr_worker(
     engine_addr: usize,
     java_vm: Arc<jni::JavaVM>,
@@ -289,10 +426,6 @@ fn start_asr_worker(
     save_audio_dir: Option<String>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let session_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
         while let Ok(message) = rx.recv() {
             let Some(task) = message else {
                 break;
@@ -300,10 +433,7 @@ fn start_asr_worker(
 
             // Save the segment audio if save_audio_dir is provided
             if let Some(ref dir) = save_audio_dir {
-                let wav_path = format!(
-                    "{}/{}_seg{:03}.wav",
-                    dir, session_timestamp, task.segment_id
-                );
+                let wav_path = format!("{}/model_input_seg{:03}.wav", dir, task.segment_id);
                 if let Err(e) = write_wav_file(&wav_path, &task.samples, 16000) {
                     eprintln!(
                         "qwen-asr worker: failed to save post-VAD audio segment: {}",
@@ -346,6 +476,15 @@ fn start_asr_worker(
                 engine.ctx.skip_silence = old_skip_silence;
                 text
             };
+
+            if let Some(ref dir) = save_audio_dir {
+                let audio_file = format!("model_input_seg{:03}.wav", task.segment_id);
+                if let Err(error) =
+                    append_vad_segment_metadata(dir, &task, &audio_file, text.as_deref())
+                {
+                    eprintln!("qwen-asr worker: failed to save VAD metadata: {}", error);
+                }
+            }
 
             let Ok(mut env) = java_vm.attach_current_thread() else {
                 continue;
@@ -582,6 +721,11 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeStartVadSession(
     } else {
         None
     };
+    if let Some(ref directory) = save_dir_opt {
+        if fs::create_dir_all(directory).is_err() {
+            return 0;
+        }
+    }
 
     let java_vm = match env.get_java_vm() {
         Ok(vm) => vm,
@@ -600,7 +744,7 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeStartVadSession(
         listener_ref,
         rx,
         queued_samples.clone(),
-        save_dir_opt,
+        save_dir_opt.clone(),
     );
 
     let session = VadAsrSession {
@@ -610,6 +754,7 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeStartVadSession(
         queued_samples,
         closed: AtomicBool::new(false),
         worker: Mutex::new(Some(worker)),
+        save_audio_dir: save_dir_opt,
     };
     Box::into_raw(Box::new(session)) as jlong
 }
@@ -675,6 +820,13 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeStopVadSession(
     };
     if let Some(handle) = worker_handle {
         let _ = handle.join();
+    }
+    if let Some(ref directory) = session.save_audio_dir {
+        if let Ok(vad) = session.vad.lock() {
+            if let Err(error) = write_vad_session_metadata(directory, &vad) {
+                eprintln!("qwen-asr: failed to save VAD session metadata: {}", error);
+            }
+        }
     }
 }
 
