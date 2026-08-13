@@ -7,10 +7,10 @@ pre-quantized tied lm_head tensor, and writes the result to
 OUTPUT_DIR/model.safetensors.
 
 All non-decoder tensors (encoder weights, norms, etc.) are copied unchanged as
-BF16.  For the tied Qwen checkpoint used by the Android app, the redundant BF16
-token embedding is dropped by default: the runtime uses the quantized tied
-lm_head for both input embeddings and output logits.  Use --keep-embed-tokens
-only for a research export that explicitly needs the redundant tensor.
+BF16. The tied BF16 token embedding is retained by default because experiments
+showed that reconstructing it from the row-wise INT8 lm_head changes transcripts.
+Use --drop-embed-tokens only for research exports evaluated against an accuracy
+gate.
 Vocabulary files (vocab.json, merges.txt) are copied as-is.
 
 The resulting model file is ~380 MB smaller than the original, eliminating
@@ -21,6 +21,14 @@ Naming convention in the output file:
   {layer}.{proj}.weight_int8_scale  dtype F32  [out_dim]         (new)
   thinker.lm_head.weight         dtype I8   [vocab, hidden]     (new/replaced tied head)
   thinker.lm_head.weight_int8_scale dtype F32 [vocab]           (new)
+
+Optional affine groupwise token embedding representation:
+  thinker.model.embed_tokens.weight dtype I8 [vocab, hidden]
+  thinker.model.embed_tokens.weight_int8_group_scale dtype F32
+  thinker.model.embed_tokens.weight_int8_group_min dtype F32
+
+This representation is an inference target for quantization-aware recovery. It
+is not the default because post-training exports did not pass the quality gate.
 
 Usage:
   bench/prepare_int8_model.py \\
@@ -52,6 +60,8 @@ DTYPE_SIZES = {"F32": 4, "F16": 2, "BF16": 2, "I8": 1, "I32": 4, "I64": 8, "BOOL
 EMBED_TOKENS = "thinker.model.embed_tokens.weight"
 LM_HEAD = "thinker.lm_head.weight"
 LM_HEAD_SCALE = "thinker.lm_head.weight_int8_scale"
+EMBED_GROUP_SCALE = "thinker.model.embed_tokens.weight_int8_group_scale"
+EMBED_GROUP_MIN = "thinker.model.embed_tokens.weight_int8_group_min"
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +135,41 @@ def quantize_bf16_to_int8(w_bf16: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     # Quantize: round(v * inv_scale).clamp(-127, 127) as i8
     q = np.round(w_f32 * inv_scales[:, np.newaxis]).clip(-127, 127).astype(np.int8)
     return q, scales
+
+
+def quantize_bf16_to_groupwise_int8(
+    w_bf16: np.ndarray, group_size: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Symmetric INT8 quantization with an independent scale per row group."""
+    assert w_bf16.dtype == np.uint16
+    rows, cols = w_bf16.shape
+    assert cols % group_size == 0
+    groups = cols // group_size
+    w_f32 = (w_bf16.astype(np.uint32) << 16).view(np.float32)
+    grouped = w_f32.reshape(rows, groups, group_size)
+    max_abs = np.max(np.abs(grouped), axis=2)
+    scales = np.where(max_abs > 0.0, max_abs / 127.0, 1.0).astype(np.float32)
+    inv_scales = (127.0 / np.maximum(max_abs, 1e-10)).astype(np.float32)
+    q = np.round(grouped * inv_scales[:, :, np.newaxis]).clip(-127, 127).astype(np.int8)
+    return q.reshape(rows, cols), scales
+
+
+def quantize_bf16_to_affine_groupwise_int8(
+    w_bf16: np.ndarray, group_size: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Affine INT8 quantization using all 256 codes within each row group."""
+    assert w_bf16.dtype == np.uint16
+    rows, cols = w_bf16.shape
+    assert cols % group_size == 0
+    groups = cols // group_size
+    w_f32 = (w_bf16.astype(np.uint32) << 16).view(np.float32)
+    grouped = w_f32.reshape(rows, groups, group_size)
+    mins = np.min(grouped, axis=2).astype(np.float32)
+    maxs = np.max(grouped, axis=2).astype(np.float32)
+    scales = np.where(maxs > mins, (maxs - mins) / 255.0, 1.0).astype(np.float32)
+    q_u8 = np.round((grouped - mins[:, :, np.newaxis]) / scales[:, :, np.newaxis])
+    q_i8 = (q_u8.clip(0, 255).astype(np.int16) - 128).astype(np.int8)
+    return q_i8.reshape(rows, cols), scales, mins
 
 
 # ---------------------------------------------------------------------------
@@ -205,16 +250,35 @@ def main():
         "--drop-embed-tokens",
         dest="drop_embed_tokens",
         action="store_true",
-        help="(Default) drop tied BF16 token embeddings and use INT8 lm_head for token embeddings",
+        help="research-only: drop tied BF16 token embeddings and use INT8 lm_head for token embeddings",
     )
     embed_group.add_argument(
         "--keep-embed-tokens",
         dest="drop_embed_tokens",
         action="store_false",
-        help="research-only: retain the redundant tied BF16 token embeddings",
+        help="(Default) retain tied BF16 token embeddings for transcript fidelity",
     )
-    ap.set_defaults(drop_embed_tokens=True)
+    ap.set_defaults(drop_embed_tokens=False)
+    ap.add_argument(
+        "--int8-embed-group-size",
+        type=int,
+        choices=(4, 8, 16, 32),
+        help="replace BF16 token embeddings with groupwise INT8 using this group size",
+    )
+    ap.add_argument(
+        "--int8-embed-affine-group-size",
+        type=int,
+        choices=(4, 8, 16, 32),
+        help="replace BF16 token embeddings with affine groupwise INT8",
+    )
     args = ap.parse_args()
+    selected_embed_modes = sum(bool(v) for v in (
+        args.drop_embed_tokens,
+        args.int8_embed_group_size,
+        args.int8_embed_affine_group_size,
+    ))
+    if selected_embed_modes > 1:
+        ap.error("select only one INT8 token embedding mode")
 
     src = Path(args.model_dir)
     dst = Path(args.output_dir)
@@ -240,7 +304,16 @@ def main():
           f"gate+up pairs to fuse: {len(gate_proj_names)}", flush=True)
     print(f"  tied lm_head pre-quantization: {'yes' if quantize_tied_lm_head else 'no'}",
           flush=True)
-    print(f"  drop BF16 token embeddings: {'yes' if args.drop_embed_tokens else 'no'}",
+    embed_mode = (
+        f"affine INT8/{args.int8_embed_affine_group_size}"
+        if args.int8_embed_affine_group_size
+        else f"symmetric INT8/{args.int8_embed_group_size}"
+        if args.int8_embed_group_size
+        else "drop"
+        if args.drop_embed_tokens
+        else "keep BF16"
+    )
+    print(f"  token embedding mode: {embed_mode}",
           flush=True)
 
     # Build the output tensor list
@@ -252,6 +325,11 @@ def main():
         dtype_str = meta["dtype"]
 
         if name in decoder_proj_names:
+            if dtype_str == "I8":
+                start, end = meta["data_offsets"]
+                raw = np.array(data_mmap[start:end], dtype=np.uint8)
+                out_tensors.append((name, dtype_str, raw, list(meta["shape"])))
+                continue
             assert dtype_str == "BF16", f"Expected BF16 for {name}, got {dtype_str}"
             w_bf16 = get_tensor_np(header, data_mmap, name)
             assert w_bf16.ndim == 2, f"Expected 2D weight for {name}"
@@ -288,14 +366,36 @@ def main():
         elif is_decoder_up_proj(name):
             pass  # already emitted as gate_up_fused when gate_proj was processed
         elif name == LM_HEAD and quantize_tied_lm_head:
+            if dtype_str == "I8":
+                start, end = meta["data_offsets"]
+                raw = np.array(data_mmap[start:end], dtype=np.uint8)
+                out_tensors.append((name, dtype_str, raw, list(meta["shape"])))
+            else:
+                assert dtype_str == "BF16", f"Expected BF16 for {name}, got {dtype_str}"
+                lm_bf16 = get_tensor_np(header, data_mmap, name)
+                assert lm_bf16.ndim == 2, f"Expected 2D weight for {name}"
+                print(f"  quantizing tied lm_head from {name} {lm_bf16.shape} …", flush=True)
+                lm_int8, lm_scales = quantize_bf16_to_int8(lm_bf16)
+                out_tensors.append((LM_HEAD, "I8", lm_int8))
+                out_tensors.append((LM_HEAD_SCALE, "F32", lm_scales))
+                quantized_count += 1
+        elif name == EMBED_TOKENS and args.int8_embed_affine_group_size and quantize_tied_lm_head:
             assert dtype_str == "BF16", f"Expected BF16 for {name}, got {dtype_str}"
-            lm_bf16 = get_tensor_np(header, data_mmap, name)
-            assert lm_bf16.ndim == 2, f"Expected 2D weight for {name}"
-            print(f"  quantizing tied lm_head from {name} {lm_bf16.shape} …", flush=True)
-            lm_int8, lm_scales = quantize_bf16_to_int8(lm_bf16)
-            out_tensors.append((LM_HEAD, "I8", lm_int8))
-            out_tensors.append((LM_HEAD_SCALE, "F32", lm_scales))
-            quantized_count += 1
+            embed_bf16 = get_tensor_np(header, data_mmap, name)
+            embed_int8, embed_scales, embed_mins = quantize_bf16_to_affine_groupwise_int8(
+                embed_bf16, args.int8_embed_affine_group_size
+            )
+            out_tensors.append((EMBED_TOKENS, "I8", embed_int8))
+            out_tensors.append((EMBED_GROUP_SCALE, "F32", embed_scales))
+            out_tensors.append((EMBED_GROUP_MIN, "F32", embed_mins))
+        elif name == EMBED_TOKENS and args.int8_embed_group_size and quantize_tied_lm_head:
+            assert dtype_str == "BF16", f"Expected BF16 for {name}, got {dtype_str}"
+            embed_bf16 = get_tensor_np(header, data_mmap, name)
+            embed_int8, embed_scales = quantize_bf16_to_groupwise_int8(
+                embed_bf16, args.int8_embed_group_size
+            )
+            out_tensors.append((EMBED_TOKENS, "I8", embed_int8))
+            out_tensors.append((EMBED_GROUP_SCALE, "F32", embed_scales))
         elif name == EMBED_TOKENS and args.drop_embed_tokens and quantize_tied_lm_head:
             pass
         else:
@@ -321,7 +421,13 @@ def main():
     write_safetensors(model_dst, out_tensors)
 
     output_names = {entry[0] for entry in out_tensors}
-    if quantize_tied_lm_head and args.drop_embed_tokens:
+    if quantize_tied_lm_head and args.int8_embed_affine_group_size:
+        if not output_names.issuperset({EMBED_TOKENS, EMBED_GROUP_SCALE, EMBED_GROUP_MIN}):
+            raise RuntimeError("affine INT8 token embedding export is incomplete")
+    elif quantize_tied_lm_head and args.int8_embed_group_size:
+        if not output_names.issuperset({EMBED_TOKENS, EMBED_GROUP_SCALE}):
+            raise RuntimeError("groupwise INT8 token embedding export is incomplete")
+    elif quantize_tied_lm_head and args.drop_embed_tokens:
         if EMBED_TOKENS in output_names:
             raise RuntimeError(
                 "mobile INT8 invariant failed: tied BF16 token embeddings were retained"

@@ -1,8 +1,9 @@
 //! Audio encoder: Conv2D stem + windowed transformer + projection cascade.
 
 use crate::config::*;
+use crate::decoder::Int8Buf;
 use crate::kernels;
-use crate::safetensors::MultiSafetensors;
+use crate::safetensors::{Dtype, MultiSafetensors};
 
 pub struct EncLayer {
     pub wq_weight_bf16: *const u16,
@@ -16,8 +17,14 @@ pub struct EncLayer {
     pub attn_norm_weight: Vec<f32>,
     pub attn_norm_bias: Vec<f32>,
     pub fc1_weight_bf16: *const u16,
+    pub fc1_weight_int8: Option<Int8Buf>,
+    pub fc1_weight_int8_scales: Vec<f32>,
+    pub fc1_weight_int8_group_size: usize,
     pub fc1_bias: Vec<f32>,
     pub fc2_weight_bf16: *const u16,
+    pub fc2_weight_int8: Option<Int8Buf>,
+    pub fc2_weight_int8_scales: Vec<f32>,
+    pub fc2_weight_int8_group_size: usize,
     pub fc2_bias: Vec<f32>,
     pub ffn_norm_weight: Vec<f32>,
     pub ffn_norm_bias: Vec<f32>,
@@ -157,6 +164,137 @@ fn load_bf16_direct(ms: &MultiSafetensors, name: &str) -> Option<*const u16> {
     ms.shards[si].get_bf16_direct(t)
 }
 
+fn load_bf16_or_int8(
+    ms: &MultiSafetensors,
+    name: &str,
+    out_dim: usize,
+    in_dim: usize,
+) -> Option<(*const u16, Option<Int8Buf>, Vec<f32>, usize)> {
+    match ms.get_dtype(name)? {
+        Dtype::BF16 => Some((load_bf16_direct(ms, name)?, None, Vec::new(), 0)),
+        Dtype::I8 => {
+            let (ptr, len) = ms.get_i8_ptr(name)?;
+            if len != out_dim * in_dim {
+                eprintln!(
+                    "encoder: invalid INT8 weight length for {}: got {}, expected {}",
+                    name,
+                    len,
+                    out_dim * in_dim
+                );
+                return None;
+            }
+            let scales = load_f32(ms, &format!("{}_int8_scale", name))?;
+            if scales.len() % out_dim != 0 {
+                eprintln!(
+                    "encoder: invalid INT8 scale length for {}: got {}, expected a multiple of {}",
+                    name,
+                    scales.len(),
+                    out_dim
+                );
+                return None;
+            }
+            let groups_per_row = scales.len() / out_dim;
+            if groups_per_row == 0 || in_dim % groups_per_row != 0 {
+                eprintln!(
+                    "encoder: invalid INT8 group count for {}: {} groups for input dim {}",
+                    name, groups_per_row, in_dim
+                );
+                return None;
+            }
+            Some((
+                std::ptr::null(),
+                Some(Int8Buf::from_mmap(ptr, len)),
+                scales,
+                in_dim / groups_per_row,
+            ))
+        }
+        dtype => {
+            eprintln!(
+                "encoder: unsupported weight dtype for {}: {:?}",
+                name, dtype
+            );
+            None
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linear_int8_f32_scratch(
+    y: &mut [f32],
+    x: &[f32],
+    weights: &[i8],
+    scales: &[f32],
+    bias: &[f32],
+    seq_len: usize,
+    in_dim: usize,
+    out_dim: usize,
+    scratch: &mut [f32],
+    tile_rows: usize,
+    group_size: usize,
+    accumulate: bool,
+) {
+    if accumulate {
+        for row in y.chunks_exact_mut(out_dim).take(seq_len) {
+            for (value, bias) in row.iter_mut().zip(bias) {
+                *value += bias;
+            }
+        }
+    }
+
+    let tile_rows = tile_rows.max(1).min(out_dim);
+    for out_start in (0..out_dim).step_by(tile_rows) {
+        let rows = tile_rows.min(out_dim - out_start);
+        let n = rows * in_dim;
+        let weight_start = out_start * in_dim;
+        let dequantized = &mut scratch[..n];
+        for row in 0..rows {
+            let source_start = weight_start + row * in_dim;
+            let target_start = row * in_dim;
+            let groups_per_row = in_dim / group_size;
+            let scale_start = (out_start + row) * groups_per_row;
+            for group in 0..groups_per_row {
+                let scale = scales[scale_start + group];
+                let group_start = group * group_size;
+                for offset in 0..group_size {
+                    let col = group_start + offset;
+                    dequantized[target_start + col] = (weights[source_start + col] as f32) * scale;
+                }
+            }
+        }
+        if accumulate {
+            kernels::linear_accumulate_output_tile(
+                y,
+                x,
+                dequantized,
+                seq_len,
+                in_dim,
+                out_dim,
+                out_start,
+                rows,
+            );
+        } else {
+            kernels::linear_nobias_output_tile(
+                y,
+                x,
+                dequantized,
+                seq_len,
+                in_dim,
+                out_dim,
+                out_start,
+                rows,
+            );
+        }
+    }
+
+    if !accumulate {
+        for row in y.chunks_exact_mut(out_dim).take(seq_len) {
+            for (value, bias) in row.iter_mut().zip(bias) {
+                *value += bias;
+            }
+        }
+    }
+}
+
 impl Encoder {
     pub fn load(ms: &MultiSafetensors, cfg: &QwenConfig) -> Option<Self> {
         let p = ENC_PREFIX;
@@ -172,6 +310,20 @@ impl Encoder {
         let mut layers = Vec::new();
         for i in 0..cfg.enc_layers {
             let lp = format!("{}layers.{}", p, i);
+            let fc1_name = format!("{}.fc1.weight", lp);
+            let (
+                fc1_weight_bf16,
+                fc1_weight_int8,
+                fc1_weight_int8_scales,
+                fc1_weight_int8_group_size,
+            ) = load_bf16_or_int8(ms, &fc1_name, cfg.enc_ffn_dim, cfg.enc_d_model)?;
+            let fc2_name = format!("{}.fc2.weight", lp);
+            let (
+                fc2_weight_bf16,
+                fc2_weight_int8,
+                fc2_weight_int8_scales,
+                fc2_weight_int8_group_size,
+            ) = load_bf16_or_int8(ms, &fc2_name, cfg.enc_d_model, cfg.enc_ffn_dim)?;
 
             let layer = EncLayer {
                 wq_weight_bf16: load_bf16_direct(ms, &format!("{}.self_attn.q_proj.weight", lp))?,
@@ -184,9 +336,15 @@ impl Encoder {
                 wo_bias: load_f32(ms, &format!("{}.self_attn.out_proj.bias", lp))?,
                 attn_norm_weight: load_f32(ms, &format!("{}.self_attn_layer_norm.weight", lp))?,
                 attn_norm_bias: load_f32(ms, &format!("{}.self_attn_layer_norm.bias", lp))?,
-                fc1_weight_bf16: load_bf16_direct(ms, &format!("{}.fc1.weight", lp))?,
+                fc1_weight_bf16,
+                fc1_weight_int8,
+                fc1_weight_int8_scales,
+                fc1_weight_int8_group_size,
                 fc1_bias: load_f32(ms, &format!("{}.fc1.bias", lp))?,
-                fc2_weight_bf16: load_bf16_direct(ms, &format!("{}.fc2.weight", lp))?,
+                fc2_weight_bf16,
+                fc2_weight_int8,
+                fc2_weight_int8_scales,
+                fc2_weight_int8_group_size,
                 fc2_bias: load_f32(ms, &format!("{}.fc2.bias", lp))?,
                 ffn_norm_weight: load_f32(ms, &format!("{}.final_layer_norm.weight", lp))?,
                 ffn_norm_bias: load_f32(ms, &format!("{}.final_layer_norm.bias", lp))?,
@@ -235,6 +393,11 @@ impl Encoder {
         let output_dim = cfg.enc_output_dim;
         let chunk_size = cfg.enc_chunk_size;
         let n_window_infer = cfg.enc_n_window_infer;
+        let int8_tile_rows = std::env::var("QWEN_ENCODER_INT8_TILE_ROWS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(256);
 
         // Determine tokens per full chunk
         let tokens_per_chunk = {
@@ -486,31 +649,65 @@ impl Encoder {
                 1e-5,
             );
 
-            unsafe {
-                kernels::linear_bf16_scratch(
+            if let Some(ref weights) = layer.fc1_weight_int8 {
+                linear_int8_f32_scratch(
                     &mut bufs.ffn_mid[..tf],
                     &bufs.x_norm[..td],
-                    layer.fc1_weight_bf16,
-                    Some(&layer.fc1_bias),
+                    weights,
+                    &layer.fc1_weight_int8_scales,
+                    &layer.fc1_bias,
                     total_tokens,
                     d_model,
                     ffn_dim,
                     &mut bufs.bf16_scratch,
+                    int8_tile_rows,
+                    layer.fc1_weight_int8_group_size,
+                    false,
                 );
+            } else {
+                unsafe {
+                    kernels::linear_bf16_scratch(
+                        &mut bufs.ffn_mid[..tf],
+                        &bufs.x_norm[..td],
+                        layer.fc1_weight_bf16,
+                        Some(&layer.fc1_bias),
+                        total_tokens,
+                        d_model,
+                        ffn_dim,
+                        &mut bufs.bf16_scratch,
+                    );
+                }
             }
             kernels::gelu(&mut bufs.ffn_mid[..tf], tf);
             // Fused: x += fc2_bias + ffn_mid @ fc2_weight.T
-            unsafe {
-                kernels::linear_accumulate_bf16_scratch(
+            if let Some(ref weights) = layer.fc2_weight_int8 {
+                linear_int8_f32_scratch(
                     &mut bufs.x[..td],
                     &bufs.ffn_mid[..tf],
-                    layer.fc2_weight_bf16,
-                    Some(&layer.fc2_bias),
+                    weights,
+                    &layer.fc2_weight_int8_scales,
+                    &layer.fc2_bias,
                     total_tokens,
                     ffn_dim,
                     d_model,
                     &mut bufs.bf16_scratch,
+                    int8_tile_rows,
+                    layer.fc2_weight_int8_group_size,
+                    true,
                 );
+            } else {
+                unsafe {
+                    kernels::linear_accumulate_bf16_scratch(
+                        &mut bufs.x[..td],
+                        &bufs.ffn_mid[..tf],
+                        layer.fc2_weight_bf16,
+                        Some(&layer.fc2_bias),
+                        total_tokens,
+                        ffn_dim,
+                        d_model,
+                        &mut bufs.bf16_scratch,
+                    );
+                }
             }
         }
 

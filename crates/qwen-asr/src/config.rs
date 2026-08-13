@@ -84,7 +84,11 @@ impl Default for QwenConfig {
 impl QwenConfig {
     /// Returns the effective lm_head output dimension.
     pub fn lm_head_dim(&self) -> usize {
-        if self.classify_num > 0 { self.classify_num } else { self.vocab_size }
+        if self.classify_num > 0 {
+            self.classify_num
+        } else {
+            self.vocab_size
+        }
     }
 
     /// Whether this config is for a forced aligner model.
@@ -111,13 +115,27 @@ impl QwenConfig {
         let mut cfg = Self::default();
 
         // Determine decoder hidden size from embed_tokens shape [vocab_size, hidden_dim]
-        let dec_hidden = info.embed_tokens_shape
-            .and_then(|s| if s.len() == 2 { Some(s[1] as usize) } else { None })
+        let dec_hidden = info
+            .embed_tokens_shape
+            .and_then(|s| {
+                if s.len() == 2 {
+                    Some(s[1] as usize)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(if info.has_enc_layer_18 { 2048 } else { 1024 });
 
         // Determine decoder intermediate from gate_proj shape [intermediate, hidden]
-        let dec_intermediate = info.gate_proj_shape
-            .and_then(|s| if s.len() == 2 { Some(s[0] as usize) } else { None })
+        let dec_intermediate = info
+            .gate_proj_shape
+            .and_then(|s| {
+                if s.len() == 2 {
+                    Some(s[0] as usize)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(if dec_hidden >= 2048 { 6144 } else { 3072 });
 
         // Encoder architecture: 24 layers = "large" encoder, 18 layers = "small" encoder
@@ -157,11 +175,36 @@ impl QwenConfig {
 }
 
 pub const SUPPORTED_LANGUAGES: &[&str] = &[
-    "Chinese", "English", "Cantonese", "Arabic", "German", "French",
-    "Spanish", "Portuguese", "Indonesian", "Italian", "Korean", "Russian",
-    "Thai", "Vietnamese", "Japanese", "Turkish", "Hindi", "Malay", "Dutch",
-    "Swedish", "Danish", "Finnish", "Polish", "Czech", "Filipino",
-    "Persian", "Greek", "Romanian", "Hungarian", "Macedonian",
+    "Chinese",
+    "English",
+    "Cantonese",
+    "Arabic",
+    "German",
+    "French",
+    "Spanish",
+    "Portuguese",
+    "Indonesian",
+    "Italian",
+    "Korean",
+    "Russian",
+    "Thai",
+    "Vietnamese",
+    "Japanese",
+    "Turkish",
+    "Hindi",
+    "Malay",
+    "Dutch",
+    "Swedish",
+    "Danish",
+    "Finnish",
+    "Polish",
+    "Czech",
+    "Filipino",
+    "Persian",
+    "Greek",
+    "Romanian",
+    "Hungarian",
+    "Macedonian",
 ];
 
 pub fn normalize_language(language: &str) -> Option<String> {
@@ -171,7 +214,9 @@ pub fn normalize_language(language: &str) -> Option<String> {
     }
     let mut chars = trimmed.chars();
     let first = chars.next()?.to_uppercase().to_string();
-    let rest: String = chars.map(|c| c.to_lowercase().next().unwrap_or(c)).collect();
+    let rest: String = chars
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect();
     let normalized = format!("{}{}", first, rest);
 
     if SUPPORTED_LANGUAGES.contains(&normalized.as_str()) {

@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "experiment_id": "infrastructure-mac-collector-0.6b",
+  "timestamp_utc": "2026-08-12T07:14:06+00:00",
+  "hypothesis": "The Mac collector records all four target metric groups and preserves the transcript",
+  "change": "Infrastructure-only validation using the locally available 0.6B model; this is not the 1.7B performance baseline",
+  "baseline": null,
+  "git": {
+    "revision": "46e7d709eddd479782bc24460f95bd2cc4716f75",
+    "short_revision": "46e7d70",
+    "dirty": true
+  },
+  "host": {
+    "system": "Darwin",
+    "release": "24.6.0",
+    "machine": "arm64",
+    "python": "3.13.7",
+    "logical_cpu_count": 10,
+    "model": "Mac mini",
+    "chip": "Apple M4",
+    "memory": "16 GB",
+    "os_version": "15.7.7"
+  },
+  "model": {
+    "path": "/Volumes/SSD/qwen3-asr-0.6b",
+    "detected_variant": "0.6B",
+    "expected_variant": "0.6B",
+    "inventory_sha256": "dfb01692182f4dc6b9784380bd00b106a5b908340d811a2913368c693dcfdcb8",
+    "files": [
+      {
+        "path": "merges.txt",
+        "bytes": 1671853
+      },
+      {
+        "path": "model.safetensors",
+        "bytes": 1876091704
+      },
+      {
+        "path": "vocab.json",
+        "bytes": 2776833
+      }
+    ]
+  },
+  "input": "/Users/tony/Documents/keyboard/QwenASR/bench/android-assets/ptt_guardrail.wav",
+  "configuration": {
+    "launches": 1,
+    "runs_per_input": 1,
+    "threads": 1,
+    "language": "Auto",
+    "prompt": "音频是粤语，可能夹杂英语",
+    "binary": "/private/tmp/qwen-experiment-target/release/qwen-asr-bench-android",
+    "benchmark_optimization_flags": [
+      "vDSP/Accelerate",
+      "NEON",
+      "DotProd"
+    ]
+  },
+  "summary": {
+    "inference_latency_ms": {
+      "median": 493.177,
+      "p95": 493.177,
+      "min": 493.177,
+      "max": 493.177,
+      "samples": 1
+    },
+    "wall_inference_latency_ms": {
+      "median": 582.575,
+      "p95": 582.575
+    },
+    "model_load_ms": {
+      "median": 332.191,
+      "first_launch": 332.191,
+      "min": 332.191,
+      "max": 332.191,
+      "samples": 1
+    },
+    "phase_medians_ms": {
+      "mel": 0.785,
+      "encoder": 106.87,
+      "prefill": 189.65,
+      "decode_loop": 195.827
+    },
+    "transcripts": [
+      "哈喽，你好吗？已经坐低咗啦。"
+    ]
+  },
+  "memory": {
+    "after_model_load_bytes_median": 3936043008,
+    "peak_rss_bytes": 4442783744,
+    "peak_rss_bytes_by_launch": [
+      4442783744
+    ],
+    "source": "benchmark process sampler"
+  },
+  "file_size": {
+    "model_total_bytes": 1880540390,
+    "model_weight_bytes": 1876091704,
+    "runtime_binary_bytes": 1731712
+  },
+  "raw_launch_files": [
+    "raw/launch-001.json"
+  ]
+}

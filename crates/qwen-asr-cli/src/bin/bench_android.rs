@@ -48,6 +48,7 @@ fn elapsed_ms(t0: Instant) -> f64 {
     t0.elapsed().as_secs_f64() * 1000.0
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn proc_status_kb(field: &str) -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     for line in status.lines() {
@@ -59,8 +60,26 @@ fn proc_status_kb(field: &str) -> Option<u64> {
     None
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn current_rss_kb() -> u64 {
     proc_status_kb("VmRSS:").unwrap_or(0)
+}
+
+#[cfg(target_os = "macos")]
+fn current_rss_kb() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: getrusage initializes the supplied rusage struct on success.
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if result != 0 {
+        return 0;
+    }
+    // macOS reports ru_maxrss in bytes; Linux reports KiB and uses /proc above.
+    (unsafe { usage.assume_init() }.ru_maxrss as u64) / 1024
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux", target_os = "macos")))]
+fn current_rss_kb() -> u64 {
+    0
 }
 
 fn peak_rss_during<F, R>(operation: F) -> (R, u64)
@@ -299,6 +318,11 @@ fn main() {
     let model_load_ms = elapsed_ms(t0);
     let startup_ms = elapsed_ms(process_start);
     let memory_after_model_load_kb = current_rss_kb();
+    let model_variant = if ctx.config.dec_hidden >= 2048 {
+        "1.7B"
+    } else {
+        "0.6B"
+    };
 
     let flags = qwen_asr::optimization_flags()
         .iter()
@@ -418,8 +442,9 @@ fn main() {
     }
 
     println!(
-        "{{\"model_dir\":\"{}\",\"input\":\"{}\",\"runs\":{},\"threads\":{},\"language\":{},\"prompt\":{},\"setup_ms\":{:.3},\"model_load_ms\":{:.3},\"startup_ms\":{:.3},\"memory_after_model_load_kb\":{},\"optimization_flags\":[{}],\"target_arch\":\"{}\",\"profile_enabled\":{},\"files\":[{}]}}",
+        "{{\"model_dir\":\"{}\",\"model_variant\":\"{}\",\"input\":\"{}\",\"runs\":{},\"threads\":{},\"language\":{},\"prompt\":{},\"setup_ms\":{:.3},\"model_load_ms\":{:.3},\"startup_ms\":{:.3},\"memory_after_model_load_kb\":{},\"optimization_flags\":[{}],\"target_arch\":\"{}\",\"profile_enabled\":{},\"files\":[{}]}}",
         json_escape(&model_dir),
+        model_variant,
         json_escape(&input.to_string_lossy()),
         runs,
         n_threads,

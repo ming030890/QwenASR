@@ -1,0 +1,213 @@
+{
+  "schema_version": 2,
+  "experiment_id": "012-mac-1.7b-prefill-scratch-smoke",
+  "timestamp_utc": "2026-08-12T22:43:16+00:00",
+  "hypothesis": "On-demand BF16-to-F32 conversion into reusable prefill scratch removes persistent decoder F32 caches, sharply reducing 1.7B load time and memory while preserving exact transcripts",
+  "change": "Do not materialize persistent F32 decoder prefill weights; convert each BF16 projection into one reusable scratch buffer immediately before GEMM",
+  "baseline": {
+    "reference": "002-mac-openblas-baseline",
+    "metrics_path": "/Users/tony/Documents/keyboard/QwenASR/experiments/qwen-inference-optimization/runs/002-mac-openblas-baseline/metrics.json",
+    "experiment_id": "002-mac-openblas-baseline"
+  },
+  "git": {
+    "revision": "46e7d709eddd479782bc24460f95bd2cc4716f75",
+    "short_revision": "46e7d70",
+    "dirty": true
+  },
+  "host": {
+    "system": "Darwin",
+    "release": "24.6.0",
+    "machine": "arm64",
+    "python": "3.13.7",
+    "logical_cpu_count": 10,
+    "model": "Mac mini",
+    "chip": "Apple M4",
+    "memory": "16 GB",
+    "os_version": "15.7.7"
+  },
+  "model": {
+    "path": "/Volumes/SSD/Qwen3-ASR-1.7B",
+    "detected_variant": "1.7B",
+    "expected_variant": "1.7B",
+    "inventory_sha256": "9fb23a12239e6a3917c36d17f0951731e5bacfdbe90bcb080fe8f421908da043",
+    "files": [
+      {
+        "path": ".gitattributes",
+        "bytes": 1519
+      },
+      {
+        "path": "README.md",
+        "bytes": 57456
+      },
+      {
+        "path": "chat_template.json",
+        "bytes": 1161
+      },
+      {
+        "path": "config.json",
+        "bytes": 6194
+      },
+      {
+        "path": "generation_config.json",
+        "bytes": 142
+      },
+      {
+        "path": "merges.txt",
+        "bytes": 1671853
+      },
+      {
+        "path": "model-00001-of-00002.safetensors",
+        "bytes": 4220320824
+      },
+      {
+        "path": "model-00002-of-00002.safetensors",
+        "bytes": 478200688
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "bytes": 64821
+      },
+      {
+        "path": "preprocessor_config.json",
+        "bytes": 330
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 12487
+      },
+      {
+        "path": "vocab.json",
+        "bytes": 2776833
+      }
+    ]
+  },
+  "input": "/Users/tony/Documents/keyboard/QwenASR/bench/android-assets",
+  "configuration": {
+    "launches": 1,
+    "runs_per_input": 1,
+    "threads": 1,
+    "language": "Auto",
+    "prompt": "音频是粤语，可能夹杂英语",
+    "binary": "/Users/tony/Documents/keyboard/QwenASR/target/release/qwen-asr-bench-android",
+    "benchmark_optimization_flags": [
+      "OpenBLAS",
+      "vDSP/Accelerate",
+      "NEON",
+      "DotProd"
+    ],
+    "required_backend": "OpenBLAS"
+  },
+  "summary": {
+    "inference_latency_ms": {
+      "median": 974.986,
+      "p95": 3991.526,
+      "min": 827.787,
+      "max": 3991.526,
+      "samples": 6
+    },
+    "wall_inference_latency_ms": {
+      "median": 1059.2085,
+      "p95": 4084.828
+    },
+    "model_load_ms": {
+      "median": 20099.947,
+      "first_launch": 20099.947,
+      "min": 20099.947,
+      "max": 20099.947,
+      "samples": 1
+    },
+    "phase_medians_ms": {
+      "mel": 0.292,
+      "encoder": 97.977,
+      "prefill": 375.0055,
+      "decode_loop": 429.39099999999996
+    },
+    "transcripts": [
+      "我急求方法啊！",
+      "唔做嘢嘅佔多數咯。",
+      "證據嘅話，真係冇啊！",
+      "你睇下呢部剧。",
+      "仲要提供乜嘢資料？",
+      "Hello，你好嘛？已经坐低咗啦。"
+    ],
+    "transcripts_by_input": {
+      "cv_yue_000.wav": {
+        "canonical": "我急求方法啊！",
+        "all_runs_equal": true,
+        "samples": 1,
+        "values": [
+          "我急求方法啊！"
+        ]
+      },
+      "cv_yue_001.wav": {
+        "canonical": "唔做嘢嘅佔多數咯。",
+        "all_runs_equal": true,
+        "samples": 1,
+        "values": [
+          "唔做嘢嘅佔多數咯。"
+        ]
+      },
+      "cv_yue_002.wav": {
+        "canonical": "證據嘅話，真係冇啊！",
+        "all_runs_equal": true,
+        "samples": 1,
+        "values": [
+          "證據嘅話，真係冇啊！"
+        ]
+      },
+      "cv_yue_003.wav": {
+        "canonical": "你睇下呢部剧。",
+        "all_runs_equal": true,
+        "samples": 1,
+        "values": [
+          "你睇下呢部剧。"
+        ]
+      },
+      "cv_yue_004.wav": {
+        "canonical": "仲要提供乜嘢資料？",
+        "all_runs_equal": true,
+        "samples": 1,
+        "values": [
+          "仲要提供乜嘢資料？"
+        ]
+      },
+      "ptt_guardrail.wav": {
+        "canonical": "Hello，你好嘛？已经坐低咗啦。",
+        "all_runs_equal": true,
+        "samples": 1,
+        "values": [
+          "Hello，你好嘛？已经坐低咗啦。"
+        ]
+      }
+    }
+  },
+  "acceptance": {
+    "transcript_gate": {
+      "rule": "Every transcript must exactly equal the baseline, including case, spacing, and punctuation.",
+      "candidate_runs_internally_equal": true,
+      "baseline_runs_internally_equal": true,
+      "same_input_set": true,
+      "exact_transcript_match": true,
+      "passed": true,
+      "mismatches": [],
+      "mode": "candidate-comparison"
+    },
+    "eligible_for_performance_acceptance": true
+  },
+  "memory": {
+    "after_model_load_bytes_median": 4679827456,
+    "peak_rss_bytes": 7567867904,
+    "peak_rss_bytes_by_launch": [
+      7567867904
+    ],
+    "source": "benchmark process sampler"
+  },
+  "file_size": {
+    "model_total_bytes": 4703114308,
+    "model_weight_bytes": 4698521512,
+    "runtime_binary_bytes": 1750272
+  },
+  "raw_launch_files": [
+    "raw/launch-001.json"
+  ]
+}

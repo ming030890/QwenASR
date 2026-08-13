@@ -12,16 +12,16 @@ out.  Comparing results from different sessions produces 6-13% phantom variance
 that violates the tight regression limits below.
 
 Stage 1 (fast gate, 1 CV clip):
-  - Guardrail must be phonetically stable.
+  - Every transcript must exactly match the baseline.
   - cv_yue_003 inference must not regress >10% vs baseline.
 
 Stage 2 (candidate gate, 2 CV clips):
-  - Guardrail must be phonetically stable.
+  - Every transcript must exactly match the baseline.
   - No clip may regress >5% vs baseline.
   - Promotes if median inference is >=3% faster.
 
 Stage 3 (acceptance gate, 5 CV clips):
-  - Guardrail must be phonetically stable.
+  - Every transcript must exactly match the baseline.
   - Accepts if ANY of:
       inference_ms improves >=5%
       model_load_ms improves >=5%
@@ -78,6 +78,13 @@ def check_guardrail(label, threads):
     return True, f"OK — '{transcript}'"
 
 
+def check_openblas(data, label):
+    flags = data.get("optimization_flags", []) if data else []
+    if "OpenBLAS" not in flags:
+        return False, f"{label} must report OpenBLAS; optimization_flags={flags!r}"
+    return True, f"{label} reports OpenBLAS"
+
+
 def get_cv_results(label, threads):
     """Returns ({clip_name: inference_ms}, {clip_name: prefill_ms}, data) from common_voice JSON."""
     data = load_json(label, f"common_voice-t{threads}.json")
@@ -101,6 +108,50 @@ def get_peak_rss_kb(data):
         if "peak_rss_kb" in run
     ]
     return statistics.median(vals) if vals else None
+
+
+def transcript_runs(data):
+    """Return {audio basename: [transcript from every measured run]}."""
+    if not data:
+        return {}
+    result = {}
+    for file_result in data.get("files", []):
+        name = os.path.basename(file_result.get("audio_path", ""))
+        values = [
+            str(run.get("transcript", ""))
+            for run in file_result.get("run_details", [])
+        ]
+        if not values and "transcript" in file_result:
+            values = [str(file_result["transcript"])]
+        result[name] = values
+    return result
+
+
+def check_exact_transcripts(result_groups, baseline_groups):
+    """Exact match, including Unicode characters, case, spaces, punctuation."""
+    failures = []
+    for group in sorted(set(result_groups) | set(baseline_groups)):
+        result = transcript_runs(result_groups.get(group))
+        baseline = transcript_runs(baseline_groups.get(group))
+        if set(result) != set(baseline):
+            failures.append(
+                f"{group}: input set differs (candidate={sorted(result)}, baseline={sorted(baseline)})"
+            )
+        for name in sorted(set(result) | set(baseline)):
+            candidate_values = result.get(name, [])
+            baseline_values = baseline.get(name, [])
+            baseline_stable = bool(baseline_values) and len(set(baseline_values)) == 1
+            candidate_stable = bool(candidate_values) and len(set(candidate_values)) == 1
+            expected = baseline_values[0] if baseline_stable else None
+            if not baseline_stable:
+                failures.append(f"{group}/{name}: baseline repetitions are not identical: {baseline_values!r}")
+            if not candidate_stable:
+                failures.append(f"{group}/{name}: candidate repetitions are not identical: {candidate_values!r}")
+            if expected is not None and any(value != expected for value in candidate_values):
+                failures.append(
+                    f"{group}/{name}: exact mismatch; baseline={expected!r}, candidate={list(dict.fromkeys(candidate_values))!r}"
+                )
+    return not failures, failures
 
 
 def pct(new, old):
@@ -148,14 +199,18 @@ def main():
     # ── Inference numbers ─────────────────────────────────────────────────────
     result_cv, result_prefills, result_data = get_cv_results(args.result, t)
     
+    result_guardrail_data = load_json(args.result, f"ptt_guardrail-t{t}.json")
+    baseline_guardrail_data = None
     if args.baseline:
         baseline_cv, baseline_prefills, baseline_data = get_cv_results(args.baseline, t)
+        baseline_guardrail_data = load_json(args.baseline, f"ptt_guardrail-t{t}.json")
     else:
         latest_path = os.path.join(os.path.dirname(__file__), "latest_baseline.json")
         if os.path.exists(latest_path):
             with open(latest_path, encoding="utf-8") as f:
                 base_obj = json.load(f)
             baseline_data = base_obj.get("common_voice")
+            baseline_guardrail_data = base_obj.get("ptt_guardrail")
             baseline_cv = {}
             baseline_prefills = {}
             if baseline_data:
@@ -167,6 +222,31 @@ def main():
             print(f"Loaded latest baseline from standalone file: {latest_path} (label: {base_obj.get('label')})")
         else:
             baseline_cv, baseline_prefills, baseline_data = {}, {}, None
+
+    backend_ok, backend_message = check_openblas(result_data, "candidate")
+    print(f"\n[backend] {'PASS' if backend_ok else 'FAIL'} — {backend_message}")
+    if not backend_ok:
+        verdict_ok = False
+        reasons_fail.append(backend_message)
+
+    if baseline_data:
+        backend_ok, backend_message = check_openblas(baseline_data, "baseline")
+        print(f"\n[backend] {'PASS' if backend_ok else 'FAIL'} — {backend_message}")
+        if not backend_ok:
+            verdict_ok = False
+            reasons_fail.append(backend_message)
+        exact_ok, exact_failures = check_exact_transcripts(
+            {"common_voice": result_data, "ptt_guardrail": result_guardrail_data},
+            {"common_voice": baseline_data, "ptt_guardrail": baseline_guardrail_data},
+        )
+        print(f"\n[exact transcript gate] {'PASS' if exact_ok else 'FAIL'}")
+        if exact_ok:
+            reasons_pass.append("all candidate transcripts exactly match baseline")
+        else:
+            verdict_ok = False
+            reasons_fail.append("exact transcript equality gate failed")
+            for failure in exact_failures:
+                print(f"  FAIL — {failure}")
 
     print(f"\n[inference_ms]")
     for clip, ms in sorted(result_cv.items()):

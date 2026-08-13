@@ -19,14 +19,14 @@ unsafe impl Send for Int8Buf {}
 unsafe impl Sync for Int8Buf {}
 
 impl Int8Buf {
-    fn from_mmap(ptr: *const i8, len: usize) -> Self {
+    pub(crate) fn from_mmap(ptr: *const i8, len: usize) -> Self {
         Int8Buf {
             ptr,
             len,
             _owned: Vec::new(),
         }
     }
-    fn from_owned(v: Vec<i8>) -> Self {
+    pub(crate) fn from_owned(v: Vec<i8>) -> Self {
         let ptr = v.as_ptr();
         let len = v.len();
         Int8Buf {
@@ -87,6 +87,12 @@ unsafe impl Sync for DecLayer {}
 
 pub struct Decoder {
     pub tok_embeddings_bf16: *const u16,
+    pub tok_embeddings_int8: Option<Int8Buf>,
+    pub tok_embeddings_int8_scales: *const f32,
+    pub tok_embeddings_int8_scales_len: usize,
+    pub tok_embeddings_int8_mins: *const f32,
+    pub tok_embeddings_int8_mins_len: usize,
+    pub tok_embeddings_int8_group_size: usize,
     pub layers: Vec<DecLayer>,
     pub norm: Vec<f32>,
     /// Separate lm_head for forced aligner (None = tied weights with tok_embeddings)
@@ -162,11 +168,95 @@ fn dequantize_int8_to_f32_scratch<'a>(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
+fn linear_nobias_int8_f32_scratch(
+    y: &mut [f32],
+    x: &[f32],
+    int8: &[i8],
+    scales: &[f32],
+    seq_len: usize,
+    in_dim: usize,
+    out_dim: usize,
+    scratch: &mut [f32],
+    tile_rows: usize,
+) {
+    let tile_rows = tile_rows.max(1).min(out_dim);
+    for out_start in (0..out_dim).step_by(tile_rows) {
+        let rows = tile_rows.min(out_dim - out_start);
+        let weight_start = out_start * in_dim;
+        let weight_end = weight_start + rows * in_dim;
+        let weights = dequantize_int8_to_f32_scratch(
+            &int8[weight_start..weight_end],
+            &scales[out_start..out_start + rows],
+            rows,
+            in_dim,
+            scratch,
+        );
+        kernels::linear_nobias_output_tile(
+            y, x, weights, seq_len, in_dim, out_dim, out_start, rows,
+        );
+    }
+}
+
 impl Decoder {
     pub fn load(ms: &MultiSafetensors, cfg: &QwenConfig) -> Option<Self> {
         use crate::safetensors::Dtype;
 
+        // Diagnostic escape hatch for controlled A/B measurements. The default
+        // keeps no persistent F32 prefill copies; setting this to 1 restores the
+        // legacy cache behavior in the same binary and model revision.
+        let cache_prefill_weights = std::env::var("QWEN_PREFILL_CACHE_WEIGHTS")
+            .map(|value| value == "1")
+            .unwrap_or(false);
+
         let tok_embeddings_bf16_opt = ms.get_bf16_direct("thinker.model.embed_tokens.weight");
+        let tok_embeddings_int8_raw = ms.get_i8_ptr("thinker.model.embed_tokens.weight");
+        let expected_embedding_len = cfg.vocab_size.checked_mul(cfg.dec_hidden)?;
+        if let Some((_, len)) = tok_embeddings_int8_raw {
+            if len != expected_embedding_len {
+                eprintln!(
+                    "decoder: invalid INT8 token embedding length: got {}, expected {}",
+                    len, expected_embedding_len
+                );
+                return None;
+            }
+        }
+        let tok_embeddings_int8 =
+            tok_embeddings_int8_raw.map(|(ptr, len)| Int8Buf::from_mmap(ptr, len));
+        let (tok_embeddings_int8_scales, tok_embeddings_int8_scales_len) = ms
+            .get_f32_ptr("thinker.model.embed_tokens.weight_int8_group_scale")
+            .unwrap_or((std::ptr::null(), 0));
+        let (tok_embeddings_int8_mins, tok_embeddings_int8_mins_len) = ms
+            .get_f32_ptr("thinker.model.embed_tokens.weight_int8_group_min")
+            .unwrap_or((std::ptr::null(), 0));
+        let tok_embeddings_int8_group_size = if tok_embeddings_int8.is_some()
+            && tok_embeddings_int8_scales_len > 0
+            && tok_embeddings_int8_scales_len % cfg.vocab_size == 0
+        {
+            let groups_per_row = tok_embeddings_int8_scales_len / cfg.vocab_size;
+            if cfg.dec_hidden % groups_per_row == 0 {
+                cfg.dec_hidden / groups_per_row
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        if tok_embeddings_int8.is_some() {
+            if tok_embeddings_int8_group_size == 0 {
+                eprintln!("decoder: invalid groupwise INT8 token embedding scales");
+                return None;
+            }
+            if tok_embeddings_int8_mins_len != 0
+                && tok_embeddings_int8_mins_len != tok_embeddings_int8_scales_len
+            {
+                eprintln!(
+                    "decoder: affine INT8 token embedding min/scale length mismatch: {} vs {}",
+                    tok_embeddings_int8_mins_len, tok_embeddings_int8_scales_len
+                );
+                return None;
+            }
+        }
 
         // Detect whether the model file stores decoder weights as pre-quantized INT8.
         // The Python host script prepare_int8_model.py creates a model where every
@@ -265,52 +355,77 @@ impl Decoder {
                 let wv = load_bf16_direct(ms, &format!("{}.self_attn.v_proj.weight", lp))?;
                 let wo = load_bf16_direct(ms, &format!("{}.self_attn.o_proj.weight", lp))?;
 
-                let wq_weight_f32_prefill = load_bf16_as_f32(
-                    ms,
-                    &format!("{}.self_attn.q_proj.weight", lp),
-                    q_dim,
-                    hidden,
-                )?;
-                let wk_weight_f32_prefill = load_bf16_as_f32(
-                    ms,
-                    &format!("{}.self_attn.k_proj.weight", lp),
-                    kv_dim,
-                    hidden,
-                )?;
-                let wv_weight_f32_prefill = load_bf16_as_f32(
-                    ms,
-                    &format!("{}.self_attn.v_proj.weight", lp),
-                    kv_dim,
-                    hidden,
-                )?;
-                let wo_weight_f32_prefill = load_bf16_as_f32(
-                    ms,
-                    &format!("{}.self_attn.o_proj.weight", lp),
-                    hidden,
-                    q_dim,
-                )?;
+                let (wq_weight_f32_prefill, wk_weight_f32_prefill) = if cache_prefill_weights {
+                    (
+                        load_bf16_as_f32(
+                            ms,
+                            &format!("{}.self_attn.q_proj.weight", lp),
+                            q_dim,
+                            hidden,
+                        )?,
+                        load_bf16_as_f32(
+                            ms,
+                            &format!("{}.self_attn.k_proj.weight", lp),
+                            kv_dim,
+                            hidden,
+                        )?,
+                    )
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                let (wv_weight_f32_prefill, wo_weight_f32_prefill) = if cache_prefill_weights {
+                    (
+                        load_bf16_as_f32(
+                            ms,
+                            &format!("{}.self_attn.v_proj.weight", lp),
+                            kv_dim,
+                            hidden,
+                        )?,
+                        load_bf16_as_f32(
+                            ms,
+                            &format!("{}.self_attn.o_proj.weight", lp),
+                            hidden,
+                            q_dim,
+                        )?,
+                    )
+                } else {
+                    (Vec::new(), Vec::new())
+                };
 
                 let gate_bf16 = load_bf16_direct(ms, &format!("{}.mlp.gate_proj.weight", lp))?;
                 let up_bf16 = load_bf16_direct(ms, &format!("{}.mlp.up_proj.weight", lp))?;
                 let down_bf16 = load_bf16_direct(ms, &format!("{}.mlp.down_proj.weight", lp))?;
 
-                // Fuse gate+up: interleave rows
-                let mut gate_up_fused = vec![0u16; 2 * inter * hidden];
-                unsafe {
-                    let gate_slice = std::slice::from_raw_parts(gate_bf16, inter * hidden);
-                    let up_slice = std::slice::from_raw_parts(up_bf16, inter * hidden);
-                    for r in 0..inter {
-                        gate_up_fused[2 * r * hidden..(2 * r + 1) * hidden]
-                            .copy_from_slice(&gate_slice[r * hidden..(r + 1) * hidden]);
-                        gate_up_fused[(2 * r + 1) * hidden..(2 * r + 2) * hidden]
-                            .copy_from_slice(&up_slice[r * hidden..(r + 1) * hidden]);
+                // The ARM64 path can project gate/up independently during prefill
+                // and uses fused INT8 weights during decode, so retaining another
+                // full BF16 copy is unnecessary. Keep it only for the diagnostic
+                // legacy cache and the non-ARM64 BF16 decode fallback.
+                let mut gate_up_fused = Vec::new();
+                if cache_prefill_weights || !cfg!(target_arch = "aarch64") {
+                    gate_up_fused.resize(2 * inter * hidden, 0u16);
+                    unsafe {
+                        let gate_slice = std::slice::from_raw_parts(gate_bf16, inter * hidden);
+                        let up_slice = std::slice::from_raw_parts(up_bf16, inter * hidden);
+                        for r in 0..inter {
+                            gate_up_fused[2 * r * hidden..(2 * r + 1) * hidden]
+                                .copy_from_slice(&gate_slice[r * hidden..(r + 1) * hidden]);
+                            gate_up_fused[(2 * r + 1) * hidden..(2 * r + 2) * hidden]
+                                .copy_from_slice(&up_slice[r * hidden..(r + 1) * hidden]);
+                        }
                     }
                 }
-                let mut gate_up_fused_f32_prefill = vec![0.0f32; 2 * inter * hidden];
-                kernels::bf16_to_f32_buf(&mut gate_up_fused_f32_prefill, &gate_up_fused);
-                let down_weight_f32_prefill =
-                    load_bf16_as_f32(ms, &format!("{}.mlp.down_proj.weight", lp), hidden, inter)?;
-
+                let gate_up_fused_f32_prefill = if cache_prefill_weights {
+                    let mut weights = vec![0.0f32; 2 * inter * hidden];
+                    kernels::bf16_to_f32_buf(&mut weights, &gate_up_fused);
+                    weights
+                } else {
+                    Vec::new()
+                };
+                let down_weight_f32_prefill = if cache_prefill_weights {
+                    load_bf16_as_f32(ms, &format!("{}.mlp.down_proj.weight", lp), hidden, inter)?
+                } else {
+                    Vec::new()
+                };
                 // INT8 quantize all decoder layer weights (on-device, heap-backed)
                 let (wq_i8, wq_int8_scales) =
                     kernels::quantize_bf16_weights_to_int8(wq, q_dim, hidden);
@@ -324,11 +439,29 @@ impl Decoder {
                 let (wo_i8, wo_int8_scales) =
                     kernels::quantize_bf16_weights_to_int8(wo, hidden, q_dim);
                 let wo_int8 = Int8Buf::from_owned(wo_i8);
-                let (gate_up_i8, gate_up_int8_scales) = kernels::quantize_bf16_weights_to_int8(
-                    gate_up_fused.as_ptr(),
-                    2 * inter,
-                    hidden,
-                );
+                let (gate_up_i8, gate_up_int8_scales) = if gate_up_fused.is_empty() {
+                    let (gate_i8, gate_scales) =
+                        kernels::quantize_bf16_weights_to_int8(gate_bf16, inter, hidden);
+                    let (up_i8, up_scales) =
+                        kernels::quantize_bf16_weights_to_int8(up_bf16, inter, hidden);
+                    let mut fused_i8 = vec![0i8; 2 * inter * hidden];
+                    let mut fused_scales = vec![0.0f32; 2 * inter];
+                    for r in 0..inter {
+                        fused_i8[2 * r * hidden..(2 * r + 1) * hidden]
+                            .copy_from_slice(&gate_i8[r * hidden..(r + 1) * hidden]);
+                        fused_i8[(2 * r + 1) * hidden..(2 * r + 2) * hidden]
+                            .copy_from_slice(&up_i8[r * hidden..(r + 1) * hidden]);
+                        fused_scales[2 * r] = gate_scales[r];
+                        fused_scales[2 * r + 1] = up_scales[r];
+                    }
+                    (fused_i8, fused_scales)
+                } else {
+                    kernels::quantize_bf16_weights_to_int8(
+                        gate_up_fused.as_ptr(),
+                        2 * inter,
+                        hidden,
+                    )
+                };
                 let gate_up_int8 = Int8Buf::from_owned(gate_up_i8);
                 let (down_i8, down_int8_scales) =
                     kernels::quantize_bf16_weights_to_int8(down_bf16, hidden, inter);
@@ -399,6 +532,12 @@ impl Decoder {
 
         Some(Decoder {
             tok_embeddings_bf16,
+            tok_embeddings_int8,
+            tok_embeddings_int8_scales,
+            tok_embeddings_int8_scales_len,
+            tok_embeddings_int8_mins,
+            tok_embeddings_int8_mins_len,
+            tok_embeddings_int8_group_size,
             layers,
             norm,
             lm_head_bf16,
@@ -622,6 +761,7 @@ pub struct DecoderBuffers {
     pub pref_ffn_out: Vec<f32>,
     pub pref_gate_up: Vec<f32>,
     pub pref_gate: Vec<f32>,
+    pub pref_up: Vec<f32>,
     pub pref_seq_cap: usize,
 
     // Reusable scratch for BF16→F32 conversion in prefill path
@@ -662,6 +802,7 @@ impl DecoderBuffers {
             pref_ffn_out: Vec::new(),
             pref_gate_up: Vec::new(),
             pref_gate: Vec::new(),
+            pref_up: Vec::new(),
             pref_seq_cap: 0,
             bf16_scratch: vec![0.0f32; max_weight],
             pref_x_int8: Vec::new(),
@@ -698,6 +839,7 @@ impl DecoderBuffers {
         self.pref_ffn_out.resize(new_cap * dim, 0.0);
         self.pref_gate_up.resize(new_cap * 2 * intermediate, 0.0);
         self.pref_gate.resize(new_cap * intermediate, 0.0);
+        self.pref_up.resize(new_cap * intermediate, 0.0);
 
         let max_in_dim = dim.max(intermediate).max(q_dim);
         self.pref_x_int8.resize(new_cap * max_in_dim, 0);
@@ -726,6 +868,17 @@ pub fn decoder_prefill(
     let theta = cfg.dec_rope_theta;
     let q_dim = n_heads * head_dim;
     let kv_dim = n_kv_heads * head_dim;
+    // Diagnostic path for pre-quantized models: retain mmap-backed INT8 weights,
+    // but dequantize only the current projection into the existing reusable
+    // scratch buffer so prefill can use the platform's optimized F32 GEMM.
+    // Non-aarch64 targets already require this fallback.
+    let use_f32_int8_prefill = cfg!(not(target_arch = "aarch64"))
+        || std::env::var("QWEN_INT8_PREFILL_F32").is_ok_and(|value| value == "1");
+    let int8_prefill_tile_rows = std::env::var("QWEN_INT8_PREFILL_TILE_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(usize::MAX);
 
     // Ensure KV cache
     let needed = kv_cache.len + seq_len;
@@ -760,9 +913,90 @@ pub fn decoder_prefill(
         let k = &mut bufs.pref_k[..seq_len * kv_dim];
         let v = &mut bufs.pref_v[..seq_len * kv_dim];
 
-        if layer.wq_weight_f32_prefill.is_empty() {
-            #[cfg(target_arch = "aarch64")]
-            {
+        if !layer.wq_weight_f32_prefill.is_empty() {
+            kernels::linear_nobias(q, x_norm, &layer.wq_weight_f32_prefill, seq_len, dim, q_dim);
+            kernels::linear_nobias(
+                k,
+                x_norm,
+                &layer.wk_weight_f32_prefill,
+                seq_len,
+                dim,
+                kv_dim,
+            );
+            kernels::linear_nobias(
+                v,
+                x_norm,
+                &layer.wv_weight_f32_prefill,
+                seq_len,
+                dim,
+                kv_dim,
+            );
+        } else if !layer.wq_weight_bf16.is_null() {
+            unsafe {
+                kernels::linear_nobias_bf16_scratch(
+                    q,
+                    x_norm,
+                    layer.wq_weight_bf16,
+                    seq_len,
+                    dim,
+                    q_dim,
+                    &mut bufs.bf16_scratch,
+                );
+                kernels::linear_nobias_bf16_scratch(
+                    k,
+                    x_norm,
+                    layer.wk_weight_bf16,
+                    seq_len,
+                    dim,
+                    kv_dim,
+                    &mut bufs.bf16_scratch,
+                );
+                kernels::linear_nobias_bf16_scratch(
+                    v,
+                    x_norm,
+                    layer.wv_weight_bf16,
+                    seq_len,
+                    dim,
+                    kv_dim,
+                    &mut bufs.bf16_scratch,
+                );
+            }
+        } else {
+            if use_f32_int8_prefill {
+                linear_nobias_int8_f32_scratch(
+                    q,
+                    x_norm,
+                    &layer.wq_int8,
+                    &layer.wq_int8_scales,
+                    seq_len,
+                    dim,
+                    q_dim,
+                    &mut bufs.bf16_scratch,
+                    int8_prefill_tile_rows,
+                );
+                linear_nobias_int8_f32_scratch(
+                    k,
+                    x_norm,
+                    &layer.wk_int8,
+                    &layer.wk_int8_scales,
+                    seq_len,
+                    dim,
+                    kv_dim,
+                    &mut bufs.bf16_scratch,
+                    int8_prefill_tile_rows,
+                );
+                linear_nobias_int8_f32_scratch(
+                    v,
+                    x_norm,
+                    &layer.wv_int8,
+                    &layer.wv_int8_scales,
+                    seq_len,
+                    dim,
+                    kv_dim,
+                    &mut bufs.bf16_scratch,
+                    int8_prefill_tile_rows,
+                );
+            } else {
                 kernels::linear_nobias_int8_matmat(
                     q,
                     x_norm,
@@ -797,51 +1031,6 @@ pub fn decoder_prefill(
                     &mut bufs.pref_x_scales,
                 );
             }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                let wq = dequantize_int8_to_f32_scratch(
-                    &layer.wq_int8,
-                    &layer.wq_int8_scales,
-                    q_dim,
-                    dim,
-                    &mut bufs.bf16_scratch,
-                );
-                kernels::linear_nobias(q, x_norm, wq, seq_len, dim, q_dim);
-                let wk = dequantize_int8_to_f32_scratch(
-                    &layer.wk_int8,
-                    &layer.wk_int8_scales,
-                    kv_dim,
-                    dim,
-                    &mut bufs.bf16_scratch,
-                );
-                kernels::linear_nobias(k, x_norm, wk, seq_len, dim, kv_dim);
-                let wv = dequantize_int8_to_f32_scratch(
-                    &layer.wv_int8,
-                    &layer.wv_int8_scales,
-                    kv_dim,
-                    dim,
-                    &mut bufs.bf16_scratch,
-                );
-                kernels::linear_nobias(v, x_norm, wv, seq_len, dim, kv_dim);
-            }
-        } else {
-            kernels::linear_nobias(q, x_norm, &layer.wq_weight_f32_prefill, seq_len, dim, q_dim);
-            kernels::linear_nobias(
-                k,
-                x_norm,
-                &layer.wk_weight_f32_prefill,
-                seq_len,
-                dim,
-                kv_dim,
-            );
-            kernels::linear_nobias(
-                v,
-                x_norm,
-                &layer.wv_weight_f32_prefill,
-                seq_len,
-                dim,
-                kv_dim,
-            );
         }
 
         kernels::rms_norm_per_head(q, &layer.q_norm_weight, seq_len, n_heads, head_dim, eps);
@@ -886,9 +1075,41 @@ pub fn decoder_prefill(
         );
 
         let proj_out = &mut bufs.pref_proj_out[..seq_len * dim];
-        if layer.wo_weight_f32_prefill.is_empty() {
-            #[cfg(target_arch = "aarch64")]
-            {
+        if !layer.wo_weight_f32_prefill.is_empty() {
+            kernels::linear_nobias(
+                proj_out,
+                attn_out,
+                &layer.wo_weight_f32_prefill,
+                seq_len,
+                q_dim,
+                dim,
+            );
+        } else if !layer.wo_weight_bf16.is_null() {
+            unsafe {
+                kernels::linear_nobias_bf16_scratch(
+                    proj_out,
+                    attn_out,
+                    layer.wo_weight_bf16,
+                    seq_len,
+                    q_dim,
+                    dim,
+                    &mut bufs.bf16_scratch,
+                );
+            }
+        } else {
+            if use_f32_int8_prefill {
+                linear_nobias_int8_f32_scratch(
+                    proj_out,
+                    attn_out,
+                    &layer.wo_int8,
+                    &layer.wo_int8_scales,
+                    seq_len,
+                    q_dim,
+                    dim,
+                    &mut bufs.bf16_scratch,
+                    int8_prefill_tile_rows,
+                );
+            } else {
                 kernels::linear_nobias_int8_matmat(
                     proj_out,
                     attn_out,
@@ -901,26 +1122,6 @@ pub fn decoder_prefill(
                     &mut bufs.pref_x_scales,
                 );
             }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                let wo = dequantize_int8_to_f32_scratch(
-                    &layer.wo_int8,
-                    &layer.wo_int8_scales,
-                    dim,
-                    q_dim,
-                    &mut bufs.bf16_scratch,
-                );
-                kernels::linear_nobias(proj_out, attn_out, wo, seq_len, q_dim, dim);
-            }
-        } else {
-            kernels::linear_nobias(
-                proj_out,
-                attn_out,
-                &layer.wo_weight_f32_prefill,
-                seq_len,
-                q_dim,
-                dim,
-            );
         }
         kernels::add_inplace(&mut bufs.pref_x[..seq_len * dim], proj_out, seq_len * dim);
 
@@ -936,9 +1137,75 @@ pub fn decoder_prefill(
         );
 
         let gate_up = &mut bufs.pref_gate_up[..seq_len * 2 * intermediate];
-        if layer.gate_up_fused_f32_prefill.is_empty() {
-            #[cfg(target_arch = "aarch64")]
-            {
+        if !layer.gate_up_fused_f32_prefill.is_empty() {
+            kernels::linear_nobias(
+                gate_up,
+                x_norm2,
+                &layer.gate_up_fused_f32_prefill,
+                seq_len,
+                dim,
+                2 * intermediate,
+            );
+        } else if !layer.gate_up_fused_bf16.is_empty() {
+            unsafe {
+                kernels::linear_nobias_bf16_scratch(
+                    gate_up,
+                    x_norm2,
+                    layer.gate_up_fused_bf16.as_ptr(),
+                    seq_len,
+                    dim,
+                    2 * intermediate,
+                    &mut bufs.bf16_scratch,
+                );
+            }
+        } else if !layer.gate_weight_bf16.is_null() && !layer.up_weight_bf16.is_null() {
+            // Reuse existing activation buffers for the two projections, then
+            // interleave their outputs for the established vectorized SwiGLU.
+            // This avoids retaining a duplicate BF16 gate/up weight matrix.
+            let gate_values = &mut bufs.pref_gate[..seq_len * intermediate];
+            let up_values = &mut bufs.pref_up[..seq_len * intermediate];
+            unsafe {
+                kernels::linear_nobias_bf16_scratch(
+                    gate_values,
+                    x_norm2,
+                    layer.gate_weight_bf16,
+                    seq_len,
+                    dim,
+                    intermediate,
+                    &mut bufs.bf16_scratch,
+                );
+                kernels::linear_nobias_bf16_scratch(
+                    up_values,
+                    x_norm2,
+                    layer.up_weight_bf16,
+                    seq_len,
+                    dim,
+                    intermediate,
+                    &mut bufs.bf16_scratch,
+                );
+            }
+            for s in 0..seq_len {
+                let src = s * intermediate;
+                let dst = s * 2 * intermediate;
+                for j in 0..intermediate {
+                    gate_up[dst + 2 * j] = gate_values[src + j];
+                    gate_up[dst + 2 * j + 1] = up_values[src + j];
+                }
+            }
+        } else {
+            if use_f32_int8_prefill {
+                linear_nobias_int8_f32_scratch(
+                    gate_up,
+                    x_norm2,
+                    &layer.gate_up_int8,
+                    &layer.gate_up_int8_scales,
+                    seq_len,
+                    dim,
+                    2 * intermediate,
+                    &mut bufs.bf16_scratch,
+                    int8_prefill_tile_rows,
+                );
+            } else {
                 kernels::linear_nobias_int8_matmat(
                     gate_up,
                     x_norm2,
@@ -951,42 +1218,47 @@ pub fn decoder_prefill(
                     &mut bufs.pref_x_scales,
                 );
             }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                let gate_up_weight = dequantize_int8_to_f32_scratch(
-                    &layer.gate_up_int8,
-                    &layer.gate_up_int8_scales,
-                    2 * intermediate,
-                    dim,
-                    &mut bufs.bf16_scratch,
-                );
-                kernels::linear_nobias(
-                    gate_up,
-                    x_norm2,
-                    gate_up_weight,
-                    seq_len,
-                    dim,
-                    2 * intermediate,
-                );
-            }
-        } else {
-            kernels::linear_nobias(
-                gate_up,
-                x_norm2,
-                &layer.gate_up_fused_f32_prefill,
-                seq_len,
-                dim,
-                2 * intermediate,
-            );
         }
 
         let gate = &mut bufs.pref_gate[..seq_len * intermediate];
         kernels::swiglu_multiply(gate, gate_up, seq_len, intermediate);
 
         let ffn_out = &mut bufs.pref_ffn_out[..seq_len * dim];
-        if layer.down_weight_f32_prefill.is_empty() {
-            #[cfg(target_arch = "aarch64")]
-            {
+        if !layer.down_weight_f32_prefill.is_empty() {
+            kernels::linear_nobias(
+                ffn_out,
+                gate,
+                &layer.down_weight_f32_prefill,
+                seq_len,
+                intermediate,
+                dim,
+            );
+        } else if !layer.down_weight_bf16.is_null() {
+            unsafe {
+                kernels::linear_nobias_bf16_scratch(
+                    ffn_out,
+                    gate,
+                    layer.down_weight_bf16,
+                    seq_len,
+                    intermediate,
+                    dim,
+                    &mut bufs.bf16_scratch,
+                );
+            }
+        } else {
+            if use_f32_int8_prefill {
+                linear_nobias_int8_f32_scratch(
+                    ffn_out,
+                    gate,
+                    &layer.down_int8,
+                    &layer.down_int8_scales,
+                    seq_len,
+                    intermediate,
+                    dim,
+                    &mut bufs.bf16_scratch,
+                    int8_prefill_tile_rows,
+                );
+            } else {
                 kernels::linear_nobias_int8_matmat(
                     ffn_out,
                     gate,
@@ -999,26 +1271,6 @@ pub fn decoder_prefill(
                     &mut bufs.pref_x_scales,
                 );
             }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                let down = dequantize_int8_to_f32_scratch(
-                    &layer.down_int8,
-                    &layer.down_int8_scales,
-                    dim,
-                    intermediate,
-                    &mut bufs.bf16_scratch,
-                );
-                kernels::linear_nobias(ffn_out, gate, down, seq_len, intermediate, dim);
-            }
-        } else {
-            kernels::linear_nobias(
-                ffn_out,
-                gate,
-                &layer.down_weight_f32_prefill,
-                seq_len,
-                intermediate,
-                dim,
-            );
         }
         kernels::add_inplace(&mut bufs.pref_x[..seq_len * dim], ffn_out, seq_len * dim);
     }
@@ -1257,8 +1509,28 @@ pub fn decoder_forward(
     if let (Some(ref int8_data), Some(ref scales)) =
         (&decoder.lm_head_int8, &decoder.lm_head_int8_scales)
     {
-        return kernels::argmax_matvec_int8(&bufs.x[..dim], int8_data, scales, dim, lm_out_dim)
-            as i32;
+        let best = kernels::argmax_matvec_int8(&bufs.x[..dim], int8_data, scales, dim, lm_out_dim);
+        if std::env::var_os("QWEN_LOGIT_TRACE").is_some() {
+            let mut rows = vec![best];
+            if let Ok(ids) = std::env::var("QWEN_LOGIT_IDS") {
+                rows.extend(
+                    ids.split(',')
+                        .filter_map(|id| id.trim().parse::<usize>().ok())
+                        .filter(|&id| id < lm_out_dim),
+                );
+                rows.sort_unstable();
+                rows.dedup();
+            }
+            let logits =
+                kernels::matvec_int8_selected_logits(&bufs.x[..dim], int8_data, scales, dim, &rows);
+            eprintln!(
+                "LOGIT_TRACE pos={} best={} selected={:?}",
+                pos,
+                best,
+                rows.iter().copied().zip(logits).collect::<Vec<_>>()
+            );
+        }
+        return best as i32;
     }
 
     let lm_weight = decoder.lm_head_bf16.unwrap_or(decoder.tok_embeddings_bf16);
@@ -1335,25 +1607,46 @@ pub unsafe fn tok_embed_bf16_to_f32(
 /// # Safety
 /// The decoder must have either a valid tok_embeddings_bf16 pointer or valid
 /// lm_head_int8 + scales pointers.
-pub unsafe fn tok_embed_to_f32(
-    decoder: &Decoder,
-    dst: &mut [f32],
-    token_id: i32,
-    dim: usize,
-) {
+pub unsafe fn tok_embed_to_f32(decoder: &Decoder, dst: &mut [f32], token_id: i32, dim: usize) {
     if !decoder.tok_embeddings_bf16.is_null() {
         let src = std::slice::from_raw_parts(
             decoder.tok_embeddings_bf16.add(token_id as usize * dim),
             dim,
         );
         kernels::bf16_to_f32_buf(dst, src);
+    } else if let Some(ref int8_buf) = decoder.tok_embeddings_int8 {
+        let group_size = decoder.tok_embeddings_int8_group_size;
+        let groups_per_row = dim / group_size;
+        let token = token_id as usize;
+        let src = std::slice::from_raw_parts(int8_buf.as_ptr().add(token * dim), dim);
+        let scale_base = token * groups_per_row;
+        debug_assert!(scale_base + groups_per_row <= decoder.tok_embeddings_int8_scales_len);
+        for group in 0..groups_per_row {
+            let scale = std::ptr::read_unaligned(
+                decoder.tok_embeddings_int8_scales.add(scale_base + group),
+            );
+            let min = if decoder.tok_embeddings_int8_mins_len
+                == decoder.tok_embeddings_int8_scales_len
+            {
+                std::ptr::read_unaligned(decoder.tok_embeddings_int8_mins.add(scale_base + group))
+            } else {
+                0.0
+            };
+            let start = group * group_size;
+            for i in start..start + group_size {
+                dst[i] = if decoder.tok_embeddings_int8_mins_len
+                    == decoder.tok_embeddings_int8_scales_len
+                {
+                    ((src[i] as i16 + 128) as f32) * scale + min
+                } else {
+                    (src[i] as f32) * scale
+                };
+            }
+        }
     } else if let (Some(ref int8_buf), Some(ref scales)) =
         (&decoder.lm_head_int8, &decoder.lm_head_int8_scales)
     {
-        let src = std::slice::from_raw_parts(
-            int8_buf.as_ptr().add(token_id as usize * dim),
-            dim,
-        );
+        let src = std::slice::from_raw_parts(int8_buf.as_ptr().add(token_id as usize * dim), dim);
         let scale = scales[token_id as usize];
         for i in 0..dim {
             dst[i] = (src[i] as f32) * scale;

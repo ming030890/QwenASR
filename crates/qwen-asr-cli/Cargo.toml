@@ -21,6 +21,7 @@ path = "src/bin/bench_android.rs"
 [dependencies]
 ureq = "2"
 ctrlc = "3"
+libc = "0.2"
 
 [features]
 android-blas = ["qwen-asr/blas"]

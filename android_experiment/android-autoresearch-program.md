@@ -23,8 +23,15 @@ Secondary metrics:
 - `binary_size_bytes`: compiled size of the candidate binary.
 
 Guardrails:
-- `ptt_guardrail.wav` transcript must remain semantically and phonetically stable for `Hello,你好吗？已经坐低咗啦。`.
-- Common Voice average CER must not regress versus the baseline.
+- The benchmark binary must report `OpenBLAS`; builds using another BLAS backend
+  are not comparable or eligible for acceptance.
+- Every candidate transcript must exactly equal the controlled baseline transcript
+  for the corresponding audio file, including Unicode characters, capitalization,
+  whitespace, and punctuation.
+- Every repeated run within both baseline and candidate must produce the same transcript.
+- The candidate and baseline audio-file sets must be identical.
+- Common Voice average CER may still be reported diagnostically, but it cannot
+  override an exact-transcript failure.
 - Host Rust tests must continue to pass (`cargo test --release --test kernels --test audio`).
 - Android JNI production builds must not be broken.
 
@@ -98,7 +105,9 @@ Prompt/Language Policy:
 
 Stage 1 and Stage 2 serve as filters. Stage 3 defines the final acceptance gate.
 
-Stage 3 accepts a change if one of the target metrics gets improved by at least the specified threshold, provided there is no major regression in other metrics or accuracy (with inference latency regression capped at `2%`):
+Stage 3 accepts a change only if the exact-transcript gate passes and one of the
+target metrics improves by at least the specified threshold, provided there is
+no major regression in other metrics (with inference latency regression capped at `2%`):
 - **Latency (Inference):** Full Common Voice median `inference_ms` improves by at least `5%`.
 - **First Token Latency:** Median `first_token_ms` (decoder prefill) improves by at least `5%`.
 - **Memory Usage:** `memory_after_model_load_kb` or `peak_inference_rss_kb` improves by at least `10%`.
@@ -111,7 +120,9 @@ bench/android_compare.py --baseline-binary bench/android-baselines/BASELINE --la
 ```
 This triggers `bench/android_check_gate.py` to evaluate the thresholds and report the PASS/FAIL verdict.
 
-Startup, memory, or binary size wins must not regress full Common Voice median inference latency by more than `2%`, and transcripts must satisfy all phonetic guardrails.
+Startup, memory, or binary size wins must not regress full Common Voice median
+inference latency by more than `2%`. Any transcript mismatch automatically
+rejects the experiment regardless of the performance win.
 
 ---
 

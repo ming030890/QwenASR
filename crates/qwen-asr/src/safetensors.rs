@@ -227,6 +227,18 @@ impl SafetensorsFile {
         }
         Some((self.data_ptr(tensor) as *const i8, n))
     }
+
+    /// Get a zero-copy pointer to F32 tensor data in the mmap region.
+    pub fn get_f32_ptr(&self, tensor: &TensorMeta) -> Option<(*const f32, usize)> {
+        if tensor.dtype != Dtype::F32 {
+            return None;
+        }
+        let n = tensor.numel();
+        if n == 0 {
+            return None;
+        }
+        Some((self.data_ptr(tensor) as *const f32, n))
+    }
 }
 
 impl Drop for SafetensorsFile {
@@ -322,6 +334,12 @@ impl MultiSafetensors {
     pub fn get_i8_ptr(&self, name: &str) -> Option<(*const i8, usize)> {
         let (si, t) = self.find(name)?;
         self.shards[si].get_i8_ptr(t)
+    }
+
+    /// Convenience: zero-copy pointer into an F32 tensor in the mmap region.
+    pub fn get_f32_ptr(&self, name: &str) -> Option<(*const f32, usize)> {
+        let (si, t) = self.find(name)?;
+        self.shards[si].get_f32_ptr(t)
     }
 
     /// Return the dtype of a named tensor, or None if not found.

@@ -1,0 +1,265 @@
+{
+  "schema_version": 2,
+  "experiment_id": "018-mac-1.7b-no-bf16-gate-up",
+  "timestamp_utc": "2026-08-12T22:52:54+00:00",
+  "hypothesis": "Removing the owned BF16 gate/up fusion buffer further lowers 1.7B memory and startup work while separate BF16 prefill projections preserve exact output",
+  "change": "On ARM64 quantize gate/up separately into the fused INT8 decode format; during BF16 prefill project gate/up separately and interleave activations before SwiGLU",
+  "baseline": {
+    "reference": "015-mac-1.7b-prefill-scratch-ab",
+    "metrics_path": "/Users/tony/Documents/keyboard/QwenASR/experiments/qwen-inference-optimization/runs/015-mac-1.7b-prefill-scratch-ab/metrics.json",
+    "experiment_id": "015-mac-1.7b-prefill-scratch-ab"
+  },
+  "git": {
+    "revision": "46e7d709eddd479782bc24460f95bd2cc4716f75",
+    "short_revision": "46e7d70",
+    "dirty": true
+  },
+  "host": {
+    "system": "Darwin",
+    "release": "24.6.0",
+    "machine": "arm64",
+    "python": "3.13.7",
+    "logical_cpu_count": 10,
+    "model": "Mac mini",
+    "chip": "Apple M4",
+    "memory": "16 GB",
+    "os_version": "15.7.7"
+  },
+  "model": {
+    "path": "/Volumes/SSD/Qwen3-ASR-1.7B",
+    "detected_variant": "1.7B",
+    "expected_variant": "1.7B",
+    "inventory_sha256": "9fb23a12239e6a3917c36d17f0951731e5bacfdbe90bcb080fe8f421908da043",
+    "files": [
+      {
+        "path": ".gitattributes",
+        "bytes": 1519
+      },
+      {
+        "path": "README.md",
+        "bytes": 57456
+      },
+      {
+        "path": "chat_template.json",
+        "bytes": 1161
+      },
+      {
+        "path": "config.json",
+        "bytes": 6194
+      },
+      {
+        "path": "generation_config.json",
+        "bytes": 142
+      },
+      {
+        "path": "merges.txt",
+        "bytes": 1671853
+      },
+      {
+        "path": "model-00001-of-00002.safetensors",
+        "bytes": 4220320824
+      },
+      {
+        "path": "model-00002-of-00002.safetensors",
+        "bytes": 478200688
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "bytes": 64821
+      },
+      {
+        "path": "preprocessor_config.json",
+        "bytes": 330
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 12487
+      },
+      {
+        "path": "vocab.json",
+        "bytes": 2776833
+      }
+    ]
+  },
+  "input": "/Users/tony/Documents/keyboard/QwenASR/bench/android-assets",
+  "configuration": {
+    "launches": 3,
+    "runs_per_input": 3,
+    "threads": 1,
+    "language": "Auto",
+    "prompt": "音频是粤语，可能夹杂英语",
+    "binary": "/Users/tony/Documents/keyboard/QwenASR/target/release/qwen-asr-bench-android",
+    "benchmark_optimization_flags": [
+      "OpenBLAS",
+      "vDSP/Accelerate",
+      "NEON",
+      "DotProd"
+    ],
+    "required_backend": "OpenBLAS"
+  },
+  "summary": {
+    "inference_latency_ms": {
+      "median": 918.755,
+      "p95": 1058.608,
+      "min": 748.886,
+      "max": 1135.929,
+      "samples": 54
+    },
+    "wall_inference_latency_ms": {
+      "median": 1000.052,
+      "p95": 1139.449
+    },
+    "model_load_ms": {
+      "median": 544.268,
+      "first_launch": 540.84,
+      "min": 540.84,
+      "max": 558.739,
+      "samples": 3
+    },
+    "phase_medians_ms": {
+      "mel": 0.202,
+      "encoder": 87.25450000000001,
+      "prefill": 371.9205,
+      "decode_loop": 414.7935
+    },
+    "transcripts": [
+      "我急求方法啊！",
+      "唔做嘢嘅佔多數咯。",
+      "證據嘅話，真係冇啊！",
+      "你睇下呢部剧。",
+      "仲要提供乜嘢資料？",
+      "Hello，你好嘛？已经坐低咗啦。"
+    ],
+    "transcripts_by_input": {
+      "cv_yue_000.wav": {
+        "canonical": "我急求方法啊！",
+        "all_runs_equal": true,
+        "samples": 9,
+        "values": [
+          "我急求方法啊！",
+          "我急求方法啊！",
+          "我急求方法啊！",
+          "我急求方法啊！",
+          "我急求方法啊！",
+          "我急求方法啊！",
+          "我急求方法啊！",
+          "我急求方法啊！",
+          "我急求方法啊！"
+        ]
+      },
+      "cv_yue_001.wav": {
+        "canonical": "唔做嘢嘅佔多數咯。",
+        "all_runs_equal": true,
+        "samples": 9,
+        "values": [
+          "唔做嘢嘅佔多數咯。",
+          "唔做嘢嘅佔多數咯。",
+          "唔做嘢嘅佔多數咯。",
+          "唔做嘢嘅佔多數咯。",
+          "唔做嘢嘅佔多數咯。",
+          "唔做嘢嘅佔多數咯。",
+          "唔做嘢嘅佔多數咯。",
+          "唔做嘢嘅佔多數咯。",
+          "唔做嘢嘅佔多數咯。"
+        ]
+      },
+      "cv_yue_002.wav": {
+        "canonical": "證據嘅話，真係冇啊！",
+        "all_runs_equal": true,
+        "samples": 9,
+        "values": [
+          "證據嘅話，真係冇啊！",
+          "證據嘅話，真係冇啊！",
+          "證據嘅話，真係冇啊！",
+          "證據嘅話，真係冇啊！",
+          "證據嘅話，真係冇啊！",
+          "證據嘅話，真係冇啊！",
+          "證據嘅話，真係冇啊！",
+          "證據嘅話，真係冇啊！",
+          "證據嘅話，真係冇啊！"
+        ]
+      },
+      "cv_yue_003.wav": {
+        "canonical": "你睇下呢部剧。",
+        "all_runs_equal": true,
+        "samples": 9,
+        "values": [
+          "你睇下呢部剧。",
+          "你睇下呢部剧。",
+          "你睇下呢部剧。",
+          "你睇下呢部剧。",
+          "你睇下呢部剧。",
+          "你睇下呢部剧。",
+          "你睇下呢部剧。",
+          "你睇下呢部剧。",
+          "你睇下呢部剧。"
+        ]
+      },
+      "cv_yue_004.wav": {
+        "canonical": "仲要提供乜嘢資料？",
+        "all_runs_equal": true,
+        "samples": 9,
+        "values": [
+          "仲要提供乜嘢資料？",
+          "仲要提供乜嘢資料？",
+          "仲要提供乜嘢資料？",
+          "仲要提供乜嘢資料？",
+          "仲要提供乜嘢資料？",
+          "仲要提供乜嘢資料？",
+          "仲要提供乜嘢資料？",
+          "仲要提供乜嘢資料？",
+          "仲要提供乜嘢資料？"
+        ]
+      },
+      "ptt_guardrail.wav": {
+        "canonical": "Hello，你好嘛？已经坐低咗啦。",
+        "all_runs_equal": true,
+        "samples": 9,
+        "values": [
+          "Hello，你好嘛？已经坐低咗啦。",
+          "Hello，你好嘛？已经坐低咗啦。",
+          "Hello，你好嘛？已经坐低咗啦。",
+          "Hello，你好嘛？已经坐低咗啦。",
+          "Hello，你好嘛？已经坐低咗啦。",
+          "Hello，你好嘛？已经坐低咗啦。",
+          "Hello，你好嘛？已经坐低咗啦。",
+          "Hello，你好嘛？已经坐低咗啦。",
+          "Hello，你好嘛？已经坐低咗啦。"
+        ]
+      }
+    }
+  },
+  "acceptance": {
+    "transcript_gate": {
+      "rule": "Every transcript must exactly equal the baseline, including case, spacing, and punctuation.",
+      "candidate_runs_internally_equal": true,
+      "baseline_runs_internally_equal": true,
+      "same_input_set": true,
+      "exact_transcript_match": true,
+      "passed": true,
+      "mismatches": [],
+      "mode": "candidate-comparison"
+    },
+    "eligible_for_performance_acceptance": true
+  },
+  "memory": {
+    "after_model_load_bytes_median": 5212258304,
+    "peak_rss_bytes": 6160777216,
+    "peak_rss_bytes_by_launch": [
+      6160777216,
+      6150651904,
+      6156451840
+    ],
+    "source": "benchmark process sampler"
+  },
+  "file_size": {
+    "model_total_bytes": 4703114308,
+    "model_weight_bytes": 4698521512,
+    "runtime_binary_bytes": 1750352
+  },
+  "raw_launch_files": [
+    "raw/launch-001.json",
+    "raw/launch-002.json",
+    "raw/launch-003.json"
+  ]
+}

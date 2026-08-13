@@ -719,6 +719,7 @@ version = "0.7.0"
 dependencies = [
  "coreaudio-sys",
  "ctrlc",
+ "libc",
  "qwen-asr",
  "ureq",
 ]

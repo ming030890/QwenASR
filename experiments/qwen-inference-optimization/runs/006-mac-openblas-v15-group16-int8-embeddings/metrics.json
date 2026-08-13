@@ -1,0 +1,237 @@
+{
+  "schema_version": 2,
+  "experiment_id": "006-mac-openblas-v15-group16-int8-embeddings",
+  "timestamp_utc": "2026-08-12T22:10:06+00:00",
+  "hypothesis": "Groupwise INT8 token embeddings recover exact transcripts while retaining a meaningful model-size reduction",
+  "change": "Replace BF16 token embeddings with symmetric INT8 values using one F32 scale per 16 values; retain the existing row-wise INT8 LM head",
+  "baseline": {
+    "reference": "004-mac-openblas-v15-int8-keep-embeddings-baseline",
+    "metrics_path": "/Users/tony/Documents/keyboard/QwenASR/experiments/qwen-inference-optimization/runs/004-mac-openblas-v15-int8-keep-embeddings-baseline/metrics.json",
+    "experiment_id": "004-mac-openblas-v15-int8-keep-embeddings-baseline"
+  },
+  "git": {
+    "revision": "46e7d709eddd479782bc24460f95bd2cc4716f75",
+    "short_revision": "46e7d70",
+    "dirty": true
+  },
+  "host": {
+    "system": "Darwin",
+    "release": "24.6.0",
+    "machine": "arm64",
+    "python": "3.13.7",
+    "logical_cpu_count": 10,
+    "model": "Mac mini",
+    "chip": "Apple M4",
+    "memory": "16 GB",
+    "os_version": "15.7.7"
+  },
+  "model": {
+    "path": "/Volumes/SSD/qwen-asr-m4-lmhead-int8-v15-lora-cp5000-group16",
+    "detected_variant": "0.6B",
+    "expected_variant": "0.6B",
+    "inventory_sha256": "aa47a6ec5b0e9123b9caf8ff1d9b1178b27f68c655d4d359453df04ef2ca6d72",
+    "files": [
+      {
+        "path": "merges.txt",
+        "bytes": 1671853
+      },
+      {
+        "path": "model.safetensors",
+        "bytes": 1165422409
+      },
+      {
+        "path": "vocab.json",
+        "bytes": 2776833
+      }
+    ]
+  },
+  "input": "/Users/tony/Documents/keyboard/QwenASR/bench/android-assets",
+  "configuration": {
+    "launches": 3,
+    "runs_per_input": 3,
+    "threads": 1,
+    "language": "Auto",
+    "prompt": "音频是粤语，可能夹杂英语",
+    "binary": "/Users/tony/Documents/keyboard/QwenASR/target/release/qwen-asr-bench-android",
+    "benchmark_optimization_flags": [
+      "OpenBLAS",
+      "vDSP/Accelerate",
+      "NEON",
+      "DotProd"
+    ],
+    "required_backend": "OpenBLAS"
+  },
+  "summary": {
+    "inference_latency_ms": {
+      "median": 476.019,
+      "p95": 653.16,
+      "min": 374.515,
+      "max": 1773.766,
+      "samples": 54
+    },
+    "wall_inference_latency_ms": {
+      "median": 557.2225000000001,
+      "p95": 735.727
+    },
+    "model_load_ms": {
+      "median": 10.914,
+      "first_launch": 119.618,
+      "min": 10.859,
+      "max": 119.618,
+      "samples": 3
+    },
+    "phase_medians_ms": {
+      "mel": 0.27849999999999997,
+      "encoder": 60.515,
+      "prefill": 301.3135,
+      "decode_loop": 90.3605
+    },
+    "transcripts": [
+      "我急求方法啊",
+      "唔做嘢嘅占多數囉",
+      "證據嘅話真係冇啊",
+      "你睇下呢部劇",
+      "重要提供乜嘢資料？",
+      "hello，你好嗎？已經坐低咗啦"
+    ],
+    "transcripts_by_input": {
+      "cv_yue_000.wav": {
+        "canonical": "我急求方法啊",
+        "all_runs_equal": true,
+        "samples": 9,
+        "values": [
+          "我急求方法啊",
+          "我急求方法啊",
+          "我急求方法啊",
+          "我急求方法啊",
+          "我急求方法啊",
+          "我急求方法啊",
+          "我急求方法啊",
+          "我急求方法啊",
+          "我急求方法啊"
+        ]
+      },
+      "cv_yue_001.wav": {
+        "canonical": "唔做嘢嘅占多數囉",
+        "all_runs_equal": true,
+        "samples": 9,
+        "values": [
+          "唔做嘢嘅占多數囉",
+          "唔做嘢嘅占多數囉",
+          "唔做嘢嘅占多數囉",
+          "唔做嘢嘅占多數囉",
+          "唔做嘢嘅占多數囉",
+          "唔做嘢嘅占多數囉",
+          "唔做嘢嘅占多數囉",
+          "唔做嘢嘅占多數囉",
+          "唔做嘢嘅占多數囉"
+        ]
+      },
+      "cv_yue_002.wav": {
+        "canonical": "證據嘅話真係冇啊",
+        "all_runs_equal": true,
+        "samples": 9,
+        "values": [
+          "證據嘅話真係冇啊",
+          "證據嘅話真係冇啊",
+          "證據嘅話真係冇啊",
+          "證據嘅話真係冇啊",
+          "證據嘅話真係冇啊",
+          "證據嘅話真係冇啊",
+          "證據嘅話真係冇啊",
+          "證據嘅話真係冇啊",
+          "證據嘅話真係冇啊"
+        ]
+      },
+      "cv_yue_003.wav": {
+        "canonical": "你睇下呢部劇",
+        "all_runs_equal": true,
+        "samples": 9,
+        "values": [
+          "你睇下呢部劇",
+          "你睇下呢部劇",
+          "你睇下呢部劇",
+          "你睇下呢部劇",
+          "你睇下呢部劇",
+          "你睇下呢部劇",
+          "你睇下呢部劇",
+          "你睇下呢部劇",
+          "你睇下呢部劇"
+        ]
+      },
+      "cv_yue_004.wav": {
+        "canonical": "重要提供乜嘢資料？",
+        "all_runs_equal": true,
+        "samples": 9,
+        "values": [
+          "重要提供乜嘢資料？",
+          "重要提供乜嘢資料？",
+          "重要提供乜嘢資料？",
+          "重要提供乜嘢資料？",
+          "重要提供乜嘢資料？",
+          "重要提供乜嘢資料？",
+          "重要提供乜嘢資料？",
+          "重要提供乜嘢資料？",
+          "重要提供乜嘢資料？"
+        ]
+      },
+      "ptt_guardrail.wav": {
+        "canonical": "hello，你好嗎？已經坐低咗啦",
+        "all_runs_equal": true,
+        "samples": 9,
+        "values": [
+          "hello，你好嗎？已經坐低咗啦",
+          "hello，你好嗎？已經坐低咗啦",
+          "hello，你好嗎？已經坐低咗啦",
+          "hello，你好嗎？已經坐低咗啦",
+          "hello，你好嗎？已經坐低咗啦",
+          "hello，你好嗎？已經坐低咗啦",
+          "hello，你好嗎？已經坐低咗啦",
+          "hello，你好嗎？已經坐低咗啦",
+          "hello，你好嗎？已經坐低咗啦"
+        ]
+      }
+    }
+  },
+  "acceptance": {
+    "transcript_gate": {
+      "rule": "Every transcript must exactly equal the baseline, including case, spacing, and punctuation.",
+      "candidate_runs_internally_equal": true,
+      "baseline_runs_internally_equal": true,
+      "same_input_set": true,
+      "exact_transcript_match": false,
+      "passed": false,
+      "mismatches": [
+        {
+          "input": "cv_yue_004.wav",
+          "baseline": "仲要提供乜嘢資料？",
+          "candidate_values": [
+            "重要提供乜嘢資料？"
+          ]
+        }
+      ],
+      "mode": "candidate-comparison"
+    },
+    "eligible_for_performance_acceptance": false
+  },
+  "memory": {
+    "after_model_load_bytes_median": 117391360,
+    "peak_rss_bytes": 1339326464,
+    "peak_rss_bytes_by_launch": [
+      1331838976,
+      1339326464,
+      1332985856
+    ],
+    "source": "benchmark process sampler"
+  },
+  "file_size": {
+    "model_total_bytes": 1169871095,
+    "model_weight_bytes": 1165422409,
+    "runtime_binary_bytes": 1731504
+  },
+  "raw_launch_files": [
+    "raw/launch-001.json",
+    "raw/launch-002.json",
+    "raw/launch-003.json"
+  ]
+}

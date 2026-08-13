@@ -9,7 +9,7 @@ pub mod neon;
 use std::thread;
 
 // BLAS extern bindings
-#[cfg(all(feature = "blas", target_vendor = "apple"))]
+#[cfg(all(feature = "blas", target_vendor = "apple", not(qwen_openblas)))]
 #[link(name = "Accelerate", kind = "framework")]
 extern "C" {
     fn cblas_sgemm(
@@ -63,7 +63,7 @@ extern "C" {
     fn vvexpf(dst: *mut f32, src: *const f32, n: *const i32);
 }
 
-#[cfg(all(feature = "blas", not(target_vendor = "apple")))]
+#[cfg(all(feature = "blas", any(not(target_vendor = "apple"), qwen_openblas)))]
 extern "C" {
     fn cblas_sgemm(
         order: i32,
@@ -782,6 +782,116 @@ pub fn linear_nobias(
     out_dim: usize,
 ) {
     linear(y, x, w, None, seq_len, in_dim, out_dim);
+}
+
+/// Write a contiguous range of output columns from `x @ W_tile.T` into a
+/// row-major output whose full row stride is `out_dim`.
+#[allow(clippy::too_many_arguments)]
+pub fn linear_nobias_output_tile(
+    y: &mut [f32],
+    x: &[f32],
+    w_tile: &[f32],
+    seq_len: usize,
+    in_dim: usize,
+    out_dim: usize,
+    out_start: usize,
+    tile_out_dim: usize,
+) {
+    debug_assert!(out_start + tile_out_dim <= out_dim);
+    debug_assert!(y.len() >= seq_len * out_dim);
+    debug_assert!(x.len() >= seq_len * in_dim);
+    debug_assert!(w_tile.len() >= tile_out_dim * in_dim);
+    let _pg = ProfileGuard::new(&PROF.sgemm);
+
+    #[cfg(feature = "blas")]
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_TRANS,
+            seq_len as i32,
+            tile_out_dim as i32,
+            in_dim as i32,
+            1.0,
+            x.as_ptr(),
+            in_dim as i32,
+            w_tile.as_ptr(),
+            in_dim as i32,
+            0.0,
+            y.as_mut_ptr().add(out_start),
+            out_dim as i32,
+        );
+    }
+
+    #[cfg(not(feature = "blas"))]
+    {
+        for s in 0..seq_len {
+            let x_row = &x[s * in_dim..(s + 1) * in_dim];
+            for tile_o in 0..tile_out_dim {
+                let w_row = &w_tile[tile_o * in_dim..(tile_o + 1) * in_dim];
+                let mut sum = 0.0f32;
+                for i in 0..in_dim {
+                    sum += x_row[i] * w_row[i];
+                }
+                y[s * out_dim + out_start + tile_o] = sum;
+            }
+        }
+    }
+}
+
+/// Accumulate a contiguous range of output columns from `x @ W_tile.T` into a
+/// row-major output whose full row stride is `out_dim`.
+#[allow(clippy::too_many_arguments)]
+pub fn linear_accumulate_output_tile(
+    y: &mut [f32],
+    x: &[f32],
+    w_tile: &[f32],
+    seq_len: usize,
+    in_dim: usize,
+    out_dim: usize,
+    out_start: usize,
+    tile_out_dim: usize,
+) {
+    debug_assert!(out_start + tile_out_dim <= out_dim);
+    debug_assert!(y.len() >= seq_len * out_dim);
+    debug_assert!(x.len() >= seq_len * in_dim);
+    debug_assert!(w_tile.len() >= tile_out_dim * in_dim);
+    let _pg = ProfileGuard::new(&PROF.sgemm);
+
+    #[cfg(feature = "blas")]
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_TRANS,
+            seq_len as i32,
+            tile_out_dim as i32,
+            in_dim as i32,
+            1.0,
+            x.as_ptr(),
+            in_dim as i32,
+            w_tile.as_ptr(),
+            in_dim as i32,
+            1.0,
+            y.as_mut_ptr().add(out_start),
+            out_dim as i32,
+        );
+    }
+
+    #[cfg(not(feature = "blas"))]
+    {
+        for s in 0..seq_len {
+            let x_row = &x[s * in_dim..(s + 1) * in_dim];
+            for tile_o in 0..tile_out_dim {
+                let w_row = &w_tile[tile_o * in_dim..(tile_o + 1) * in_dim];
+                let mut sum = 0.0f32;
+                for i in 0..in_dim {
+                    sum += x_row[i] * w_row[i];
+                }
+                y[s * out_dim + out_start + tile_o] += sum;
+            }
+        }
+    }
 }
 
 /// y += bias + x @ w.T  (accumulate into existing y, fusing residual add)
@@ -2917,6 +3027,29 @@ pub fn argmax_matvec_int8(
         );
         unimplemented!("INT8 argmax only implemented for aarch64")
     }
+}
+
+/// Compute selected INT8 lm-head logits using the same activation quantization
+/// as `argmax_matvec_int8`. Intended for opt-in decoding diagnostics.
+pub fn matvec_int8_selected_logits(
+    x: &[f32],
+    w_int8: &[i8],
+    w_scales: &[f32],
+    in_dim: usize,
+    rows: &[usize],
+) -> Vec<f32> {
+    let (x_int8, x_scale) = quantize_f32_to_int8(x);
+    rows.iter()
+        .map(|&row| {
+            let weights = &w_int8[row * in_dim..(row + 1) * in_dim];
+            let dot = x_int8
+                .iter()
+                .zip(weights)
+                .map(|(&a, &b)| (a as i32) * (b as i32))
+                .sum::<i32>();
+            dot as f32 * x_scale * w_scales[row]
+        })
+        .collect()
 }
 
 pub fn argmax_matvec_bf16(x: &[f32], w_bf16: *const u16, in_dim: usize, out_dim: usize) -> usize {

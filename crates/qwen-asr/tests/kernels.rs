@@ -273,3 +273,83 @@ fn test_linear_nobias_int8_matmat() {
         err
     );
 }
+
+#[test]
+fn test_linear_nobias_output_tiles_match_full_projection() {
+    let seq_len = 3;
+    let in_dim = 5;
+    let out_dim = 7;
+    let x: Vec<f32> = (0..seq_len * in_dim)
+        .map(|i| i as f32 * 0.07 - 0.4)
+        .collect();
+    let weights: Vec<f32> = (0..out_dim * in_dim)
+        .map(|i| i as f32 * 0.013 - 0.2)
+        .collect();
+
+    let mut expected = vec![0.0; seq_len * out_dim];
+    kernels::linear_nobias(&mut expected, &x, &weights, seq_len, in_dim, out_dim);
+
+    let mut tiled = vec![f32::NAN; seq_len * out_dim];
+    for out_start in (0..out_dim).step_by(3) {
+        let rows = 3.min(out_dim - out_start);
+        let start = out_start * in_dim;
+        let end = start + rows * in_dim;
+        kernels::linear_nobias_output_tile(
+            &mut tiled,
+            &x,
+            &weights[start..end],
+            seq_len,
+            in_dim,
+            out_dim,
+            out_start,
+            rows,
+        );
+    }
+
+    let err = max_abs_err(&expected, &tiled);
+    assert!(err < 1e-5, "tiled projection mismatch: max_err={err}");
+}
+
+#[test]
+fn test_linear_accumulate_output_tiles_match_full_projection() {
+    let seq_len = 3;
+    let in_dim = 5;
+    let out_dim = 7;
+    let x: Vec<f32> = (0..seq_len * in_dim)
+        .map(|i| i as f32 * 0.07 - 0.4)
+        .collect();
+    let weights: Vec<f32> = (0..out_dim * in_dim)
+        .map(|i| i as f32 * 0.013 - 0.2)
+        .collect();
+    let residual: Vec<f32> = (0..seq_len * out_dim)
+        .map(|i| i as f32 * 0.02 - 0.1)
+        .collect();
+
+    let mut projection = vec![0.0; seq_len * out_dim];
+    kernels::linear_nobias(&mut projection, &x, &weights, seq_len, in_dim, out_dim);
+    let expected: Vec<f32> = residual
+        .iter()
+        .zip(projection.iter())
+        .map(|(a, b)| a + b)
+        .collect();
+
+    let mut tiled = residual;
+    for out_start in (0..out_dim).step_by(3) {
+        let rows = 3.min(out_dim - out_start);
+        let start = out_start * in_dim;
+        let end = start + rows * in_dim;
+        kernels::linear_accumulate_output_tile(
+            &mut tiled,
+            &x,
+            &weights[start..end],
+            seq_len,
+            in_dim,
+            out_dim,
+            out_start,
+            rows,
+        );
+    }
+
+    let err = max_abs_err(&expected, &tiled);
+    assert!(err < 1e-5, "tiled accumulation mismatch: max_err={err}");
+}

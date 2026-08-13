@@ -72,10 +72,17 @@ pub mod transcribe;
 pub fn optimization_flags() -> Vec<&'static str> {
     let mut flags = Vec::new();
 
+    if cfg!(qwen_openblas) || (cfg!(feature = "blas") && !cfg!(target_vendor = "apple")) {
+        flags.push("OpenBLAS");
+    }
     if cfg!(feature = "vdsp") {
         flags.push("vDSP/Accelerate");
     }
-    if cfg!(feature = "blas") && !cfg!(feature = "vdsp") {
+    if cfg!(feature = "blas")
+        && !cfg!(feature = "vdsp")
+        && !cfg!(qwen_openblas)
+        && cfg!(target_vendor = "apple")
+    {
         flags.push("BLAS");
     }
 
