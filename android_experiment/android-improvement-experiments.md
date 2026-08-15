@@ -32,6 +32,7 @@ Each completed or evaluated experiment has its own markdown file in the `android
 | **K6** | I8MM decoder, fat LTO, and OpenBLAS 0.3.34 follow-ups. | Accept | [k6-i8mm-lto-openblas-pixel10.md](android-speed-results/k6-i8mm-lto-openblas-pixel10.md) |
 | **K7** | Offline I8MM packing for already-INT8 encoder matrices. | Accept | [k7-i8mm-packed-encoder-pixel10.md](android-speed-results/k7-i8mm-packed-encoder-pixel10.md) |
 | **K8** | Quantize and offline-pack every encoder linear matrix; convolution extension failed transcript gate. | Accept linear / reject convolution | [k8-full-encoder-linear-int8-pixel10.md](android-speed-results/k8-full-encoder-linear-int8-pixel10.md) |
+| **K9** | Apply the complete offline I8MM-packed format to the fine-tuned 0.6B mobile model. | Accept full linear INT8 | [k9-full-linear-int8-06b-pixel10.md](android-speed-results/k9-full-linear-int8-06b-pixel10.md) |
 
 ---
 
