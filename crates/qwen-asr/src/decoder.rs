@@ -55,20 +55,18 @@ impl std::ops::Deref for Int8Buf {
     }
 }
 
-#[cfg(feature = "kleidiai")]
-struct PackedInt8Buf {
+pub(crate) struct PackedInt8Buf {
     ptr: *const i8,
     len: usize,
 }
 
-#[cfg(feature = "kleidiai")]
 impl PackedInt8Buf {
-    fn from_mmap(ptr: *const i8, len: usize) -> Self {
+    #[cfg(feature = "kleidiai")]
+    pub(crate) fn from_mmap(ptr: *const i8, len: usize) -> Self {
         Self { ptr, len }
     }
 }
 
-#[cfg(feature = "kleidiai")]
 impl std::ops::Deref for PackedInt8Buf {
     type Target = [i8];
 

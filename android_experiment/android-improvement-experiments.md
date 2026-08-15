@@ -28,6 +28,9 @@ Each completed or evaluated experiment has its own markdown file in the `android
 | **M4** | Tied `lm_head` host-side pre-quantization (zero-copy lm_head).| Accept | [m4-tied-lm-head-int8.md](android-speed-results/m4-tied-lm-head-int8.md) |
 | **P0** | Phase-split benchmark timing instrumentation. | Infrastructure | [p0-phase-split-benchmark-timing.md](android-speed-results/p0-phase-split-benchmark-timing.md) |
 | **K4** | INT8 SDOT packed matmat prefill activation quantization. | Accept | [k4-int8-prefill-sdot.md](android-speed-results/k4-int8-prefill-sdot.md) |
+| **K5** | KleidiAI offline-packed decoder on Pixel 10. | Accept | [k5-kleidiai-offline-packed-pixel10.md](android-speed-results/k5-kleidiai-offline-packed-pixel10.md) |
+| **K6** | I8MM decoder, fat LTO, and OpenBLAS 0.3.34 follow-ups. | Accept | [k6-i8mm-lto-openblas-pixel10.md](android-speed-results/k6-i8mm-lto-openblas-pixel10.md) |
+| **K7** | Offline I8MM packing for already-INT8 encoder matrices. | Accept | [k7-i8mm-packed-encoder-pixel10.md](android-speed-results/k7-i8mm-packed-encoder-pixel10.md) |
 
 ---
 
@@ -41,35 +44,23 @@ This list acts as a prioritized backlog of upcoming optimization experiments. Ea
    - **Targets**: 1. Latency, 4. Memory usage (`encoder_ms`, `peak_rss_kb`)
    - **Why**: Use native Armv8.6 hardware instructions (FEAT_BF16) for BF16 math to execute forward passes directly on BF16 weights. This avoids the F32 unpacking step, allowing us to keep the encoder weights in memory-mapped BF16 (M3-style memory savings) without paying the 3.5% latency conversion penalty.
 
-2. **Encoder INT8 weights + native INT8 GEMM kernel (E1)**
-   - **Targets**: 1. Latency, 4. Memory usage (`encoder_ms`, `model_load_ms`, `memory_after_model_load_kb`)
-   - **Why**: Similar to the K4 decoder prefill optimization, pre-quantize encoder weights to INT8 on the host and run parallelized INT8 matrix-multiplication using native hardware `SDOT` (vdotq_s32) instructions. This reduces the encoder model footprint by 50% and leverages optimized SIMD INT8 execution.
-
-3. **KleidiAI (Arm) GEMM library integration (K2)**
-   - **Targets**: 1. Latency, 2. First token latency (`encoder_ms`, `prefill_ms`)
-   - **Why**: Integrate Arm's specialized KleidiAI library designed specifically for micro-architectural transformer GEMM optimization on Arm CPUs, serving as a high-performance alternative to OpenBLAS.
-
-4. **INT8/FP16 KV Cache Quantization (KV1)**
+2. **INT8/FP16 KV Cache Quantization (KV1)**
    - **Targets**: 1. Latency, 4. Memory usage (`peak_rss_kb`, `decode_loop_ms_per_token`)
    - **Why**: The 2048-token KV cache allocates up to ~470 MB of F32 buffer space across 28 layers. Quantizing KV cache keys and values to FP16 or INT8 (group-wise/channel-wise) reduces maximum cache memory overhead by 50-75% and improves memory bandwidth during the autoregressive decode loop.
 
-5. **Cargo Release Profile Tweaks: Debug Stripping & Panic Abort (CT2)**
+3. **Cargo Release Profile Tweaks: Debug Stripping & Panic Abort (CT2)**
    - **Targets**: 3. Binary size, 1. Latency (`binary_size_bytes`)
    - **Why**: Currently, the release profile does not strip symbols or abort on panic. Adding `strip = true` and `panic = "abort"` in `Cargo.toml` strips debugging information and removes panic unwinding tables from the dynamic library. This can reduce the dynamic library (.so) binary footprint on Android by 50-80% and generate tighter, faster assembly.
 
-6. **Compile-time LTO and codegen units optimization (CT1)**
-   - **Targets**: 1. Latency, 3. Binary size (`binary_size_bytes`)
-   - **Why**: Upgrade release profile from `lto = "thin"` to `lto = "fat"` and set `codegen-units = 1`. This forces inter-crate compiler optimization and inlining across the crate boundaries (`qwen-asr` vs `qwen-asr-cli`), improving code efficiency.
-
-7. **FP16 Activation/Quantization for Encoder (E2)**
+4. **FP16 Activation/Quantization for Encoder (E2)**
    - **Targets**: 1. Latency, 4. Memory usage (`encoder_ms`)
    - **Why**: Keep intermediate activation buffers in FP16 instead of F32. On CPUs with native FP16 (`+fp16`), this cuts memory bandwidth usage in half, reduces cache line pressure, and doubles FLOPS throughput.
 
-8. **Cache line alignment for weight buffers (CL1)**
+5. **Cache line alignment for weight buffers (CL1)**
    - **Targets**: 1. Latency (`encoder_ms`, `prefill_ms`)
    - **Why**: Align memory-mapped weights and internal buffers to 64/128-byte boundaries to prevent split cache line loads and cache bank conflicts on the CPU.
 
-9. **Custom vectorized Softmax kernel (K5)**
+6. **Custom vectorized Softmax kernel (S1)**
    - **Targets**: 1. Latency (`encoder_ms`, `decode_loop_ms_per_token`)
    - **Why**: Attention layers perform row-wise softmax. Implementing a custom vectorized Softmax kernel with ARM NEON intrinsics (and math approximations for exp) will speed up attention overhead compared to scalar code.
 
@@ -83,4 +74,3 @@ This list acts as a prioritized backlog of upcoming optimization experiments. Ea
   - *Reason for punting*: The thread sweeps in C2/C3 already isolated single-thread execution (`threads=1`) as optimal and rejected multi-threading. With custom kernels, OpenBLAS is being bypassed anyway.
 - **Overlapped Mel extraction and encoder forward (OL1)** (Latency)
   - *Reason for punting*: P0 phase timing proved that Mel extraction takes < 5 ms (under 1% of total inference time). Overlapping it would yield no noticeable performance gains.
-

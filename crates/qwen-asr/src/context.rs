@@ -111,7 +111,10 @@ impl QwenCtx {
         // Detect model variant from tensor shapes
         let info = crate::config::DetectInfo {
             has_enc_layer_18: ms
-                .has_tensor("thinker.audio_tower.layers.18.self_attn.q_proj.weight"),
+                .has_tensor("thinker.audio_tower.layers.18.self_attn.q_proj.weight")
+                || ms.has_tensor(
+                    "thinker.audio_tower.layers.18.self_attn.q_proj.weight_kleidiai_i8mm_packed",
+                ),
             lm_head_shape: ms
                 .find("thinker.lm_head.weight")
                 .map(|(_, t)| t.shape.as_slice()),

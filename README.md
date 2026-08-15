@@ -13,6 +13,7 @@ This repository is a highly-optimized fork of [antirez/qwen-asr](https://github.
 * **Dynamic Prefill Activation Quantization (`K4`):** Developed a custom dynamic quantization prefill kernel utilizing NEON `SDOT` (`vdotq_s32`) on `aarch64`, significantly accelerating prompt ingestion.
 * **Transient Prefill Dequantization (`M1`):** Optimized memory bandwidth by transiently dequantizing INT8 weights into a shared thread-local F32 scratch buffer during compute.
 * **Static OpenBLAS on Android:** Ported and optimized the engine for Android `arm64-v8a` environments, linking with a customized CBLAS-only static OpenBLAS target configuration.
+* **Offline I8MM-Packed Mobile Model:** Packed the accepted INT8 decoder and encoder matrices into their final KleidiAI I8MM layout in the model artifact, eliminating runtime packing and duplicate row-major copies.
 * **Same-Session Mobile Benchmark & Gate Checks:** Created an automated on-device testing and gate-check harness (`bench/android_run.py`, `bench/android_compare.py`, `bench/android_check_gate.py`) that monitors device thermals, enforces phonetic guardrails, and compares baseline vs. candidate builds on E2E latency, first-token latency, RSS/peak memory, and binary footprint.
 
 Supports 0.6B and 1.7B models with multiple modes: offline, segmented, streaming, live capture, VAD live, and forced alignment.

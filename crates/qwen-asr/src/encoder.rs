@@ -1,36 +1,42 @@
 //! Audio encoder: Conv2D stem + windowed transformer + projection cascade.
 
 use crate::config::*;
-use crate::decoder::Int8Buf;
+use crate::decoder::{Int8Buf, PackedInt8Buf};
 use crate::kernels;
 use crate::safetensors::{Dtype, MultiSafetensors};
 
 pub struct EncLayer {
     pub wq_weight_bf16: *const u16,
     pub wq_weight_int8: Option<Int8Buf>,
+    pub(crate) wq_weight_i8mm: Option<PackedInt8Buf>,
     pub wq_weight_int8_scales: Vec<f32>,
     pub wq_bias: Vec<f32>,
     pub wk_weight_bf16: *const u16,
     pub wk_weight_int8: Option<Int8Buf>,
+    pub(crate) wk_weight_i8mm: Option<PackedInt8Buf>,
     pub wk_weight_int8_scales: Vec<f32>,
     pub wk_bias: Vec<f32>,
     pub wv_weight_bf16: *const u16,
     pub wv_weight_int8: Option<Int8Buf>,
+    pub(crate) wv_weight_i8mm: Option<PackedInt8Buf>,
     pub wv_weight_int8_scales: Vec<f32>,
     pub wv_bias: Vec<f32>,
     pub wo_weight_bf16: *const u16,
     pub wo_weight_int8: Option<Int8Buf>,
+    pub(crate) wo_weight_i8mm: Option<PackedInt8Buf>,
     pub wo_weight_int8_scales: Vec<f32>,
     pub wo_bias: Vec<f32>,
     pub attn_norm_weight: Vec<f32>,
     pub attn_norm_bias: Vec<f32>,
     pub fc1_weight_bf16: *const u16,
     pub fc1_weight_int8: Option<Int8Buf>,
+    pub(crate) fc1_weight_i8mm: Option<PackedInt8Buf>,
     pub fc1_weight_int8_scales: Vec<f32>,
     pub fc1_weight_int8_group_size: usize,
     pub fc1_bias: Vec<f32>,
     pub fc2_weight_bf16: *const u16,
     pub fc2_weight_int8: Option<Int8Buf>,
+    pub(crate) fc2_weight_i8mm: Option<PackedInt8Buf>,
     pub fc2_weight_int8_scales: Vec<f32>,
     pub fc2_weight_int8_group_size: usize,
     pub fc2_bias: Vec<f32>,
@@ -172,15 +178,23 @@ fn load_bf16_direct(ms: &MultiSafetensors, name: &str) -> Option<*const u16> {
     ms.shards[si].get_bf16_direct(t)
 }
 
+type LoadedEncoderWeight = (
+    *const u16,
+    Option<Int8Buf>,
+    Option<PackedInt8Buf>,
+    Vec<f32>,
+    usize,
+);
+
 fn load_bf16_or_int8(
     ms: &MultiSafetensors,
     name: &str,
     out_dim: usize,
     in_dim: usize,
-) -> Option<(*const u16, Option<Int8Buf>, Vec<f32>, usize)> {
-    match ms.get_dtype(name)? {
-        Dtype::BF16 => Some((load_bf16_direct(ms, name)?, None, Vec::new(), 0)),
-        Dtype::I8 => {
+) -> Option<LoadedEncoderWeight> {
+    match ms.get_dtype(name) {
+        Some(Dtype::BF16) => Some((load_bf16_direct(ms, name)?, None, None, Vec::new(), 0)),
+        Some(Dtype::I8) => {
             let (ptr, len) = ms.get_i8_ptr(name)?;
             if len != out_dim * in_dim {
                 eprintln!(
@@ -202,7 +216,7 @@ fn load_bf16_or_int8(
                 return None;
             }
             let groups_per_row = scales.len() / out_dim;
-            if groups_per_row == 0 || in_dim % groups_per_row != 0 {
+            if groups_per_row == 0 || !in_dim.is_multiple_of(groups_per_row) {
                 eprintln!(
                     "encoder: invalid INT8 group count for {}: {} groups for input dim {}",
                     name, groups_per_row, in_dim
@@ -212,15 +226,40 @@ fn load_bf16_or_int8(
             Some((
                 std::ptr::null(),
                 Some(Int8Buf::from_mmap(ptr, len)),
+                None,
                 scales,
                 in_dim / groups_per_row,
             ))
         }
-        dtype => {
+        Some(dtype) => {
             eprintln!(
                 "encoder: unsupported weight dtype for {}: {:?}",
                 name, dtype
             );
+            None
+        }
+        None => {
+            #[cfg(feature = "kleidiai")]
+            {
+                let packed_name = format!("{name}_kleidiai_i8mm_packed");
+                if let Some((ptr, len)) = ms.get_i8_ptr(&packed_name) {
+                    let expected = kernels::kleidiai_packed_rhs_size(in_dim, out_dim);
+                    if len != expected {
+                        eprintln!(
+                            "encoder: invalid packed matrix {packed_name}: got {len}, expected {expected}"
+                        );
+                        return None;
+                    }
+                    return Some((
+                        std::ptr::null(),
+                        None,
+                        Some(PackedInt8Buf::from_mmap(ptr, len)),
+                        Vec::new(),
+                        0,
+                    ));
+                }
+            }
+            eprintln!("encoder: weight not found: {name}");
             None
         }
     }
@@ -303,6 +342,24 @@ fn linear_int8_f32_scratch(
     }
 }
 
+fn linear_i8mm(
+    y: &mut [f32],
+    x: &[f32],
+    packed: &Option<PackedInt8Buf>,
+    seq_len: usize,
+    in_dim: usize,
+    out_dim: usize,
+) -> bool {
+    #[cfg(feature = "kleidiai")]
+    if let Some(packed) = packed {
+        kernels::linear_nobias_int8_kleidiai(y, x, packed.as_ref(), seq_len, in_dim, out_dim);
+        return true;
+    }
+    #[cfg(not(feature = "kleidiai"))]
+    let _ = (y, x, packed, seq_len, in_dim, out_dim);
+    false
+}
+
 impl Encoder {
     pub fn load(ms: &MultiSafetensors, cfg: &QwenConfig) -> Option<Self> {
         let p = ENC_PREFIX;
@@ -319,21 +376,22 @@ impl Encoder {
         for i in 0..cfg.enc_layers {
             let lp = format!("{}layers.{}", p, i);
             let wq_name = format!("{}.self_attn.q_proj.weight", lp);
-            let (wq_weight_bf16, wq_weight_int8, wq_weight_int8_scales, _) =
+            let (wq_weight_bf16, wq_weight_int8, wq_weight_i8mm, wq_weight_int8_scales, _) =
                 load_bf16_or_int8(ms, &wq_name, cfg.enc_d_model, cfg.enc_d_model)?;
             let wk_name = format!("{}.self_attn.k_proj.weight", lp);
-            let (wk_weight_bf16, wk_weight_int8, wk_weight_int8_scales, _) =
+            let (wk_weight_bf16, wk_weight_int8, wk_weight_i8mm, wk_weight_int8_scales, _) =
                 load_bf16_or_int8(ms, &wk_name, cfg.enc_d_model, cfg.enc_d_model)?;
             let wv_name = format!("{}.self_attn.v_proj.weight", lp);
-            let (wv_weight_bf16, wv_weight_int8, wv_weight_int8_scales, _) =
+            let (wv_weight_bf16, wv_weight_int8, wv_weight_i8mm, wv_weight_int8_scales, _) =
                 load_bf16_or_int8(ms, &wv_name, cfg.enc_d_model, cfg.enc_d_model)?;
             let wo_name = format!("{}.self_attn.out_proj.weight", lp);
-            let (wo_weight_bf16, wo_weight_int8, wo_weight_int8_scales, _) =
+            let (wo_weight_bf16, wo_weight_int8, wo_weight_i8mm, wo_weight_int8_scales, _) =
                 load_bf16_or_int8(ms, &wo_name, cfg.enc_d_model, cfg.enc_d_model)?;
             let fc1_name = format!("{}.fc1.weight", lp);
             let (
                 fc1_weight_bf16,
                 fc1_weight_int8,
+                fc1_weight_i8mm,
                 fc1_weight_int8_scales,
                 fc1_weight_int8_group_size,
             ) = load_bf16_or_int8(ms, &fc1_name, cfg.enc_ffn_dim, cfg.enc_d_model)?;
@@ -341,6 +399,7 @@ impl Encoder {
             let (
                 fc2_weight_bf16,
                 fc2_weight_int8,
+                fc2_weight_i8mm,
                 fc2_weight_int8_scales,
                 fc2_weight_int8_group_size,
             ) = load_bf16_or_int8(ms, &fc2_name, cfg.enc_d_model, cfg.enc_ffn_dim)?;
@@ -348,29 +407,35 @@ impl Encoder {
             let layer = EncLayer {
                 wq_weight_bf16,
                 wq_weight_int8,
+                wq_weight_i8mm,
                 wq_weight_int8_scales,
                 wq_bias: load_f32(ms, &format!("{}.self_attn.q_proj.bias", lp))?,
                 wk_weight_bf16,
                 wk_weight_int8,
+                wk_weight_i8mm,
                 wk_weight_int8_scales,
                 wk_bias: load_f32(ms, &format!("{}.self_attn.k_proj.bias", lp))?,
                 wv_weight_bf16,
                 wv_weight_int8,
+                wv_weight_i8mm,
                 wv_weight_int8_scales,
                 wv_bias: load_f32(ms, &format!("{}.self_attn.v_proj.bias", lp))?,
                 wo_weight_bf16,
                 wo_weight_int8,
+                wo_weight_i8mm,
                 wo_weight_int8_scales,
                 wo_bias: load_f32(ms, &format!("{}.self_attn.out_proj.bias", lp))?,
                 attn_norm_weight: load_f32(ms, &format!("{}.self_attn_layer_norm.weight", lp))?,
                 attn_norm_bias: load_f32(ms, &format!("{}.self_attn_layer_norm.bias", lp))?,
                 fc1_weight_bf16,
                 fc1_weight_int8,
+                fc1_weight_i8mm,
                 fc1_weight_int8_scales,
                 fc1_weight_int8_group_size,
                 fc1_bias: load_f32(ms, &format!("{}.fc1.bias", lp))?,
                 fc2_weight_bf16,
                 fc2_weight_int8,
+                fc2_weight_i8mm,
                 fc2_weight_int8_scales,
                 fc2_weight_int8_group_size,
                 fc2_bias: load_f32(ms, &format!("{}.fc2.bias", lp))?,
@@ -606,7 +671,15 @@ impl Encoder {
                 1e-5,
             );
 
-            if let Some(ref weights) = layer.wq_weight_int8 {
+            if linear_i8mm(
+                &mut bufs.q[..td],
+                &bufs.x_norm[..td],
+                &layer.wq_weight_i8mm,
+                total_tokens,
+                d_model,
+                d_model,
+            ) {
+            } else if let Some(ref weights) = layer.wq_weight_int8 {
                 linear_int8_f32_scratch(
                     &mut bufs.q[..td],
                     &bufs.x_norm[..td],
@@ -635,7 +708,15 @@ impl Encoder {
                     );
                 }
             }
-            if let Some(ref weights) = layer.wk_weight_int8 {
+            if linear_i8mm(
+                &mut bufs.k[..td],
+                &bufs.x_norm[..td],
+                &layer.wk_weight_i8mm,
+                total_tokens,
+                d_model,
+                d_model,
+            ) {
+            } else if let Some(ref weights) = layer.wk_weight_int8 {
                 linear_int8_f32_scratch(
                     &mut bufs.k[..td],
                     &bufs.x_norm[..td],
@@ -664,7 +745,15 @@ impl Encoder {
                     );
                 }
             }
-            if let Some(ref weights) = layer.wv_weight_int8 {
+            if linear_i8mm(
+                &mut bufs.v[..td],
+                &bufs.x_norm[..td],
+                &layer.wv_weight_i8mm,
+                total_tokens,
+                d_model,
+                d_model,
+            ) {
+            } else if let Some(ref weights) = layer.wv_weight_int8 {
                 linear_int8_f32_scratch(
                     &mut bufs.v[..td],
                     &bufs.x_norm[..td],
@@ -708,7 +797,16 @@ impl Encoder {
             );
 
             // Fused: x += wo_bias + attn_out @ wo_weight.T
-            if let Some(ref weights) = layer.wo_weight_int8 {
+            if linear_i8mm(
+                &mut bufs.proj_out[..td],
+                &bufs.attn_out[..td],
+                &layer.wo_weight_i8mm,
+                total_tokens,
+                d_model,
+                d_model,
+            ) {
+                kernels::add_inplace(&mut bufs.x[..td], &bufs.proj_out[..td], td);
+            } else if let Some(ref weights) = layer.wo_weight_int8 {
                 linear_int8_f32_scratch(
                     &mut bufs.x[..td],
                     &bufs.attn_out[..td],
@@ -749,7 +847,15 @@ impl Encoder {
                 1e-5,
             );
 
-            if let Some(ref weights) = layer.fc1_weight_int8 {
+            if linear_i8mm(
+                &mut bufs.ffn_mid[..tf],
+                &bufs.x_norm[..td],
+                &layer.fc1_weight_i8mm,
+                total_tokens,
+                d_model,
+                ffn_dim,
+            ) {
+            } else if let Some(ref weights) = layer.fc1_weight_int8 {
                 linear_int8_f32_scratch(
                     &mut bufs.ffn_mid[..tf],
                     &bufs.x_norm[..td],
@@ -780,7 +886,16 @@ impl Encoder {
             }
             kernels::gelu(&mut bufs.ffn_mid[..tf], tf);
             // Fused: x += fc2_bias + ffn_mid @ fc2_weight.T
-            if let Some(ref weights) = layer.fc2_weight_int8 {
+            if linear_i8mm(
+                &mut bufs.ffn_out[..td],
+                &bufs.ffn_mid[..tf],
+                &layer.fc2_weight_i8mm,
+                total_tokens,
+                ffn_dim,
+                d_model,
+            ) {
+                kernels::add_inplace(&mut bufs.x[..td], &bufs.ffn_out[..td], td);
+            } else if let Some(ref weights) = layer.fc2_weight_int8 {
                 linear_int8_f32_scratch(
                     &mut bufs.x[..td],
                     &bufs.ffn_mid[..tf],

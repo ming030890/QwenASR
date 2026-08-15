@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Create an I8MM-packed-only Android Qwen model for the KleidiAI decoder backend.
+"""Create an I8MM-packed-only Android Qwen model for the KleidiAI backend.
 
-The output base model retains shared tensors but omits row-major decoder
-projection weights and scales. A second mmap-able safetensors file contains the
-complete I8MM-packed decoder layout used by both prefill and decode.
+The output base model retains shared tensors but omits every row-major INT8
+matrix and scale represented in the packed shard. A second mmap-able
+safetensors file contains the complete I8MM-packed decoder layout plus all
+already-quantized encoder attention and FFN matrices.
 """
 
 import argparse
@@ -18,13 +19,21 @@ import numpy as np
 from prepare_int8_model import get_tensor_np, read_safetensors
 
 
-PACKABLE_SUFFIXES = (
+DECODER_PACKABLE_SUFFIXES = (
     "self_attn.q_proj.weight",
     "self_attn.k_proj.weight",
     "self_attn.v_proj.weight",
     "self_attn.o_proj.weight",
     "mlp.gate_up_fused.weight",
     "mlp.down_proj.weight",
+)
+ENCODER_PACKABLE_SUFFIXES = (
+    "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.out_proj.weight",
+    "fc1.weight",
+    "fc2.weight",
 )
 PACKED_SUFFIX = "_kleidiai_i8mm_packed"
 
@@ -66,15 +75,37 @@ def load_kleidiai(path: Path):
     return lib
 
 
-def is_packable(name: str) -> bool:
-    return "thinker.model.layers." in name and name.endswith(PACKABLE_SUFFIXES)
+def is_decoder_packable(name: str) -> bool:
+    return "thinker.model.layers." in name and name.endswith(DECODER_PACKABLE_SUFFIXES)
 
 
-def is_removed_row_major_tensor(name: str) -> bool:
-    if is_packable(name):
+def is_encoder_packable(header: dict, name: str) -> bool:
+    return (
+        "thinker.audio_tower.layers." in name
+        and name.endswith(ENCODER_PACKABLE_SUFFIXES)
+        and header[name]["dtype"] == "I8"
+    )
+
+
+def is_packable(header: dict, name: str) -> bool:
+    return is_decoder_packable(name) or is_encoder_packable(header, name)
+
+
+def is_removed_row_major_tensor(header: dict, name: str) -> bool:
+    if is_packable(header, name):
         return True
     scale_suffix = "_int8_scale"
-    return name.endswith(scale_suffix) and is_packable(name[: -len(scale_suffix)])
+    return name.endswith(scale_suffix) and is_packable(header, name[: -len(scale_suffix)])
+
+
+def get_tensor_f32(header: dict, data: np.ndarray, name: str) -> np.ndarray:
+    tensor = get_tensor_np(header, data, name)
+    dtype = header[name]["dtype"]
+    if dtype == "BF16":
+        return (tensor.astype(np.uint32) << 16).view(np.float32)
+    if dtype in ("F16", "F32"):
+        return tensor.astype(np.float32)
+    raise ValueError(f"expected floating-point tensor for {name}, got {dtype}")
 
 
 def write_filtered_base_model(
@@ -83,7 +114,7 @@ def write_filtered_base_model(
     kept_names = [
         name
         for name in header
-        if name != "__metadata__" and not is_removed_row_major_tensor(name)
+        if name != "__metadata__" and not is_removed_row_major_tensor(header, name)
     ]
     filtered_header = {}
     if "__metadata__" in header:
@@ -141,9 +172,11 @@ def main() -> None:
             raise SystemExit(f"refusing to overwrite {path}")
 
     header, data = read_safetensors(str(source_dir / "model.safetensors"))
-    names = sorted(name for name in header if name != "__metadata__" and is_packable(name))
+    names = sorted(
+        name for name in header if name != "__metadata__" and is_packable(header, name)
+    )
     if not names:
-        raise SystemExit("no packed-decoder candidates found")
+        raise SystemExit("no I8MM packing candidates found")
 
     lib = load_kleidiai(Path(args.kleidiai_lib).resolve())
     nr = lib.kai_get_nr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm()
@@ -174,7 +207,12 @@ def main() -> None:
             scales = np.ascontiguousarray(
                 get_tensor_np(header, data, name + "_int8_scale"), dtype=np.float32
             )
-            bias = np.zeros(n, dtype=np.float32)
+            bias_name = name.removesuffix("weight") + "bias"
+            bias = (
+                np.ascontiguousarray(get_tensor_f32(header, data, bias_name))
+                if is_encoder_packable(header, name)
+                else np.zeros(n, dtype=np.float32)
+            )
             packed = np.empty(size, dtype=np.uint8)
             lib.kai_run_rhs_pack_nxk_qsi8cxp_qsi8cx_neon(
                 1,
