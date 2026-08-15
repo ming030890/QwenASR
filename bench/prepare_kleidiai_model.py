@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Create a Qwen model directory with offline KleidiAI-packed decoder weights.
+"""Create a packed-only Android Qwen model for the KleidiAI decoder backend.
 
-The source row-major INT8 tensors remain available for the existing one-token
-decode kernel. A second mmap-able safetensors file contains the DotProd-packed
-layout used by decoder prefill, avoiding all runtime RHS packing.
+The output base model retains shared tensors but omits row-major decoder
+projection weights and scales. A second mmap-able safetensors file contains the
+complete DotProd-packed decoder layout used by both prefill and decode.
 """
 
 import argparse
 import ctypes
 import json
 import os
+import shutil
 import struct
 from pathlib import Path
 
@@ -70,13 +71,58 @@ def is_packable(name: str) -> bool:
     return "thinker.model.layers." in name and name.endswith(PACKABLE_SUFFIXES)
 
 
-def link_source_files(source_dir: Path, output_dir: Path) -> None:
+def is_removed_row_major_tensor(name: str) -> bool:
+    if is_packable(name):
+        return True
+    scale_suffix = "_int8_scale"
+    return name.endswith(scale_suffix) and is_packable(name[: -len(scale_suffix)])
+
+
+def write_filtered_base_model(
+    path: Path, header: dict, data: np.ndarray
+) -> tuple[int, int]:
+    kept_names = [
+        name
+        for name in header
+        if name != "__metadata__" and not is_removed_row_major_tensor(name)
+    ]
+    filtered_header = {}
+    if "__metadata__" in header:
+        filtered_header["__metadata__"] = header["__metadata__"]
+
+    offset = 0
+    for name in kept_names:
+        meta = header[name]
+        start, end = meta["data_offsets"]
+        size = end - start
+        filtered_header[name] = {
+            "dtype": meta["dtype"],
+            "shape": meta["shape"],
+            "data_offsets": [offset, offset + size],
+        }
+        offset += size
+
+    header_bytes = json.dumps(filtered_header, separators=(",", ":")).encode("utf-8")
+    chunk_size = 64 * 1024 * 1024
+    with path.open("wb") as stream:
+        stream.write(struct.pack("<Q", len(header_bytes)))
+        stream.write(header_bytes)
+        for name in kept_names:
+            start, end = header[name]["data_offsets"]
+            for chunk_start in range(start, end, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, end)
+                stream.write(data[chunk_start:chunk_end].tobytes())
+
+    return len(kept_names), len(header) - (1 if "__metadata__" in header else 0) - len(kept_names)
+
+
+def copy_support_files(source_dir: Path, output_dir: Path) -> None:
     for source in source_dir.iterdir():
-        if not source.is_file() or source.name == "model.kleidiai.safetensors":
+        if not source.is_file() or "safetensors" in source.name:
             continue
         destination = output_dir / source.name
         if not destination.exists():
-            destination.symlink_to(source.resolve())
+            shutil.copy2(source, destination)
 
 
 def main() -> None:
@@ -90,8 +136,10 @@ def main() -> None:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "model.kleidiai.safetensors"
-    if output_path.exists():
-        raise SystemExit(f"refusing to overwrite {output_path}")
+    base_output_path = output_dir / "model.safetensors"
+    for path in (base_output_path, output_path):
+        if path.exists():
+            raise SystemExit(f"refusing to overwrite {path}")
 
     header, data = read_safetensors(str(source_dir / "model.safetensors"))
     names = sorted(name for name in header if name != "__metadata__" and is_packable(name))
@@ -146,7 +194,12 @@ def main() -> None:
             stream.write(packed.tobytes())
             print(f"[{index:3d}/{len(entries)}] {name}: {size / 1048576:.2f} MiB", flush=True)
 
-    link_source_files(source_dir, output_dir)
+    kept, removed = write_filtered_base_model(base_output_path, header, data)
+    copy_support_files(source_dir, output_dir)
+    print(
+        f"wrote {base_output_path} ({base_output_path.stat().st_size / 1048576:.2f} MiB; "
+        f"kept {kept} tensors, removed {removed})"
+    )
     print(f"wrote {output_path} ({output_path.stat().st_size / 1048576:.2f} MiB)")
 
 

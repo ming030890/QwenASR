@@ -19,6 +19,14 @@ unsafe impl Send for Int8Buf {}
 unsafe impl Sync for Int8Buf {}
 
 impl Int8Buf {
+    fn empty() -> Self {
+        Self {
+            ptr: std::ptr::null(),
+            len: 0,
+            _owned: Vec::new(),
+        }
+    }
+
     pub(crate) fn from_mmap(ptr: *const i8, len: usize) -> Self {
         Int8Buf {
             ptr,
@@ -169,9 +177,21 @@ fn load_i8_mmap(ms: &MultiSafetensors, name: &str) -> Option<Int8Buf> {
 }
 
 #[cfg(feature = "kleidiai")]
-fn load_kleidiai_weight(ms: &MultiSafetensors, name: &str) -> Option<PackedInt8Buf> {
+fn load_kleidiai_weight(
+    ms: &MultiSafetensors,
+    name: &str,
+    in_dim: usize,
+    out_dim: usize,
+) -> Option<PackedInt8Buf> {
     let packed_name = format!("{name}_kleidiai_dotprod_packed");
     let (ptr, len) = ms.get_i8_ptr(&packed_name)?;
+    let expected = kernels::kleidiai_packed_rhs_size(in_dim, out_dim);
+    if len != expected {
+        eprintln!(
+            "decoder: invalid packed projection {packed_name}: got {len} bytes, expected {expected}"
+        );
+        return None;
+    }
     Some(PackedInt8Buf::from_mmap(ptr, len))
 }
 
@@ -391,6 +411,10 @@ impl Decoder {
         };
         #[cfg(not(feature = "kleidiai"))]
         let decoder_backend = DecoderBackend::RowMajorInt8;
+        #[cfg(feature = "kleidiai")]
+        let use_packed_weights = decoder_backend == DecoderBackend::KleidiAiPacked;
+        #[cfg(not(feature = "kleidiai"))]
+        let use_packed_weights = false;
 
         if use_int8_weights {
             #[cfg(not(target_arch = "aarch64"))]
@@ -416,31 +440,54 @@ impl Decoder {
             let input_norm = load_f32(ms, &format!("{}.input_layernorm.weight", lp))?;
             let post_attn_norm = load_f32(ms, &format!("{}.post_attention_layernorm.weight", lp))?;
 
-            if use_int8_weights {
+            if use_packed_weights || use_int8_weights {
                 // INT8 model path: decoder projection weights stored as I8 + F32 scales.
                 // Zero-copy: raw pointers point directly into the mmap region — no heap copies.
                 // gate_up_fused is pre-interleaved by prepare_int8_model.py, so no runtime fusion.
-                let wq_int8 = load_i8_mmap(ms, &format!("{}.self_attn.q_proj.weight", lp))?;
-                let wq_int8_scales =
-                    load_f32(ms, &format!("{}.self_attn.q_proj.weight_int8_scale", lp))?;
-                let wk_int8 = load_i8_mmap(ms, &format!("{}.self_attn.k_proj.weight", lp))?;
-                let wk_int8_scales =
-                    load_f32(ms, &format!("{}.self_attn.k_proj.weight_int8_scale", lp))?;
-                let wv_int8 = load_i8_mmap(ms, &format!("{}.self_attn.v_proj.weight", lp))?;
-                let wv_int8_scales =
-                    load_f32(ms, &format!("{}.self_attn.v_proj.weight_int8_scale", lp))?;
-                let wo_int8 = load_i8_mmap(ms, &format!("{}.self_attn.o_proj.weight", lp))?;
-                let wo_int8_scales =
-                    load_f32(ms, &format!("{}.self_attn.o_proj.weight_int8_scale", lp))?;
-
-                // Pre-fused gate+up from model file (no runtime interleaving needed)
-                let gate_up_int8 = load_i8_mmap(ms, &format!("{}.mlp.gate_up_fused.weight", lp))?;
-                let gate_up_int8_scales =
-                    load_f32(ms, &format!("{}.mlp.gate_up_fused.weight_int8_scale", lp))?;
-
-                let down_int8 = load_i8_mmap(ms, &format!("{}.mlp.down_proj.weight", lp))?;
-                let down_int8_scales =
-                    load_f32(ms, &format!("{}.mlp.down_proj.weight_int8_scale", lp))?;
+                let (
+                    wq_int8,
+                    wq_int8_scales,
+                    wk_int8,
+                    wk_int8_scales,
+                    wv_int8,
+                    wv_int8_scales,
+                    wo_int8,
+                    wo_int8_scales,
+                    gate_up_int8,
+                    gate_up_int8_scales,
+                    down_int8,
+                    down_int8_scales,
+                ) = if use_packed_weights {
+                    (
+                        Int8Buf::empty(),
+                        Vec::new(),
+                        Int8Buf::empty(),
+                        Vec::new(),
+                        Int8Buf::empty(),
+                        Vec::new(),
+                        Int8Buf::empty(),
+                        Vec::new(),
+                        Int8Buf::empty(),
+                        Vec::new(),
+                        Int8Buf::empty(),
+                        Vec::new(),
+                    )
+                } else {
+                    (
+                        load_i8_mmap(ms, &format!("{}.self_attn.q_proj.weight", lp))?,
+                        load_f32(ms, &format!("{}.self_attn.q_proj.weight_int8_scale", lp))?,
+                        load_i8_mmap(ms, &format!("{}.self_attn.k_proj.weight", lp))?,
+                        load_f32(ms, &format!("{}.self_attn.k_proj.weight_int8_scale", lp))?,
+                        load_i8_mmap(ms, &format!("{}.self_attn.v_proj.weight", lp))?,
+                        load_f32(ms, &format!("{}.self_attn.v_proj.weight_int8_scale", lp))?,
+                        load_i8_mmap(ms, &format!("{}.self_attn.o_proj.weight", lp))?,
+                        load_f32(ms, &format!("{}.self_attn.o_proj.weight_int8_scale", lp))?,
+                        load_i8_mmap(ms, &format!("{}.mlp.gate_up_fused.weight", lp))?,
+                        load_f32(ms, &format!("{}.mlp.gate_up_fused.weight_int8_scale", lp))?,
+                        load_i8_mmap(ms, &format!("{}.mlp.down_proj.weight", lp))?,
+                        load_f32(ms, &format!("{}.mlp.down_proj.weight_int8_scale", lp))?,
+                    )
+                };
 
                 #[cfg(feature = "kleidiai")]
                 let (
@@ -455,26 +502,38 @@ impl Decoder {
                         Some(load_kleidiai_weight(
                             ms,
                             &format!("{}.self_attn.q_proj.weight", lp),
+                            hidden,
+                            q_dim,
                         )?),
                         Some(load_kleidiai_weight(
                             ms,
                             &format!("{}.self_attn.k_proj.weight", lp),
+                            hidden,
+                            kv_dim,
                         )?),
                         Some(load_kleidiai_weight(
                             ms,
                             &format!("{}.self_attn.v_proj.weight", lp),
+                            hidden,
+                            kv_dim,
                         )?),
                         Some(load_kleidiai_weight(
                             ms,
                             &format!("{}.self_attn.o_proj.weight", lp),
+                            q_dim,
+                            hidden,
                         )?),
                         Some(load_kleidiai_weight(
                             ms,
                             &format!("{}.mlp.gate_up_fused.weight", lp),
+                            hidden,
+                            2 * inter,
                         )?),
                         Some(load_kleidiai_weight(
                             ms,
                             &format!("{}.mlp.down_proj.weight", lp),
+                            inter,
+                            hidden,
                         )?),
                     )
                 } else {

@@ -1352,6 +1352,29 @@ fn int8_matvec_threaded(
 }
 
 #[cfg(feature = "kleidiai")]
+pub fn kleidiai_packed_rhs_size(in_dim: usize, out_dim: usize) -> usize {
+    unsafe extern "C" {
+        fn kai_get_nr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod() -> usize;
+        fn kai_get_kr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod() -> usize;
+        fn kai_get_sr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod() -> usize;
+        fn kai_get_rhs_packed_size_rhs_pack_nxk_qsi8cxp_qsi8cx_neon(
+            n: usize,
+            k: usize,
+            nr: usize,
+            kr: usize,
+            sr: usize,
+        ) -> usize;
+    }
+
+    unsafe {
+        let nr = kai_get_nr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod();
+        let kr = kai_get_kr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod();
+        let sr = kai_get_sr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod();
+        kai_get_rhs_packed_size_rhs_pack_nxk_qsi8cxp_qsi8cx_neon(out_dim, in_dim, nr, kr, sr)
+    }
+}
+
+#[cfg(feature = "kleidiai")]
 #[allow(clippy::too_many_arguments)]
 pub fn linear_nobias_int8_kleidiai(
     y: &mut [f32],
@@ -1365,20 +1388,12 @@ pub fn linear_nobias_int8_kleidiai(
 
     unsafe extern "C" {
         fn kai_get_mr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod() -> usize;
-        fn kai_get_nr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod() -> usize;
         fn kai_get_kr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod() -> usize;
         fn kai_get_sr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod() -> usize;
         fn kai_get_lhs_packed_size_lhs_quant_pack_qai8dxp_f32(
             m: usize,
             k: usize,
             mr: usize,
-            kr: usize,
-            sr: usize,
-        ) -> usize;
-        fn kai_get_rhs_packed_size_rhs_pack_nxk_qsi8cxp_qsi8cx_neon(
-            n: usize,
-            k: usize,
-            nr: usize,
             kr: usize,
             sr: usize,
         ) -> usize;
@@ -1412,13 +1427,11 @@ pub fn linear_nobias_int8_kleidiai(
 
     unsafe {
         let mr = kai_get_mr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod();
-        let nr = kai_get_nr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod();
         let kr = kai_get_kr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod();
         let sr = kai_get_sr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod();
         let lhs_size =
             kai_get_lhs_packed_size_lhs_quant_pack_qai8dxp_f32(seq_len, in_dim, mr, kr, sr);
-        let rhs_size =
-            kai_get_rhs_packed_size_rhs_pack_nxk_qsi8cxp_qsi8cx_neon(out_dim, in_dim, nr, kr, sr);
+        let rhs_size = kleidiai_packed_rhs_size(in_dim, out_dim);
         assert_eq!(
             rhs_packed.len(),
             rhs_size,
