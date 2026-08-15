@@ -2,7 +2,7 @@
 
 use crate::audio;
 use crate::config::*;
-use crate::context::QwenCtx;
+use crate::context::{QwenCtx, StaticPrefixKvCache};
 use crate::decoder::{self, tok_embed_to_f32};
 use crate::kernels;
 use crate::tokenizer::QwenTokenizer;
@@ -135,6 +135,7 @@ fn transcribe_segment(
     samples: &[f32],
     tokenizer: &QwenTokenizer,
     past_tokens: Option<&[i32]>,
+    inference_t0: f64,
 ) -> Option<(String, i32)> {
     let cfg = &ctx.config.clone();
     let dim = cfg.dec_hidden;
@@ -278,17 +279,53 @@ fn transcribe_segment(
 
     // Decoder prefill
     let t0 = get_time_ms();
-    ctx.kv_cache.len = 0;
     let prefill_len = total_seq - 1;
+    // Enabled by default; retain an explicit rollback switch for controlled A/Bs.
+    let use_static_prefix_cache = std::env::var("QWEN_STATIC_PREFIX_KV_CACHE")
+        .map(|value| value != "0")
+        .unwrap_or(true);
+    let mut prefix_tokens = Vec::with_capacity(prefix_len);
+    prefix_tokens.extend_from_slice(PREFIX_HEAD);
+    if let Some(ref tokens) = ctx.prompt_tokens {
+        prefix_tokens.extend_from_slice(tokens);
+    }
+    prefix_tokens.extend_from_slice(PREFIX_TAIL);
+
+    let reused_prefix = if use_static_prefix_cache {
+        if let Some(cache) = ctx
+            .static_prefix_kv_cache
+            .as_ref()
+            .filter(|cache| cache.tokens == prefix_tokens)
+        {
+            ctx.kv_cache.restore_prefix(prefix_len, &cache.k, &cache.v);
+            prefix_len
+        } else {
+            ctx.kv_cache.len = 0;
+            0
+        }
+    } else {
+        ctx.kv_cache.len = 0;
+        0
+    };
+
     decoder::decoder_prefill(
         &ctx.decoder,
         cfg,
         &mut ctx.kv_cache,
         &mut ctx.rope_cache,
         &mut ctx.dec_bufs,
-        &input_embeds,
-        prefill_len,
+        &input_embeds[reused_prefix * dim..],
+        prefill_len - reused_prefix,
     );
+
+    if use_static_prefix_cache && reused_prefix == 0 {
+        let (k, v) = ctx.kv_cache.snapshot_prefix(prefix_len);
+        ctx.static_prefix_kv_cache = Some(StaticPrefixKvCache {
+            tokens: prefix_tokens,
+            k,
+            v,
+        });
+    }
 
     // First token from last prefill position
     let last_embed = &input_embeds[prefill_len * dim..(prefill_len + 1) * dim];
@@ -334,6 +371,9 @@ fn transcribe_segment(
             n_text_tokens += 1;
 
             if let Some(piece) = push_utf8_piece(&mut callback_bytes, piece_bytes) {
+                if ctx.perf_first_visible_token_ms == 0.0 {
+                    ctx.perf_first_visible_token_ms = elapsed_ms(inference_t0);
+                }
                 if let Some(ref cb) = ctx.token_cb {
                     cb(&ctx.convert_chinese(&piece));
                 }
@@ -450,6 +490,7 @@ fn should_insert_boundary_space(prev_ch: u8, next_ch: u8) -> bool {
 /// Returns `None` if the tokenizer or encoder fails to initialize.
 pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
     ctx.reset_perf();
+    let inference_t0 = get_time_ms();
     ctx.perf_audio_ms = 1000.0 * samples.len() as f64 / SAMPLE_RATE as f64;
 
     let mut normalized_samples = samples.to_vec();
@@ -502,7 +543,7 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 
     // No splitting if segment_sec is 0 or audio fits in one segment
     if ctx.segment_sec <= 0.0 || audio_samples.len() <= target_samples + margin_samples {
-        let (text, _) = transcribe_segment(ctx, &audio_samples, &tokenizer, None)?;
+        let (text, _) = transcribe_segment(ctx, &audio_samples, &tokenizer, None, inference_t0)?;
         return Some(ctx.convert_chinese(&text));
     }
 
@@ -567,11 +608,16 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             None
         };
 
-        let (seg_text, _seg_text_tokens) =
-            match transcribe_segment(ctx, seg_ptr, &tokenizer, past_tokens.as_deref()) {
-                Some(r) => r,
-                None => continue,
-            };
+        let (seg_text, _seg_text_tokens) = match transcribe_segment(
+            ctx,
+            seg_ptr,
+            &tokenizer,
+            past_tokens.as_deref(),
+            inference_t0,
+        ) {
+            Some(r) => r,
+            None => continue,
+        };
 
         if seg_text.is_empty() {
             continue;
@@ -625,6 +671,7 @@ pub fn transcribe_stdin(ctx: &mut QwenCtx) -> Option<String> {
 /// Trades throughput for lower latency compared to offline mode. If no
 /// `token_cb` is set, falls back to a single offline decode of the full audio.
 pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
+    let inference_t0 = get_time_ms();
     let cfg = ctx.config.clone();
     let dim = cfg.dec_hidden;
     let chunk_samples = (ctx.stream_chunk_sec * SAMPLE_RATE as f32) as usize;
@@ -651,7 +698,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         };
         let tokenizer = load_tokenizer(&ctx.model_dir)?;
         ctx.prepare_prompt_tokens(&tokenizer);
-        let (text, _) = transcribe_segment(ctx, &audio_samples, &tokenizer, None)?;
+        let (text, _) = transcribe_segment(ctx, &audio_samples, &tokenizer, None, inference_t0)?;
         return Some(ctx.convert_chinese(&text));
     }
 

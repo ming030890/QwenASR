@@ -123,7 +123,13 @@ def collect_values(payloads: list[dict[str, Any]], input_path: Path) -> dict[str
     inference: list[float] = []
     wall_inference: list[float] = []
     model_load: list[float] = []
-    phase_names = ("mel_ms", "encoder_ms", "prefill_ms", "decode_loop_ms")
+    phase_names = (
+        "mel_ms",
+        "encoder_ms",
+        "prefill_ms",
+        "first_visible_token_ms",
+        "decode_loop_ms",
+    )
     phases: dict[str, list[float]] = {name: [] for name in phase_names}
     transcripts: list[str] = []
     transcript_runs: dict[str, list[str]] = {}
@@ -291,6 +297,8 @@ def write_experiment_md(
 | --- | ---: |
 | Median inference latency | {summary['inference_latency_ms']['median']:.3f} ms |
 | P95 inference latency | {summary['inference_latency_ms']['p95']:.3f} ms |
+| Median first-visible-token latency | {summary['phase_medians_ms'].get('first_visible_token') or 0.0:.3f} ms |
+| Median decoder prefill | {summary['phase_medians_ms'].get('prefill') or 0.0:.3f} ms |
 | Median model load time | {summary['model_load_ms']['median']:.3f} ms |
 | First-launch model load time | {summary['model_load_ms']['first_launch']:.3f} ms |
 | RSS after model load | {mib(metrics['memory']['after_model_load_bytes_median'])} MiB |
@@ -487,6 +495,15 @@ def main() -> None:
             "binary": str(args.binary),
             "benchmark_optimization_flags": payloads[0].get("optimization_flags", []),
             "required_backend": args.require_backend,
+            "benchmark_environment": {
+                name: os.environ.get(name)
+                for name in (
+                    "QWEN_INT8_PREFILL_F32",
+                    "QWEN_INT8_PREFILL_TILE_ROWS",
+                    "QWEN_STATIC_PREFIX_KV_CACHE",
+                )
+                if os.environ.get(name) is not None
+            },
         },
         "summary": summary,
         "acceptance": {

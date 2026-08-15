@@ -10,6 +10,12 @@ use crate::tokenizer::QwenTokenizer;
 
 pub type TokenCallback = Box<dyn Fn(&str) + Send>;
 
+pub(crate) struct StaticPrefixKvCache {
+    pub tokens: Vec<i32>,
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+}
+
 /// Top-level ASR engine state owning model weights, KV cache, and scratch buffers.
 ///
 /// Create with [`QwenCtx::load`], then pass to functions in the [`crate::transcribe`] module.
@@ -32,6 +38,7 @@ pub struct QwenCtx {
 
     // KV cache
     pub kv_cache: KvCache,
+    pub(crate) static_prefix_kv_cache: Option<StaticPrefixKvCache>,
 
     // Decoder buffers
     pub dec_bufs: DecoderBuffers,
@@ -79,6 +86,8 @@ pub struct QwenCtx {
     pub perf_mel_ms: f64,
     pub perf_encoder_ms: f64,
     pub perf_prefill_ms: f64,
+    /// Time from the start of transcription to the first complete UTF-8 text piece.
+    pub perf_first_visible_token_ms: f64,
     pub perf_decode_loop_ms: f64,
 }
 
@@ -152,7 +161,7 @@ impl QwenCtx {
         let decoder = Decoder::load(&ms, &cfg)?;
 
         let kv_cache = KvCache::new(cfg.dec_layers, 2048, cfg.dec_kv_heads, cfg.dec_head_dim);
-        let dec_bufs = DecoderBuffers::new(&cfg);
+        let dec_bufs = DecoderBuffers::new(&cfg, decoder.prefill_scratch_len(&cfg));
 
         if kernels::verbose() >= 1 {
             eprintln!("Model loaded.");
@@ -165,6 +174,7 @@ impl QwenCtx {
             _safetensors: ms,
             model_dir: model_dir.to_string(),
             kv_cache,
+            static_prefix_kv_cache: None,
             dec_bufs,
             enc_bufs: EncoderBuffers::new(),
             rope_cache: RopeCache::new(),
@@ -191,6 +201,7 @@ impl QwenCtx {
             perf_mel_ms: 0.0,
             perf_encoder_ms: 0.0,
             perf_prefill_ms: 0.0,
+            perf_first_visible_token_ms: 0.0,
             perf_decode_loop_ms: 0.0,
         })
     }
@@ -204,6 +215,7 @@ impl QwenCtx {
             self.prompt = Some(prompt.to_string());
         }
         self.prompt_tokens_ready = false;
+        self.static_prefix_kv_cache = None;
         Ok(())
     }
 
@@ -303,6 +315,7 @@ impl QwenCtx {
         self.perf_mel_ms = 0.0;
         self.perf_encoder_ms = 0.0;
         self.perf_prefill_ms = 0.0;
+        self.perf_first_visible_token_ms = 0.0;
         self.perf_decode_loop_ms = 0.0;
     }
 }

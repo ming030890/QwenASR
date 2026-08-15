@@ -23,6 +23,10 @@ Decoder projections and the tied LM head are stored mmap-ready as INT8, the
 duplicate BF16 token embedding is omitted, and prefill dequantizes only 256
 output rows at a time into reusable F32 scratch for OpenBLAS.
 
+The accepted prefill configuration is now the runtime default. Set
+`QWEN_INT8_PREFILL_F32=0` only for a diagnostic rollback; override
+`QWEN_INT8_PREFILL_TILE_ROWS` only for controlled tile-size experiments.
+
 Against the optimized BF16 candidate (`018`), it reduced peak RSS by 56.4%,
 model files by 49.8%, median inference latency by 5.4%, and P95 latency by 2.7%.
 All 54 repetitions were stable. The INT8 result differs from BF16 on one of six
@@ -36,14 +40,49 @@ known QAT debt; it is no longer the performance baseline.
 
 ## Latest encoder result
 
-Run `035-mac-1.7b-int8-encoder-ffn-l7-23` quantizes encoder FC1/FC2 weights in
-layers 7-23 to mmap-backed per-row INT8 while keeping layers 0-6, attention,
-the convolutional stem, and final projections BF16. Against baseline `025`, it
-reduced peak RSS by 5.4% and model files by 6.0%, improved encoder phase latency
-by 9.1%, and preserved all 54 exact transcripts. Run `032` established the
-current quality boundary: including encoder layer 6 changed one transcript.
-Use `025` as requested for the current experiment series; use `035` as the
-starting point and comparison baseline when continuing encoder-specific work.
+Run `045-mac-1.7b-int8-encoder-ffn-l7-attn-l1` stores encoder FC1/FC2 in layers
+7-23 and Q/K/V/output attention projections in layers 1-23 as mmap-backed
+per-row INT8. Layer 0 attention, layers 0-6 FFN, the convolutional stem, and
+final projections remain BF16. Against encoder comparison run `040`, it reduced
+peak RSS by another 1.0% (22.5 MiB), model files by 1.2% (23.9 MiB), and encoder
+latency by 4.8%, with effectively flat total latency and all 54 exact
+transcripts preserved. Cumulatively versus baseline `025`, the encoder work
+reduces peak RSS by 9.1%, model files by 10.1%, and encoder latency by 19.3%.
+Runs `041`-`044` isolated the attention quality boundary: quantizing layer 0
+changed one transcript's final punctuation, while starting at layer 1 passed.
+Run `032` separately established the FFN boundary: including layer 6 changed one
+transcript. Use `025` as requested for the overall experiment baseline; use
+`045` as the accepted comparison point for subsequent encoder-specific work.
+
+Run `038` sized decoder F32 prefill scratch to the active INT8 tile (6 MiB
+instead of 96 MiB). Exact transcripts passed, but peak RSS did not improve
+against the comparable `034` smoke run (2390.75 versus 2380.97 MiB), because
+the untouched zero-filled capacity was mostly lazy virtual memory. The bounded
+allocation is retained as hygiene, not counted as an RSS optimization.
+
+Phase-aware mmap eviction was implemented and measured in runs `036` and `037`.
+Full encoder/decoder eviction preserved transcripts but regressed latency 15.0%
+for only a 1.6% peak-RSS improvement versus `035`; encoder-only eviction
+regressed latency 7.4% for a 2.1% peak-RSS improvement. Both are rejected as
+defaults, and the runtime implementation was reverted. The measurements remain
+recorded so the approach is not repeated without evidence of different VM
+behavior on the target platform.
+
+## Latest first-token result
+
+Run `047-mac-1.7b-static-prefix-kv-cache` reuses a compact, exact K/V snapshot
+for `PREFIX_HEAD + prompt + PREFIX_TAIL` across utterances in the same context.
+Against same-revision control `046`, it reduced median first-visible-token
+latency by 11.6% (576.52 to 509.91 ms), decoder prefill by 19.7%, median total
+inference by 5.3%, and P95 inference by 6.4%. All 54 transcripts matched
+exactly. Peak RSS increased by 6.48 MiB (0.3%). The optimization is enabled by
+default; set `QWEN_STATIC_PREFIX_KV_CACHE=0` only for a diagnostic rollback
+comparison.
+
+The benchmark now records `first_visible_token_ms` separately from
+`prefill_ms`. It starts at transcription entry and ends when the decoder emits
+the first complete UTF-8 text piece; `prefill_ms` remains a decoder phase metric
+and must no longer be presented as user-visible TTFT.
 
 The runner defaults to requiring a model detected by the engine as `1.7B`; this
 prevents a 0.6B model with a similarly named or sized weight file from becoming

@@ -18,6 +18,7 @@ struct RunResult {
     mel_ms: f64,
     encoder_ms: f64,
     prefill_ms: f64,
+    first_visible_token_ms: f64,
     decode_loop_ms: f64,
     rss_before_kb: u64,
     rss_after_kb: u64,
@@ -254,7 +255,7 @@ fn run_details_json(runs: &[RunResult]) -> String {
                 0.0
             };
             format!(
-                "{{\"run\":{},\"inference_ms\":{:.3},\"wall_inference_ms\":{:.3},\"encode_ms\":{:.3},\"decode_ms\":{:.3},\"mel_ms\":{:.3},\"encoder_ms\":{:.3},\"prefill_ms\":{:.3},\"decode_loop_ms\":{:.3},\"decode_loop_ms_per_token\":{:.6},\"rss_before_kb\":{},\"rss_after_kb\":{},\"peak_rss_kb\":{},\"tokens\":{},\"rtf\":{:.6},\"transcript\":\"{}\",\"profile\":[{}]}}",
+                "{{\"run\":{},\"inference_ms\":{:.3},\"wall_inference_ms\":{:.3},\"encode_ms\":{:.3},\"decode_ms\":{:.3},\"mel_ms\":{:.3},\"encoder_ms\":{:.3},\"prefill_ms\":{:.3},\"first_visible_token_ms\":{:.3},\"decode_loop_ms\":{:.3},\"decode_loop_ms_per_token\":{:.6},\"rss_before_kb\":{},\"rss_after_kb\":{},\"peak_rss_kb\":{},\"tokens\":{},\"rtf\":{:.6},\"transcript\":\"{}\",\"profile\":[{}]}}",
                 run.run,
                 run.inference_ms,
                 run.wall_inference_ms,
@@ -263,6 +264,7 @@ fn run_details_json(runs: &[RunResult]) -> String {
                 run.mel_ms,
                 run.encoder_ms,
                 run.prefill_ms,
+                run.first_visible_token_ms,
                 run.decode_loop_ms,
                 decode_loop_ms_per_token,
                 run.rss_before_kb,
@@ -387,6 +389,7 @@ fn main() {
                 mel_ms: ctx.perf_mel_ms,
                 encoder_ms: ctx.perf_encoder_ms,
                 prefill_ms: ctx.perf_prefill_ms,
+                first_visible_token_ms: ctx.perf_first_visible_token_ms,
                 decode_loop_ms: ctx.perf_decode_loop_ms,
                 rss_before_kb,
                 rss_after_kb,
@@ -407,6 +410,7 @@ fn main() {
         let median_mel_ms = median_by(&file_runs, |run| run.mel_ms);
         let median_encoder_ms = median_by(&file_runs, |run| run.encoder_ms);
         let median_prefill_ms = median_by(&file_runs, |run| run.prefill_ms);
+        let median_first_visible_token_ms = median_by(&file_runs, |run| run.first_visible_token_ms);
         let median_decode_loop_ms = median_by(&file_runs, |run| run.decode_loop_ms);
         let median_tokens = median_by(&file_runs, |run| run.tokens as f64);
         let median_decode_loop_ms_per_token = if median_tokens > 0.0 {
@@ -421,7 +425,7 @@ fn main() {
         };
 
         file_json.push(format!(
-            "{{\"audio_path\":\"{}\",\"audio_load_ms\":{:.3},\"audio_s\":{:.6},\"median_run\":{},\"inference_ms\":{:.3},\"encode_ms\":{:.3},\"decode_ms\":{:.3},\"mel_ms\":{:.3},\"encoder_ms\":{:.3},\"prefill_ms\":{:.3},\"decode_loop_ms\":{:.3},\"decode_loop_ms_per_token\":{:.6},\"median_tokens\":{:.1},\"rtf\":{:.6},\"transcript\":\"{}\",\"run_details\":[{}]}}",
+            "{{\"audio_path\":\"{}\",\"audio_load_ms\":{:.3},\"audio_s\":{:.6},\"median_run\":{},\"inference_ms\":{:.3},\"encode_ms\":{:.3},\"decode_ms\":{:.3},\"mel_ms\":{:.3},\"encoder_ms\":{:.3},\"prefill_ms\":{:.3},\"first_visible_token_ms\":{:.3},\"decode_loop_ms\":{:.3},\"decode_loop_ms_per_token\":{:.6},\"median_tokens\":{:.1},\"rtf\":{:.6},\"transcript\":\"{}\",\"run_details\":[{}]}}",
             json_escape(&audio_path),
             audio_load_ms,
             audio_s,
@@ -432,6 +436,7 @@ fn main() {
             median_mel_ms,
             median_encoder_ms,
             median_prefill_ms,
+            median_first_visible_token_ms,
             median_decode_loop_ms,
             median_decode_loop_ms_per_token,
             median_tokens,

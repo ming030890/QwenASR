@@ -110,6 +110,18 @@ def is_encoder_ffn_weight(name: str) -> bool:
     )
 
 
+def is_encoder_attention_weight(name: str) -> bool:
+    return name.startswith("thinker.audio_tower.layers.") and any(
+        name.endswith(suffix)
+        for suffix in (
+            ".self_attn.q_proj.weight",
+            ".self_attn.k_proj.weight",
+            ".self_attn.v_proj.weight",
+            ".self_attn.out_proj.weight",
+        )
+    )
+
+
 def encoder_layer_index(name: str) -> int:
     return int(name.split("thinker.audio_tower.layers.", 1)[1].split(".", 1)[0])
 
@@ -119,10 +131,23 @@ def build_plan(
     sources: dict[str, SourceTensor],
     drop_embed_tokens: bool = False,
     int8_encoder_ffn: bool = False,
+    int8_encoder_attention: bool = False,
     encoder_ffn_group_size: int | None = None,
     encoder_ffn_layer_start: int = 0,
     encoder_ffn_layer_limit: int | None = None,
+    encoder_attention_layer_start: int | None = None,
+    encoder_attention_layer_limit: int | None = None,
 ) -> list[OutputTensor]:
+    attention_layer_start = (
+        encoder_ffn_layer_start
+        if encoder_attention_layer_start is None
+        else encoder_attention_layer_start
+    )
+    attention_layer_limit = (
+        encoder_ffn_layer_limit
+        if encoder_attention_layer_limit is None
+        else encoder_attention_layer_limit
+    )
     plan = []
     has_lm_head = LM_HEAD in sources
     if drop_embed_tokens and has_lm_head:
@@ -144,7 +169,24 @@ def build_plan(
                 or encoder_layer_index(name) < encoder_ffn_layer_limit
             )
         )
-        if quantize_encoder_ffn:
+        quantize_encoder_attention = (
+            int8_encoder_attention
+            and is_encoder_attention_weight(name)
+            and encoder_layer_index(name) >= attention_layer_start
+            and (
+                attention_layer_limit is None
+                or encoder_layer_index(name) < attention_layer_limit
+            )
+        )
+        if quantize_encoder_attention:
+            assert source.dtype == "BF16" and len(source.shape) == 2
+            plan.append(OutputTensor(name, "I8", source.shape, "quant", (name,)))
+            plan.append(
+                OutputTensor(
+                    name + "_int8_scale", "F32", [source.shape[0]], "scale", (name,)
+                )
+            )
+        elif quantize_encoder_ffn:
             assert source.dtype == "BF16" and len(source.shape) == 2
             if encoder_ffn_group_size:
                 if source.shape[1] % encoder_ffn_group_size != 0:
@@ -385,6 +427,21 @@ def main():
         action="store_true",
         help="quantize audio-encoder FC1/FC2 weights to per-row INT8",
     )
+    parser.add_argument(
+        "--int8-encoder-attention",
+        action="store_true",
+        help="quantize encoder Q/K/V/output projection weights to per-row INT8",
+    )
+    parser.add_argument(
+        "--encoder-attention-layer-start",
+        type=int,
+        help="first encoder layer whose attention projections are quantized (defaults to FFN start)",
+    )
+    parser.add_argument(
+        "--encoder-attention-layer-limit",
+        type=int,
+        help="exclusive encoder attention layer limit (defaults to FFN limit)",
+    )
     encoder_group.add_argument(
         "--int8-encoder-ffn-group-size",
         type=int,
@@ -419,9 +476,12 @@ def main():
         int8_encoder_ffn=bool(
             args.int8_encoder_ffn or args.int8_encoder_ffn_group_size
         ),
+        int8_encoder_attention=args.int8_encoder_attention,
         encoder_ffn_group_size=args.int8_encoder_ffn_group_size,
         encoder_ffn_layer_start=args.encoder_ffn_layer_start,
         encoder_ffn_layer_limit=args.encoder_ffn_layer_limit,
+        encoder_attention_layer_start=args.encoder_attention_layer_start,
+        encoder_attention_layer_limit=args.encoder_attention_layer_limit,
     )
 
     source_bytes = sum(source.end - source.start for source in sources.values())

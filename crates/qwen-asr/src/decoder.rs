@@ -199,6 +199,50 @@ fn linear_nobias_int8_f32_scratch(
 }
 
 impl Decoder {
+    /// F32 conversion scratch required by the active decoder representation.
+    /// Prequantized INT8 prefill only materializes one output-row tile at a
+    /// time; BF16 and aligner models retain the legacy full-matrix capacity.
+    pub fn prefill_scratch_len(&self, cfg: &QwenConfig) -> usize {
+        let dim = cfg.dec_hidden;
+        let q_dim = cfg.dec_heads * cfg.dec_head_dim;
+        let kv_dim = cfg.dec_kv_heads * cfg.dec_head_dim;
+        let intermediate = cfg.dec_intermediate;
+        let full = (2 * intermediate * dim).max(q_dim * dim).max(kv_dim * dim);
+        let prequantized = self.layers.iter().all(|layer| {
+            layer.wq_weight_bf16.is_null()
+                && layer.wk_weight_bf16.is_null()
+                && layer.wv_weight_bf16.is_null()
+                && layer.wo_weight_bf16.is_null()
+                && layer.gate_up_fused_bf16.is_empty()
+                && layer.down_weight_bf16.is_null()
+        });
+        if !prequantized || cfg.is_aligner() {
+            return full;
+        }
+
+        let use_f32_int8_prefill = std::env::var("QWEN_INT8_PREFILL_F32")
+            .map(|value| value != "0")
+            .unwrap_or(true);
+        if !use_f32_int8_prefill {
+            return 0;
+        }
+        let tile_rows = std::env::var("QWEN_INT8_PREFILL_TILE_ROWS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(256);
+        [
+            tile_rows.min(q_dim) * dim,
+            tile_rows.min(kv_dim) * dim,
+            tile_rows.min(dim) * q_dim,
+            tile_rows.min(2 * intermediate) * dim,
+            tile_rows.min(dim) * intermediate,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0)
+    }
+
     pub fn load(ms: &MultiSafetensors, cfg: &QwenConfig) -> Option<Self> {
         use crate::safetensors::Dtype;
 
@@ -610,6 +654,48 @@ impl KvCache {
         self.max_seq = new_max;
     }
 
+    /// Copy the first `len` positions into compact head-contiguous buffers.
+    pub fn snapshot_prefix(&self, len: usize) -> (Vec<f32>, Vec<f32>) {
+        assert!(len <= self.len);
+        let compact_head_stride = len * self.head_dim;
+        let total = self.n_layers * self.n_kv_heads * compact_head_stride;
+        let mut k = vec![0.0; total];
+        let mut v = vec![0.0; total];
+        let source_head_stride = self.head_stride();
+        for layer in 0..self.n_layers {
+            for head in 0..self.n_kv_heads {
+                let source = (layer * self.n_kv_heads + head) * source_head_stride;
+                let destination = (layer * self.n_kv_heads + head) * compact_head_stride;
+                k[destination..destination + compact_head_stride]
+                    .copy_from_slice(&self.k[source..source + compact_head_stride]);
+                v[destination..destination + compact_head_stride]
+                    .copy_from_slice(&self.v[source..source + compact_head_stride]);
+            }
+        }
+        (k, v)
+    }
+
+    /// Restore compact prefix buffers into the working cache.
+    pub fn restore_prefix(&mut self, len: usize, k: &[f32], v: &[f32]) {
+        self.grow(len);
+        let compact_head_stride = len * self.head_dim;
+        let expected = self.n_layers * self.n_kv_heads * compact_head_stride;
+        assert_eq!(k.len(), expected);
+        assert_eq!(v.len(), expected);
+        let destination_head_stride = self.head_stride();
+        for layer in 0..self.n_layers {
+            for head in 0..self.n_kv_heads {
+                let source = (layer * self.n_kv_heads + head) * compact_head_stride;
+                let destination = (layer * self.n_kv_heads + head) * destination_head_stride;
+                self.k[destination..destination + compact_head_stride]
+                    .copy_from_slice(&k[source..source + compact_head_stride]);
+                self.v[destination..destination + compact_head_stride]
+                    .copy_from_slice(&v[source..source + compact_head_stride]);
+            }
+        }
+        self.len = len;
+    }
+
     /// Write K for all heads at a given position (from interleaved kv_dim buffer).
     pub fn k_write_pos(&mut self, layer: usize, pos: usize, src: &[f32]) {
         let head_stride = self.max_seq * self.head_dim;
@@ -773,14 +859,11 @@ pub struct DecoderBuffers {
 }
 
 impl DecoderBuffers {
-    pub fn new(cfg: &QwenConfig) -> Self {
+    pub fn new(cfg: &QwenConfig, scratch_len: usize) -> Self {
         let dim = cfg.dec_hidden;
         let q_dim = cfg.dec_heads * cfg.dec_head_dim;
         let kv_dim = cfg.dec_kv_heads * cfg.dec_head_dim;
         let intermediate = cfg.dec_intermediate;
-
-        // Largest weight matrix is gate_up_fused: 2 * intermediate * hidden
-        let max_weight = (2 * intermediate * dim).max(q_dim * dim).max(kv_dim * dim);
 
         DecoderBuffers {
             x: vec![0.0f32; dim],
@@ -804,7 +887,7 @@ impl DecoderBuffers {
             pref_gate: Vec::new(),
             pref_up: Vec::new(),
             pref_seq_cap: 0,
-            bf16_scratch: vec![0.0f32; max_weight],
+            bf16_scratch: vec![0.0f32; scratch_len],
             pref_x_int8: Vec::new(),
             pref_x_scales: Vec::new(),
         }
@@ -872,13 +955,16 @@ pub fn decoder_prefill(
     // but dequantize only the current projection into the existing reusable
     // scratch buffer so prefill can use the platform's optimized F32 GEMM.
     // Non-aarch64 targets already require this fallback.
-    let use_f32_int8_prefill = cfg!(not(target_arch = "aarch64"))
-        || std::env::var("QWEN_INT8_PREFILL_F32").is_ok_and(|value| value == "1");
+    // The accepted INT8 baseline uses tiled F32 GEMM on every architecture.
+    // Set QWEN_INT8_PREFILL_F32=0 only for a diagnostic rollback comparison.
+    let use_f32_int8_prefill = std::env::var("QWEN_INT8_PREFILL_F32")
+        .map(|value| value != "0")
+        .unwrap_or(true);
     let int8_prefill_tile_rows = std::env::var("QWEN_INT8_PREFILL_TILE_ROWS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value > 0)
-        .unwrap_or(usize::MAX);
+        .unwrap_or(256);
 
     // Ensure KV cache
     let needed = kv_cache.len + seq_len;
@@ -1653,5 +1739,33 @@ pub unsafe fn tok_embed_to_f32(decoder: &Decoder, dst: &mut [f32], token_id: i32
         }
     } else {
         panic!("decoder has no token embeddings!");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KvCache;
+
+    #[test]
+    fn compact_prefix_snapshot_restores_exact_values() {
+        let mut cache = KvCache::new(2, 8, 2, 3);
+        cache.len = 4;
+        for (index, value) in cache.k.iter_mut().enumerate() {
+            *value = index as f32 + 0.25;
+        }
+        for (index, value) in cache.v.iter_mut().enumerate() {
+            *value = -(index as f32) - 0.5;
+        }
+
+        let (expected_k, expected_v) = cache.snapshot_prefix(3);
+        cache.k.fill(0.0);
+        cache.v.fill(0.0);
+        cache.len = 0;
+        cache.restore_prefix(3, &expected_k, &expected_v);
+
+        let (actual_k, actual_v) = cache.snapshot_prefix(3);
+        assert_eq!(actual_k, expected_k);
+        assert_eq!(actual_v, expected_v);
+        assert_eq!(cache.len, 3);
     }
 }

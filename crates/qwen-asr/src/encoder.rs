@@ -7,12 +7,20 @@ use crate::safetensors::{Dtype, MultiSafetensors};
 
 pub struct EncLayer {
     pub wq_weight_bf16: *const u16,
+    pub wq_weight_int8: Option<Int8Buf>,
+    pub wq_weight_int8_scales: Vec<f32>,
     pub wq_bias: Vec<f32>,
     pub wk_weight_bf16: *const u16,
+    pub wk_weight_int8: Option<Int8Buf>,
+    pub wk_weight_int8_scales: Vec<f32>,
     pub wk_bias: Vec<f32>,
     pub wv_weight_bf16: *const u16,
+    pub wv_weight_int8: Option<Int8Buf>,
+    pub wv_weight_int8_scales: Vec<f32>,
     pub wv_bias: Vec<f32>,
     pub wo_weight_bf16: *const u16,
+    pub wo_weight_int8: Option<Int8Buf>,
+    pub wo_weight_int8_scales: Vec<f32>,
     pub wo_bias: Vec<f32>,
     pub attn_norm_weight: Vec<f32>,
     pub attn_norm_bias: Vec<f32>,
@@ -310,6 +318,18 @@ impl Encoder {
         let mut layers = Vec::new();
         for i in 0..cfg.enc_layers {
             let lp = format!("{}layers.{}", p, i);
+            let wq_name = format!("{}.self_attn.q_proj.weight", lp);
+            let (wq_weight_bf16, wq_weight_int8, wq_weight_int8_scales, _) =
+                load_bf16_or_int8(ms, &wq_name, cfg.enc_d_model, cfg.enc_d_model)?;
+            let wk_name = format!("{}.self_attn.k_proj.weight", lp);
+            let (wk_weight_bf16, wk_weight_int8, wk_weight_int8_scales, _) =
+                load_bf16_or_int8(ms, &wk_name, cfg.enc_d_model, cfg.enc_d_model)?;
+            let wv_name = format!("{}.self_attn.v_proj.weight", lp);
+            let (wv_weight_bf16, wv_weight_int8, wv_weight_int8_scales, _) =
+                load_bf16_or_int8(ms, &wv_name, cfg.enc_d_model, cfg.enc_d_model)?;
+            let wo_name = format!("{}.self_attn.out_proj.weight", lp);
+            let (wo_weight_bf16, wo_weight_int8, wo_weight_int8_scales, _) =
+                load_bf16_or_int8(ms, &wo_name, cfg.enc_d_model, cfg.enc_d_model)?;
             let fc1_name = format!("{}.fc1.weight", lp);
             let (
                 fc1_weight_bf16,
@@ -326,13 +346,21 @@ impl Encoder {
             ) = load_bf16_or_int8(ms, &fc2_name, cfg.enc_d_model, cfg.enc_ffn_dim)?;
 
             let layer = EncLayer {
-                wq_weight_bf16: load_bf16_direct(ms, &format!("{}.self_attn.q_proj.weight", lp))?,
+                wq_weight_bf16,
+                wq_weight_int8,
+                wq_weight_int8_scales,
                 wq_bias: load_f32(ms, &format!("{}.self_attn.q_proj.bias", lp))?,
-                wk_weight_bf16: load_bf16_direct(ms, &format!("{}.self_attn.k_proj.weight", lp))?,
+                wk_weight_bf16,
+                wk_weight_int8,
+                wk_weight_int8_scales,
                 wk_bias: load_f32(ms, &format!("{}.self_attn.k_proj.bias", lp))?,
-                wv_weight_bf16: load_bf16_direct(ms, &format!("{}.self_attn.v_proj.weight", lp))?,
+                wv_weight_bf16,
+                wv_weight_int8,
+                wv_weight_int8_scales,
                 wv_bias: load_f32(ms, &format!("{}.self_attn.v_proj.bias", lp))?,
-                wo_weight_bf16: load_bf16_direct(ms, &format!("{}.self_attn.out_proj.weight", lp))?,
+                wo_weight_bf16,
+                wo_weight_int8,
+                wo_weight_int8_scales,
                 wo_bias: load_f32(ms, &format!("{}.self_attn.out_proj.bias", lp))?,
                 attn_norm_weight: load_f32(ms, &format!("{}.self_attn_layer_norm.weight", lp))?,
                 attn_norm_bias: load_f32(ms, &format!("{}.self_attn_layer_norm.bias", lp))?,
@@ -578,37 +606,92 @@ impl Encoder {
                 1e-5,
             );
 
-            unsafe {
-                kernels::linear_bf16_scratch(
+            if let Some(ref weights) = layer.wq_weight_int8 {
+                linear_int8_f32_scratch(
                     &mut bufs.q[..td],
                     &bufs.x_norm[..td],
-                    layer.wq_weight_bf16,
-                    Some(&layer.wq_bias),
+                    weights,
+                    &layer.wq_weight_int8_scales,
+                    &layer.wq_bias,
                     total_tokens,
                     d_model,
                     d_model,
                     &mut bufs.bf16_scratch,
+                    int8_tile_rows,
+                    d_model,
+                    false,
                 );
-                kernels::linear_bf16_scratch(
+            } else {
+                unsafe {
+                    kernels::linear_bf16_scratch(
+                        &mut bufs.q[..td],
+                        &bufs.x_norm[..td],
+                        layer.wq_weight_bf16,
+                        Some(&layer.wq_bias),
+                        total_tokens,
+                        d_model,
+                        d_model,
+                        &mut bufs.bf16_scratch,
+                    );
+                }
+            }
+            if let Some(ref weights) = layer.wk_weight_int8 {
+                linear_int8_f32_scratch(
                     &mut bufs.k[..td],
                     &bufs.x_norm[..td],
-                    layer.wk_weight_bf16,
-                    Some(&layer.wk_bias),
+                    weights,
+                    &layer.wk_weight_int8_scales,
+                    &layer.wk_bias,
                     total_tokens,
                     d_model,
                     d_model,
                     &mut bufs.bf16_scratch,
+                    int8_tile_rows,
+                    d_model,
+                    false,
                 );
-                kernels::linear_bf16_scratch(
+            } else {
+                unsafe {
+                    kernels::linear_bf16_scratch(
+                        &mut bufs.k[..td],
+                        &bufs.x_norm[..td],
+                        layer.wk_weight_bf16,
+                        Some(&layer.wk_bias),
+                        total_tokens,
+                        d_model,
+                        d_model,
+                        &mut bufs.bf16_scratch,
+                    );
+                }
+            }
+            if let Some(ref weights) = layer.wv_weight_int8 {
+                linear_int8_f32_scratch(
                     &mut bufs.v[..td],
                     &bufs.x_norm[..td],
-                    layer.wv_weight_bf16,
-                    Some(&layer.wv_bias),
+                    weights,
+                    &layer.wv_weight_int8_scales,
+                    &layer.wv_bias,
                     total_tokens,
                     d_model,
                     d_model,
                     &mut bufs.bf16_scratch,
+                    int8_tile_rows,
+                    d_model,
+                    false,
                 );
+            } else {
+                unsafe {
+                    kernels::linear_bf16_scratch(
+                        &mut bufs.v[..td],
+                        &bufs.x_norm[..td],
+                        layer.wv_weight_bf16,
+                        Some(&layer.wv_bias),
+                        total_tokens,
+                        d_model,
+                        d_model,
+                        &mut bufs.bf16_scratch,
+                    );
+                }
             }
 
             kernels::bidirectional_attention(
@@ -625,17 +708,34 @@ impl Encoder {
             );
 
             // Fused: x += wo_bias + attn_out @ wo_weight.T
-            unsafe {
-                kernels::linear_accumulate_bf16_scratch(
+            if let Some(ref weights) = layer.wo_weight_int8 {
+                linear_int8_f32_scratch(
                     &mut bufs.x[..td],
                     &bufs.attn_out[..td],
-                    layer.wo_weight_bf16,
-                    Some(&layer.wo_bias),
+                    weights,
+                    &layer.wo_weight_int8_scales,
+                    &layer.wo_bias,
                     total_tokens,
                     d_model,
                     d_model,
                     &mut bufs.bf16_scratch,
+                    int8_tile_rows,
+                    d_model,
+                    true,
                 );
+            } else {
+                unsafe {
+                    kernels::linear_accumulate_bf16_scratch(
+                        &mut bufs.x[..td],
+                        &bufs.attn_out[..td],
+                        layer.wo_weight_bf16,
+                        Some(&layer.wo_bias),
+                        total_tokens,
+                        d_model,
+                        d_model,
+                        &mut bufs.bf16_scratch,
+                    );
+                }
             }
 
             // FFN
