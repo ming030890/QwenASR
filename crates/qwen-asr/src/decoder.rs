@@ -47,6 +47,28 @@ impl std::ops::Deref for Int8Buf {
     }
 }
 
+#[cfg(feature = "kleidiai")]
+struct PackedInt8Buf {
+    ptr: *const i8,
+    len: usize,
+}
+
+#[cfg(feature = "kleidiai")]
+impl PackedInt8Buf {
+    fn from_mmap(ptr: *const i8, len: usize) -> Self {
+        Self { ptr, len }
+    }
+}
+
+#[cfg(feature = "kleidiai")]
+impl std::ops::Deref for PackedInt8Buf {
+    type Target = [i8];
+
+    fn deref(&self) -> &[i8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
 pub struct DecLayer {
     pub wq_weight_bf16: *const u16,
     pub wk_weight_bf16: *const u16,
@@ -80,6 +102,18 @@ pub struct DecLayer {
     pub gate_up_int8_scales: Vec<f32>,
     pub down_int8: Int8Buf,
     pub down_int8_scales: Vec<f32>,
+    #[cfg(feature = "kleidiai")]
+    wq_kleidiai: Option<PackedInt8Buf>,
+    #[cfg(feature = "kleidiai")]
+    wk_kleidiai: Option<PackedInt8Buf>,
+    #[cfg(feature = "kleidiai")]
+    wv_kleidiai: Option<PackedInt8Buf>,
+    #[cfg(feature = "kleidiai")]
+    wo_kleidiai: Option<PackedInt8Buf>,
+    #[cfg(feature = "kleidiai")]
+    gate_up_kleidiai: Option<PackedInt8Buf>,
+    #[cfg(feature = "kleidiai")]
+    down_kleidiai: Option<PackedInt8Buf>,
 }
 
 unsafe impl Send for DecLayer {}
@@ -157,17 +191,10 @@ fn load_i8_mmap(ms: &MultiSafetensors, name: &str) -> Option<Int8Buf> {
 }
 
 #[cfg(feature = "kleidiai")]
-fn register_offline_kleidiai_weight(
-    ms: &MultiSafetensors,
-    name: &str,
-    weights: &[i8],
-    in_dim: usize,
-    out_dim: usize,
-) {
+fn load_kleidiai_weight(ms: &MultiSafetensors, name: &str) -> Option<PackedInt8Buf> {
     let packed_name = format!("{name}_kleidiai_dotprod_packed");
-    if let Some((ptr, len)) = ms.get_i8_ptr(&packed_name) {
-        kernels::register_kleidiai_packed_rhs(weights, in_dim, out_dim, ptr, len);
-    }
+    let (ptr, len) = ms.get_i8_ptr(&packed_name)?;
+    Some(PackedInt8Buf::from_mmap(ptr, len))
 }
 
 #[cfg(feature = "kleidiai")]
@@ -219,6 +246,7 @@ fn linear_nobias_int8_f32_scratch(
     x: &[f32],
     int8: &[i8],
     scales: &[f32],
+    packed: Option<&[i8]>,
     seq_len: usize,
     in_dim: usize,
     out_dim: usize,
@@ -228,11 +256,18 @@ fn linear_nobias_int8_f32_scratch(
 ) {
     #[cfg(feature = "kleidiai")]
     if use_kleidiai {
-        kernels::linear_nobias_int8_kleidiai(y, x, int8, scales, seq_len, in_dim, out_dim);
+        kernels::linear_nobias_int8_kleidiai(
+            y,
+            x,
+            packed.expect("validated KleidiAI projection missing"),
+            seq_len,
+            in_dim,
+            out_dim,
+        );
         return;
     }
     #[cfg(not(feature = "kleidiai"))]
-    let _ = use_kleidiai;
+    let _ = (packed, use_kleidiai);
 
     let tile_rows = tile_rows.max(1).min(out_dim);
     for out_start in (0..out_dim).step_by(tile_rows) {
@@ -444,50 +479,43 @@ impl Decoder {
                     load_f32(ms, &format!("{}.mlp.down_proj.weight_int8_scale", lp))?;
 
                 #[cfg(feature = "kleidiai")]
-                if decoder_backend == DecoderBackend::KleidiAiPacked {
-                    register_offline_kleidiai_weight(
-                        ms,
-                        &format!("{}.self_attn.q_proj.weight", lp),
-                        &wq_int8,
-                        hidden,
-                        q_dim,
-                    );
-                    register_offline_kleidiai_weight(
-                        ms,
-                        &format!("{}.self_attn.k_proj.weight", lp),
-                        &wk_int8,
-                        hidden,
-                        kv_dim,
-                    );
-                    register_offline_kleidiai_weight(
-                        ms,
-                        &format!("{}.self_attn.v_proj.weight", lp),
-                        &wv_int8,
-                        hidden,
-                        kv_dim,
-                    );
-                    register_offline_kleidiai_weight(
-                        ms,
-                        &format!("{}.self_attn.o_proj.weight", lp),
-                        &wo_int8,
-                        q_dim,
-                        hidden,
-                    );
-                    register_offline_kleidiai_weight(
-                        ms,
-                        &format!("{}.mlp.gate_up_fused.weight", lp),
-                        &gate_up_int8,
-                        hidden,
-                        2 * inter,
-                    );
-                    register_offline_kleidiai_weight(
-                        ms,
-                        &format!("{}.mlp.down_proj.weight", lp),
-                        &down_int8,
-                        inter,
-                        hidden,
-                    );
-                }
+                let (
+                    wq_kleidiai,
+                    wk_kleidiai,
+                    wv_kleidiai,
+                    wo_kleidiai,
+                    gate_up_kleidiai,
+                    down_kleidiai,
+                ) = if decoder_backend == DecoderBackend::KleidiAiPacked {
+                    (
+                        Some(load_kleidiai_weight(
+                            ms,
+                            &format!("{}.self_attn.q_proj.weight", lp),
+                        )?),
+                        Some(load_kleidiai_weight(
+                            ms,
+                            &format!("{}.self_attn.k_proj.weight", lp),
+                        )?),
+                        Some(load_kleidiai_weight(
+                            ms,
+                            &format!("{}.self_attn.v_proj.weight", lp),
+                        )?),
+                        Some(load_kleidiai_weight(
+                            ms,
+                            &format!("{}.self_attn.o_proj.weight", lp),
+                        )?),
+                        Some(load_kleidiai_weight(
+                            ms,
+                            &format!("{}.mlp.gate_up_fused.weight", lp),
+                        )?),
+                        Some(load_kleidiai_weight(
+                            ms,
+                            &format!("{}.mlp.down_proj.weight", lp),
+                        )?),
+                    )
+                } else {
+                    (None, None, None, None, None, None)
+                };
 
                 layers.push(DecLayer {
                     wq_weight_bf16: std::ptr::null(),
@@ -520,6 +548,18 @@ impl Decoder {
                     gate_up_int8_scales,
                     down_int8,
                     down_int8_scales,
+                    #[cfg(feature = "kleidiai")]
+                    wq_kleidiai,
+                    #[cfg(feature = "kleidiai")]
+                    wk_kleidiai,
+                    #[cfg(feature = "kleidiai")]
+                    wv_kleidiai,
+                    #[cfg(feature = "kleidiai")]
+                    wo_kleidiai,
+                    #[cfg(feature = "kleidiai")]
+                    gate_up_kleidiai,
+                    #[cfg(feature = "kleidiai")]
+                    down_kleidiai,
                 });
             } else {
                 // BF16 model path (original): load BF16 then quantize on device.
@@ -671,6 +711,18 @@ impl Decoder {
                     gate_up_int8_scales,
                     down_int8,
                     down_int8_scales,
+                    #[cfg(feature = "kleidiai")]
+                    wq_kleidiai: None,
+                    #[cfg(feature = "kleidiai")]
+                    wk_kleidiai: None,
+                    #[cfg(feature = "kleidiai")]
+                    wv_kleidiai: None,
+                    #[cfg(feature = "kleidiai")]
+                    wo_kleidiai: None,
+                    #[cfg(feature = "kleidiai")]
+                    gate_up_kleidiai: None,
+                    #[cfg(feature = "kleidiai")]
+                    down_kleidiai: None,
                 });
             }
         }
@@ -1116,6 +1168,24 @@ pub fn decoder_prefill(
     let scale = 1.0 / (head_dim as f32).sqrt();
 
     for (layer_idx, layer) in decoder.layers.iter().enumerate() {
+        #[cfg(feature = "kleidiai")]
+        let (wq_packed, wk_packed, wv_packed, wo_packed, gate_up_packed, down_packed) = (
+            layer.wq_kleidiai.as_deref(),
+            layer.wk_kleidiai.as_deref(),
+            layer.wv_kleidiai.as_deref(),
+            layer.wo_kleidiai.as_deref(),
+            layer.gate_up_kleidiai.as_deref(),
+            layer.down_kleidiai.as_deref(),
+        );
+        #[cfg(not(feature = "kleidiai"))]
+        let (wq_packed, wk_packed, wv_packed, wo_packed, gate_up_packed, down_packed): (
+            Option<&[i8]>,
+            Option<&[i8]>,
+            Option<&[i8]>,
+            Option<&[i8]>,
+            Option<&[i8]>,
+            Option<&[i8]>,
+        ) = (None, None, None, None, None, None);
         let x_norm = &mut bufs.pref_x_norm[..seq_len * dim];
         kernels::rms_norm(
             x_norm,
@@ -1185,6 +1255,7 @@ pub fn decoder_prefill(
                     x_norm,
                     &layer.wq_int8,
                     &layer.wq_int8_scales,
+                    wq_packed,
                     seq_len,
                     dim,
                     q_dim,
@@ -1197,6 +1268,7 @@ pub fn decoder_prefill(
                     x_norm,
                     &layer.wk_int8,
                     &layer.wk_int8_scales,
+                    wk_packed,
                     seq_len,
                     dim,
                     kv_dim,
@@ -1209,6 +1281,7 @@ pub fn decoder_prefill(
                     x_norm,
                     &layer.wv_int8,
                     &layer.wv_int8_scales,
+                    wv_packed,
                     seq_len,
                     dim,
                     kv_dim,
@@ -1323,6 +1396,7 @@ pub fn decoder_prefill(
                     attn_out,
                     &layer.wo_int8,
                     &layer.wo_int8_scales,
+                    wo_packed,
                     seq_len,
                     q_dim,
                     dim,
@@ -1420,6 +1494,7 @@ pub fn decoder_prefill(
                     x_norm2,
                     &layer.gate_up_int8,
                     &layer.gate_up_int8_scales,
+                    gate_up_packed,
                     seq_len,
                     dim,
                     2 * intermediate,
@@ -1474,6 +1549,7 @@ pub fn decoder_prefill(
                     gate,
                     &layer.down_int8,
                     &layer.down_int8_scales,
+                    down_packed,
                     seq_len,
                     intermediate,
                     dim,
@@ -1553,8 +1629,10 @@ pub fn decoder_forward(
             kernels::linear_nobias_int8_kleidiai(
                 &mut bufs.q[..q_dim],
                 &bufs.x_norm[..dim],
-                &layer.wq_int8,
-                &layer.wq_int8_scales,
+                layer
+                    .wq_kleidiai
+                    .as_deref()
+                    .expect("validated KleidiAI Q projection missing"),
                 1,
                 dim,
                 q_dim,
@@ -1562,8 +1640,10 @@ pub fn decoder_forward(
             kernels::linear_nobias_int8_kleidiai(
                 &mut bufs.k[..kv_dim],
                 &bufs.x_norm[..dim],
-                &layer.wk_int8,
-                &layer.wk_int8_scales,
+                layer
+                    .wk_kleidiai
+                    .as_deref()
+                    .expect("validated KleidiAI K projection missing"),
                 1,
                 dim,
                 kv_dim,
@@ -1571,8 +1651,10 @@ pub fn decoder_forward(
             kernels::linear_nobias_int8_kleidiai(
                 &mut bufs.v[..kv_dim],
                 &bufs.x_norm[..dim],
-                &layer.wv_int8,
-                &layer.wv_int8_scales,
+                layer
+                    .wv_kleidiai
+                    .as_deref()
+                    .expect("validated KleidiAI V projection missing"),
                 1,
                 dim,
                 kv_dim,
@@ -1701,8 +1783,10 @@ pub fn decoder_forward(
             kernels::linear_nobias_int8_kleidiai(
                 &mut bufs.proj_out[..dim],
                 &bufs.attn_out[..q_dim],
-                &layer.wo_int8,
-                &layer.wo_int8_scales,
+                layer
+                    .wo_kleidiai
+                    .as_deref()
+                    .expect("validated KleidiAI O projection missing"),
                 1,
                 q_dim,
                 dim,
@@ -1751,8 +1835,10 @@ pub fn decoder_forward(
             kernels::linear_nobias_int8_kleidiai(
                 &mut bufs.gate_buf[..2 * intermediate],
                 &bufs.x_norm[..dim],
-                &layer.gate_up_int8,
-                &layer.gate_up_int8_scales,
+                layer
+                    .gate_up_kleidiai
+                    .as_deref()
+                    .expect("validated KleidiAI gate/up projection missing"),
                 1,
                 dim,
                 2 * intermediate,
@@ -1797,8 +1883,10 @@ pub fn decoder_forward(
             kernels::linear_nobias_int8_kleidiai(
                 &mut bufs.proj_out[..dim],
                 &bufs.ffn_out[..intermediate],
-                &layer.down_int8,
-                &layer.down_int8_scales,
+                layer
+                    .down_kleidiai
+                    .as_deref()
+                    .expect("validated KleidiAI down projection missing"),
                 1,
                 intermediate,
                 dim,
