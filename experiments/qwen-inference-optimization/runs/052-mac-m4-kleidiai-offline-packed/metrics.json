@@ -1,0 +1,263 @@
+{
+  "schema_version": 2,
+  "experiment_id": "052-mac-m4-kleidiai-offline-packed",
+  "timestamp_utc": "2026-08-15T09:11:53+00:00",
+  "hypothesis": "Offline-packed KleidiAI weights eliminate runtime packing and reduce first-visible-token latency",
+  "change": "Load a 1.35 GiB DotProd-packed safetensors shard and use it directly for all decoder prefill projections",
+  "baseline": {
+    "reference": "experiments/qwen-inference-optimization/runs/048-mac-m4-kleidiai-control",
+    "metrics_path": "/Users/tony/Documents/keyboard/QwenASR/experiments/qwen-inference-optimization/runs/048-mac-m4-kleidiai-control/metrics.json",
+    "experiment_id": "048-mac-m4-kleidiai-control"
+  },
+  "git": {
+    "revision": "18391d69addf19f8fffa8e124856740263c3dfc2",
+    "short_revision": "18391d6",
+    "dirty": true
+  },
+  "host": {
+    "system": "Darwin",
+    "release": "24.6.0",
+    "machine": "arm64",
+    "python": "3.13.7",
+    "logical_cpu_count": 10,
+    "model": "Mac mini",
+    "chip": "Apple M4",
+    "memory": "16 GB",
+    "os_version": "15.7.7"
+  },
+  "model": {
+    "path": "/Volumes/SSD/Qwen3-ASR-1.7B-int8-kleidiai-dotprod",
+    "detected_variant": "1.7B",
+    "expected_variant": "1.7B",
+    "inventory_sha256": "c66474786ecece26a914a358bac08958ebde045c332b72d04b50fe682732a96e",
+    "files": [
+      {
+        "path": ".gitattributes",
+        "bytes": 1519
+      },
+      {
+        "path": "README.md",
+        "bytes": 57456
+      },
+      {
+        "path": "chat_template.json",
+        "bytes": 1161
+      },
+      {
+        "path": "config.json",
+        "bytes": 6194
+      },
+      {
+        "path": "generation_config.json",
+        "bytes": 142
+      },
+      {
+        "path": "merges.txt",
+        "bytes": 1671853
+      },
+      {
+        "path": "model.kleidiai.safetensors",
+        "bytes": 1416191638
+      },
+      {
+        "path": "model.safetensors",
+        "bytes": 2120326216
+      },
+      {
+        "path": "preprocessor_config.json",
+        "bytes": 330
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 12487
+      },
+      {
+        "path": "vocab.json",
+        "bytes": 2776833
+      }
+    ]
+  },
+  "input": "/Users/tony/Documents/keyboard/QwenASR/bench/android-assets",
+  "configuration": {
+    "launches": 3,
+    "runs_per_input": 3,
+    "threads": 1,
+    "language": "Auto",
+    "prompt": "音频是粤语，可能夹杂英语",
+    "binary": "/Users/tony/Documents/keyboard/QwenASR/target/release/qwen-asr-bench-android",
+    "benchmark_optimization_flags": [
+      "OpenBLAS",
+      "vDSP/Accelerate",
+      "NEON",
+      "DotProd"
+    ],
+    "required_backend": "OpenBLAS",
+    "benchmark_environment": {}
+  },
+  "summary": {
+    "inference_latency_ms": {
+      "median": 790.448,
+      "p95": 1112.087,
+      "min": 659.804,
+      "max": 1154.408,
+      "samples": 54
+    },
+    "wall_inference_latency_ms": {
+      "median": 870.767,
+      "p95": 1202.496
+    },
+    "model_load_ms": {
+      "median": 21.223,
+      "first_launch": 21.223,
+      "min": 21.075,
+      "max": 75.813,
+      "samples": 3
+    },
+    "phase_medians_ms": {
+      "mel": 0.23,
+      "encoder": 83.1215,
+      "prefill": 313.3535,
+      "first_visible_token": 571.548,
+      "decode_loop": 405.7075
+    },
+    "transcripts": [
+      "我急求方法啊！",
+      "唔做嘢嘅佔多數咯。",
+      "證據嘅話，真係冇啊！",
+      "你睇下呢部剧。",
+      "仲要提供乜嘢資料？",
+      "哈喽，你好嘛？已经坐低咗啦。"
+    ],
+    "transcripts_by_input": {
+      "cv_yue_000.wav": {
+        "canonical": "我急求方法啊！",
+        "all_runs_equal": true,
+        "samples": 9,
+        "values": [
+          "我急求方法啊！",
+          "我急求方法啊！",
+          "我急求方法啊！",
+          "我急求方法啊！",
+          "我急求方法啊！",
+          "我急求方法啊！",
+          "我急求方法啊！",
+          "我急求方法啊！",
+          "我急求方法啊！"
+        ]
+      },
+      "cv_yue_001.wav": {
+        "canonical": "唔做嘢嘅佔多數咯。",
+        "all_runs_equal": true,
+        "samples": 9,
+        "values": [
+          "唔做嘢嘅佔多數咯。",
+          "唔做嘢嘅佔多數咯。",
+          "唔做嘢嘅佔多數咯。",
+          "唔做嘢嘅佔多數咯。",
+          "唔做嘢嘅佔多數咯。",
+          "唔做嘢嘅佔多數咯。",
+          "唔做嘢嘅佔多數咯。",
+          "唔做嘢嘅佔多數咯。",
+          "唔做嘢嘅佔多數咯。"
+        ]
+      },
+      "cv_yue_002.wav": {
+        "canonical": "證據嘅話，真係冇啊！",
+        "all_runs_equal": true,
+        "samples": 9,
+        "values": [
+          "證據嘅話，真係冇啊！",
+          "證據嘅話，真係冇啊！",
+          "證據嘅話，真係冇啊！",
+          "證據嘅話，真係冇啊！",
+          "證據嘅話，真係冇啊！",
+          "證據嘅話，真係冇啊！",
+          "證據嘅話，真係冇啊！",
+          "證據嘅話，真係冇啊！",
+          "證據嘅話，真係冇啊！"
+        ]
+      },
+      "cv_yue_003.wav": {
+        "canonical": "你睇下呢部剧。",
+        "all_runs_equal": true,
+        "samples": 9,
+        "values": [
+          "你睇下呢部剧。",
+          "你睇下呢部剧。",
+          "你睇下呢部剧。",
+          "你睇下呢部剧。",
+          "你睇下呢部剧。",
+          "你睇下呢部剧。",
+          "你睇下呢部剧。",
+          "你睇下呢部剧。",
+          "你睇下呢部剧。"
+        ]
+      },
+      "cv_yue_004.wav": {
+        "canonical": "仲要提供乜嘢資料？",
+        "all_runs_equal": true,
+        "samples": 9,
+        "values": [
+          "仲要提供乜嘢資料？",
+          "仲要提供乜嘢資料？",
+          "仲要提供乜嘢資料？",
+          "仲要提供乜嘢資料？",
+          "仲要提供乜嘢資料？",
+          "仲要提供乜嘢資料？",
+          "仲要提供乜嘢資料？",
+          "仲要提供乜嘢資料？",
+          "仲要提供乜嘢資料？"
+        ]
+      },
+      "ptt_guardrail.wav": {
+        "canonical": "哈喽，你好嘛？已经坐低咗啦。",
+        "all_runs_equal": true,
+        "samples": 9,
+        "values": [
+          "哈喽，你好嘛？已经坐低咗啦。",
+          "哈喽，你好嘛？已经坐低咗啦。",
+          "哈喽，你好嘛？已经坐低咗啦。",
+          "哈喽，你好嘛？已经坐低咗啦。",
+          "哈喽，你好嘛？已经坐低咗啦。",
+          "哈喽，你好嘛？已经坐低咗啦。",
+          "哈喽，你好嘛？已经坐低咗啦。",
+          "哈喽，你好嘛？已经坐低咗啦。",
+          "哈喽，你好嘛？已经坐低咗啦。"
+        ]
+      }
+    }
+  },
+  "acceptance": {
+    "transcript_gate": {
+      "rule": "Every transcript must exactly equal the baseline, including case, spacing, and punctuation.",
+      "candidate_runs_internally_equal": true,
+      "baseline_runs_internally_equal": true,
+      "same_input_set": true,
+      "exact_transcript_match": true,
+      "passed": true,
+      "mismatches": [],
+      "mode": "candidate-comparison"
+    },
+    "eligible_for_performance_acceptance": true
+  },
+  "memory": {
+    "after_model_load_bytes_median": 51609600,
+    "peak_rss_bytes": 3846963200,
+    "peak_rss_bytes_by_launch": [
+      3842097152,
+      3846963200,
+      3844440064
+    ],
+    "source": "benchmark process sampler"
+  },
+  "file_size": {
+    "model_total_bytes": 3541045829,
+    "model_weight_bytes": 3536517854,
+    "runtime_binary_bytes": 1808128
+  },
+  "raw_launch_files": [
+    "raw/launch-001.json",
+    "raw/launch-002.json",
+    "raw/launch-003.json"
+  ]
+}

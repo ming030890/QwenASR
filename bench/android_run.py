@@ -207,6 +207,11 @@ def main():
     p.add_argument("--profile",     action="store_true", help="Enable kernel profiling counters")
     p.add_argument("--save-binary", metavar="PATH",
                    help="Copy the compiled binary to PATH after build (e.g. bench/android-baselines/my-baseline)")
+    p.add_argument(
+        "--skip-model-push",
+        action="store_true",
+        help="Reuse the model already present under REMOTE_DIR/model",
+    )
     args = p.parse_args()
 
     ndk_home     = env("NDK_HOME", env("ANDROID_NDK_HOME", env("ANDROID_NDK_ROOT",
@@ -300,7 +305,10 @@ def main():
              capture_output=True)
     if openblas_runtime:
         run_step("push OpenBLAS runtime", [args.adb, "push", openblas_runtime, f"{args.remote_dir}/"])
-    run_step(f"push model ({args.model_dir})", [args.adb, "push", f"{args.model_dir}/.", remote_model])
+    if args.skip_model_push:
+        log(f"  reusing model already present at {remote_model}")
+    else:
+        run_step(f"push model ({args.model_dir})", [args.adb, "push", f"{args.model_dir}/.", remote_model])
     run_step(f"push assets ({args.assets_dir})", [args.adb, "push", f"{args.assets_dir}/.", remote_assets])
     run_step("prepare Common Voice input", [args.adb, "shell",
         f"rm -rf '{remote_cv}' && mkdir -p '{remote_cv}' && "

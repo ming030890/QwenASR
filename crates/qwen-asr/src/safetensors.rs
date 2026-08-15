@@ -260,7 +260,18 @@ impl MultiSafetensors {
         // Try single file first
         let single_path = format!("{}/model.safetensors", model_dir);
         if let Some(sf) = SafetensorsFile::open(&single_path) {
-            return Some(MultiSafetensors { shards: vec![sf] });
+            let mut shards = vec![sf];
+            let packed_path = format!("{}/model.kleidiai.safetensors", model_dir);
+            if Path::new(&packed_path).is_file() {
+                match SafetensorsFile::open(&packed_path) {
+                    Some(packed) => shards.push(packed),
+                    None => {
+                        eprintln!("multi_safetensors_open: failed to open {}", packed_path);
+                        return None;
+                    }
+                }
+            }
+            return Some(MultiSafetensors { shards });
         }
 
         // Scan directory for shard files

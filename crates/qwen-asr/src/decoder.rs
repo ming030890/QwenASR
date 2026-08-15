@@ -147,6 +147,20 @@ fn load_i8_mmap(ms: &MultiSafetensors, name: &str) -> Option<Int8Buf> {
     }
 }
 
+#[cfg(feature = "kleidiai")]
+fn register_offline_kleidiai_weight(
+    ms: &MultiSafetensors,
+    name: &str,
+    weights: &[i8],
+    in_dim: usize,
+    out_dim: usize,
+) {
+    let packed_name = format!("{name}_kleidiai_dotprod_packed");
+    if let Some((ptr, len)) = ms.get_i8_ptr(&packed_name) {
+        kernels::register_kleidiai_packed_rhs(weights, in_dim, out_dim, ptr, len);
+    }
+}
+
 #[allow(dead_code)]
 fn dequantize_int8_to_f32_scratch<'a>(
     int8: &[i8],
@@ -180,6 +194,12 @@ fn linear_nobias_int8_f32_scratch(
     scratch: &mut [f32],
     tile_rows: usize,
 ) {
+    #[cfg(feature = "kleidiai")]
+    if std::env::var("QWEN_KLEIDIAI_PREFILL").ok().as_deref() == Some("1") {
+        kernels::linear_nobias_int8_kleidiai(y, x, int8, scales, seq_len, in_dim, out_dim);
+        return;
+    }
+
     let tile_rows = tile_rows.max(1).min(out_dim);
     for out_start in (0..out_dim).step_by(tile_rows) {
         let rows = tile_rows.min(out_dim - out_start);
@@ -359,6 +379,52 @@ impl Decoder {
                 let down_int8 = load_i8_mmap(ms, &format!("{}.mlp.down_proj.weight", lp))?;
                 let down_int8_scales =
                     load_f32(ms, &format!("{}.mlp.down_proj.weight_int8_scale", lp))?;
+
+                #[cfg(feature = "kleidiai")]
+                {
+                    register_offline_kleidiai_weight(
+                        ms,
+                        &format!("{}.self_attn.q_proj.weight", lp),
+                        &wq_int8,
+                        hidden,
+                        q_dim,
+                    );
+                    register_offline_kleidiai_weight(
+                        ms,
+                        &format!("{}.self_attn.k_proj.weight", lp),
+                        &wk_int8,
+                        hidden,
+                        kv_dim,
+                    );
+                    register_offline_kleidiai_weight(
+                        ms,
+                        &format!("{}.self_attn.v_proj.weight", lp),
+                        &wv_int8,
+                        hidden,
+                        kv_dim,
+                    );
+                    register_offline_kleidiai_weight(
+                        ms,
+                        &format!("{}.self_attn.o_proj.weight", lp),
+                        &wo_int8,
+                        q_dim,
+                        hidden,
+                    );
+                    register_offline_kleidiai_weight(
+                        ms,
+                        &format!("{}.mlp.gate_up_fused.weight", lp),
+                        &gate_up_int8,
+                        hidden,
+                        2 * inter,
+                    );
+                    register_offline_kleidiai_weight(
+                        ms,
+                        &format!("{}.mlp.down_proj.weight", lp),
+                        &down_int8,
+                        inter,
+                        hidden,
+                    );
+                }
 
                 layers.push(DecLayer {
                     wq_weight_bf16: std::ptr::null(),
@@ -1397,6 +1463,9 @@ pub fn decoder_forward(
 
     let scale = 1.0 / (head_dim as f32).sqrt();
 
+    #[cfg(feature = "kleidiai")]
+    let use_kleidiai_decode = std::env::var("QWEN_KLEIDIAI_DECODE").ok().as_deref() == Some("1");
+
     for (layer_idx, layer) in decoder.layers.iter().enumerate() {
         kernels::rms_norm(
             &mut bufs.x_norm[..dim],
@@ -1408,7 +1477,53 @@ pub fn decoder_forward(
         );
 
         // INT8 fused QKV projection (aarch64 only, BF16 fallback on x86_64)
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", feature = "kleidiai"))]
+        if use_kleidiai_decode {
+            kernels::linear_nobias_int8_kleidiai(
+                &mut bufs.q[..q_dim],
+                &bufs.x_norm[..dim],
+                &layer.wq_int8,
+                &layer.wq_int8_scales,
+                1,
+                dim,
+                q_dim,
+            );
+            kernels::linear_nobias_int8_kleidiai(
+                &mut bufs.k[..kv_dim],
+                &bufs.x_norm[..dim],
+                &layer.wk_int8,
+                &layer.wk_int8_scales,
+                1,
+                dim,
+                kv_dim,
+            );
+            kernels::linear_nobias_int8_kleidiai(
+                &mut bufs.v[..kv_dim],
+                &bufs.x_norm[..dim],
+                &layer.wv_int8,
+                &layer.wv_int8_scales,
+                1,
+                dim,
+                kv_dim,
+            );
+        } else {
+            kernels::linear_nobias_int8_qkv(
+                &mut bufs.q[..q_dim],
+                &mut bufs.k[..kv_dim],
+                &mut bufs.v[..kv_dim],
+                &bufs.x_norm[..dim],
+                &layer.wq_int8,
+                &layer.wq_int8_scales,
+                &layer.wk_int8,
+                &layer.wk_int8_scales,
+                &layer.wv_int8,
+                &layer.wv_int8_scales,
+                dim,
+                q_dim,
+                kv_dim,
+            );
+        }
+        #[cfg(all(target_arch = "aarch64", not(feature = "kleidiai")))]
         kernels::linear_nobias_int8_qkv(
             &mut bufs.q[..q_dim],
             &mut bufs.k[..kv_dim],
@@ -1510,7 +1625,29 @@ pub fn decoder_forward(
         );
 
         // O-projection with fused residual add: x += attn_out @ wo (INT8 on aarch64, BF16 on x86_64)
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", feature = "kleidiai"))]
+        if use_kleidiai_decode {
+            kernels::linear_nobias_int8_kleidiai(
+                &mut bufs.proj_out[..dim],
+                &bufs.attn_out[..q_dim],
+                &layer.wo_int8,
+                &layer.wo_int8_scales,
+                1,
+                q_dim,
+                dim,
+            );
+            kernels::add_inplace(&mut bufs.x[..dim], &bufs.proj_out[..dim], dim);
+        } else {
+            kernels::linear_nobias_int8_addto(
+                &mut bufs.x[..dim],
+                &bufs.attn_out[..q_dim],
+                &layer.wo_int8,
+                &layer.wo_int8_scales,
+                q_dim,
+                dim,
+            );
+        }
+        #[cfg(all(target_arch = "aarch64", not(feature = "kleidiai")))]
         kernels::linear_nobias_int8_addto(
             &mut bufs.x[..dim],
             &bufs.attn_out[..q_dim],
@@ -1538,7 +1675,34 @@ pub fn decoder_forward(
         );
 
         // gate_up + SwiGLU (INT8 on aarch64, BF16 on x86_64)
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", feature = "kleidiai"))]
+        if use_kleidiai_decode {
+            kernels::linear_nobias_int8_kleidiai(
+                &mut bufs.gate_buf[..2 * intermediate],
+                &bufs.x_norm[..dim],
+                &layer.gate_up_int8,
+                &layer.gate_up_int8_scales,
+                1,
+                dim,
+                2 * intermediate,
+            );
+            kernels::swiglu_multiply(
+                &mut bufs.ffn_out[..intermediate],
+                &bufs.gate_buf[..2 * intermediate],
+                1,
+                intermediate,
+            );
+        } else {
+            kernels::linear_nobias_int8_swiglu(
+                &mut bufs.ffn_out[..intermediate],
+                &bufs.x_norm[..dim],
+                &layer.gate_up_int8,
+                &layer.gate_up_int8_scales,
+                dim,
+                intermediate,
+            );
+        }
+        #[cfg(all(target_arch = "aarch64", not(feature = "kleidiai")))]
         kernels::linear_nobias_int8_swiglu(
             &mut bufs.ffn_out[..intermediate],
             &bufs.x_norm[..dim],
@@ -1557,7 +1721,29 @@ pub fn decoder_forward(
         );
 
         // down-projection with fused residual add: x += ffn_out @ down (INT8 on aarch64, BF16 on x86_64)
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", feature = "kleidiai"))]
+        if use_kleidiai_decode {
+            kernels::linear_nobias_int8_kleidiai(
+                &mut bufs.proj_out[..dim],
+                &bufs.ffn_out[..intermediate],
+                &layer.down_int8,
+                &layer.down_int8_scales,
+                1,
+                intermediate,
+                dim,
+            );
+            kernels::add_inplace(&mut bufs.x[..dim], &bufs.proj_out[..dim], dim);
+        } else {
+            kernels::linear_nobias_int8_addto(
+                &mut bufs.x[..dim],
+                &bufs.ffn_out[..intermediate],
+                &layer.down_int8,
+                &layer.down_int8_scales,
+                intermediate,
+                dim,
+            );
+        }
+        #[cfg(all(target_arch = "aarch64", not(feature = "kleidiai")))]
         kernels::linear_nobias_int8_addto(
             &mut bufs.x[..dim],
             &bufs.ffn_out[..intermediate],

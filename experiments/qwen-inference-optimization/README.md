@@ -84,6 +84,33 @@ The benchmark now records `first_visible_token_ms` separately from
 the first complete UTF-8 text piece; `prefill_ms` remains a decoder phase metric
 and must no longer be presented as user-visible TTFT.
 
+## Latest INT8 accelerator result
+
+Runs `048`, `049`, and `052` evaluate Arm KleidiAI on the Apple M4. Repacking
+weights on every prefill (`049`) is rejected: TTFT regressed 154.1%. Moving all
+168 packed projections into a 1.35 GiB mmap-able safetensors shard (`052`)
+removed runtime packing and preserved all 54 transcripts, but TTFT still
+regressed 11.5%, prefill 21.8%, P95 15.3%, and peak RSS 57.9% against the
+same-binary tiled-F32 control (`048`). The packed path therefore remains an
+opt-in research feature and is not enabled by default on macOS.
+
+The isolated projection microbenchmark showed 2.4-7.3x gains when repeatedly
+reusing one packed matrix, but that cache-hot result did not predict the full
+decoder, which streams 168 distinct matrices. NEON I8MM performed essentially
+the same as DotProd on this M4. The next credible use is an Android-specific
+test on a connected device; the accepted Mac path remains tiled F32/OpenBLAS.
+
+The Android follow-up is recorded in
+[`k5-kleidiai-offline-packed-pixel10.md`](../../android_experiment/android-speed-results/k5-kleidiai-offline-packed-pixel10.md).
+On Pixel 10,
+using the offline-packed layout for both prefill and single-token decode reduced
+Common Voice TTFT by 45.1%, prefill by 69.9%, decode-loop latency by 17.5%, and
+total inference by 40.4%. Guardrail TTFT improved 48.0%. Peak RSS is only 0.5%
+above control because decode no longer faults the original row-major projection
+pages into memory; the prefill-only variant's 60.7% memory regression is
+rejected. Five of six exact transcripts pass, with one stable
+traditional-to-simplified character change. No last-layer F32 fallback is used.
+
 The runner defaults to requiring a model detected by the engine as `1.7B`; this
 prevents a 0.6B model with a similarly named or sized weight file from becoming
 the baseline by accident. Use `--expect-model-variant` only when intentionally

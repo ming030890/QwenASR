@@ -1495,6 +1495,216 @@ pub fn linear_nobias_int8_matmat(
     );
 }
 
+#[cfg(feature = "kleidiai")]
+type PrepackedRhsRegistry = std::collections::HashMap<(usize, usize, usize), (usize, usize)>;
+
+#[cfg(feature = "kleidiai")]
+static PREPACKED_RHS_REGISTRY: std::sync::OnceLock<std::sync::RwLock<PrepackedRhsRegistry>> =
+    std::sync::OnceLock::new();
+
+#[cfg(feature = "kleidiai")]
+pub fn register_kleidiai_packed_rhs(
+    weights: &[i8],
+    in_dim: usize,
+    out_dim: usize,
+    packed_ptr: *const i8,
+    packed_len: usize,
+) {
+    let registry =
+        PREPACKED_RHS_REGISTRY.get_or_init(|| std::sync::RwLock::new(PrepackedRhsRegistry::new()));
+    registry.write().unwrap().insert(
+        (weights.as_ptr() as usize, in_dim, out_dim),
+        (packed_ptr as usize, packed_len),
+    );
+}
+
+#[cfg(feature = "kleidiai")]
+#[allow(clippy::too_many_arguments)]
+pub fn linear_nobias_int8_kleidiai(
+    y: &mut [f32],
+    x: &[f32],
+    w_int8: &[i8],
+    w_scales: &[f32],
+    seq_len: usize,
+    in_dim: usize,
+    out_dim: usize,
+) {
+    use std::ffi::c_void;
+
+    type PackedRhsCache = std::collections::HashMap<(usize, usize, usize), std::sync::Arc<Vec<u8>>>;
+    static PACKED_RHS_CACHE: std::sync::OnceLock<std::sync::Mutex<PackedRhsCache>> =
+        std::sync::OnceLock::new();
+
+    unsafe extern "C" {
+        fn kai_get_mr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod() -> usize;
+        fn kai_get_nr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod() -> usize;
+        fn kai_get_kr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod() -> usize;
+        fn kai_get_sr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod() -> usize;
+        fn kai_get_lhs_packed_size_lhs_quant_pack_qai8dxp_f32(
+            m: usize,
+            k: usize,
+            mr: usize,
+            kr: usize,
+            sr: usize,
+        ) -> usize;
+        fn kai_get_rhs_packed_size_rhs_pack_nxk_qsi8cxp_qsi8cx_neon(
+            n: usize,
+            k: usize,
+            nr: usize,
+            kr: usize,
+            sr: usize,
+        ) -> usize;
+        fn kai_run_lhs_quant_pack_qai8dxp_f32(
+            m: usize,
+            k: usize,
+            mr: usize,
+            kr: usize,
+            sr: usize,
+            m_idx_start: usize,
+            lhs: *const f32,
+            lhs_stride: usize,
+            lhs_packed: *mut c_void,
+        );
+        fn kai_run_rhs_pack_nxk_qsi8cxp_qsi8cx_neon(
+            num_groups: usize,
+            n: usize,
+            k: usize,
+            nr: usize,
+            kr: usize,
+            sr: usize,
+            rhs: *const i8,
+            bias: *const f32,
+            scale: *const f32,
+            rhs_packed: *mut c_void,
+            extra_bytes: usize,
+            params: *const KaiRhsPackQsi8cxParams,
+        );
+        fn kai_run_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod(
+            m: usize,
+            n: usize,
+            k: usize,
+            lhs_packed: *const c_void,
+            rhs_packed: *const c_void,
+            dst: *mut f32,
+            dst_stride_row: usize,
+            dst_stride_col: usize,
+            scalar_min: f32,
+            scalar_max: f32,
+        );
+    }
+
+    #[repr(C)]
+    struct KaiRhsPackQsi8cxParams {
+        lhs_zero_point: i32,
+        scale_multiplier: f32,
+    }
+
+    debug_assert_eq!(x.len(), seq_len * in_dim);
+    debug_assert_eq!(w_int8.len(), out_dim * in_dim);
+    debug_assert_eq!(w_scales.len(), out_dim);
+    debug_assert_eq!(y.len(), seq_len * out_dim);
+
+    unsafe {
+        let mr = kai_get_mr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod();
+        let nr = kai_get_nr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod();
+        let kr = kai_get_kr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod();
+        let sr = kai_get_sr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod();
+        let lhs_size =
+            kai_get_lhs_packed_size_lhs_quant_pack_qai8dxp_f32(seq_len, in_dim, mr, kr, sr);
+        let rhs_size =
+            kai_get_rhs_packed_size_rhs_pack_nxk_qsi8cxp_qsi8cx_neon(out_dim, in_dim, nr, kr, sr);
+        let mut lhs_packed = vec![0u8; lhs_size];
+        let params = KaiRhsPackQsi8cxParams {
+            lhs_zero_point: 1,
+            scale_multiplier: 1.0,
+        };
+
+        kai_run_lhs_quant_pack_qai8dxp_f32(
+            seq_len,
+            in_dim,
+            mr,
+            kr,
+            sr,
+            0,
+            x.as_ptr(),
+            in_dim * size_of::<f32>(),
+            lhs_packed.as_mut_ptr().cast(),
+        );
+        let prepacked = PREPACKED_RHS_REGISTRY.get().and_then(|registry| {
+            registry
+                .read()
+                .unwrap()
+                .get(&(w_int8.as_ptr() as usize, in_dim, out_dim))
+                .copied()
+        });
+        if let Some((packed_ptr, packed_len)) = prepacked {
+            assert_eq!(
+                packed_len, rhs_size,
+                "invalid offline KleidiAI packed weight size"
+            );
+            kai_run_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod(
+                seq_len,
+                out_dim,
+                in_dim,
+                lhs_packed.as_ptr().cast(),
+                packed_ptr as *const c_void,
+                y.as_mut_ptr(),
+                out_dim * size_of::<f32>(),
+                size_of::<f32>(),
+                f32::NEG_INFINITY,
+                f32::INFINITY,
+            );
+            return;
+        }
+        let pack_rhs = || {
+            let mut packed = vec![0u8; rhs_size];
+            let zero_bias = vec![0.0f32; out_dim];
+            kai_run_rhs_pack_nxk_qsi8cxp_qsi8cx_neon(
+                1,
+                out_dim,
+                in_dim,
+                nr,
+                kr,
+                sr,
+                w_int8.as_ptr(),
+                zero_bias.as_ptr(),
+                w_scales.as_ptr(),
+                packed.as_mut_ptr().cast(),
+                0,
+                &params,
+            );
+            std::sync::Arc::new(packed)
+        };
+        let rhs_packed = if std::env::var("QWEN_KLEIDIAI_PACK_CACHE").ok().as_deref() == Some("1") {
+            let key = (w_int8.as_ptr() as usize, in_dim, out_dim);
+            let cache =
+                PACKED_RHS_CACHE.get_or_init(|| std::sync::Mutex::new(PackedRhsCache::new()));
+            let cached = { cache.lock().unwrap().get(&key).cloned() };
+            if let Some(packed) = cached {
+                packed
+            } else {
+                let packed = pack_rhs();
+                cache.lock().unwrap().insert(key, packed.clone());
+                packed
+            }
+        } else {
+            pack_rhs()
+        };
+        kai_run_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod(
+            seq_len,
+            out_dim,
+            in_dim,
+            lhs_packed.as_ptr().cast(),
+            rhs_packed.as_ptr().cast(),
+            y.as_mut_ptr(),
+            out_dim * size_of::<f32>(),
+            size_of::<f32>(),
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+        );
+    }
+}
+
 /// INT8 fused QKV matvec for single-token decode
 #[allow(clippy::too_many_arguments)]
 pub fn linear_nobias_int8_qkv(

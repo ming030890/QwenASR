@@ -25,6 +25,7 @@ libc = "0.2"
 
 [features]
 android-blas = ["qwen-asr/blas"]
+kleidiai = ["qwen-asr/kleidiai"]
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 qwen-asr = { workspace = true, features = ["blas", "vdsp"] }
