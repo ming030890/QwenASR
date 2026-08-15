@@ -49,9 +49,6 @@ TSV_HEADER = "\t".join([
     "rtf", "guardrail_ok", "json_path",
 ])
 
-GUARDRAIL_KEYWORDS = ["你好吗", "坐低咗"]
-
-
 def env(key, default=""):
     return os.environ.get(key, default)
 
@@ -169,7 +166,7 @@ def append_tsv(tsv_path, json_path, timestamp, label, threads, input_name):
     guardrail_ok = ""
     if input_name == "ptt_guardrail":
         t = files[0]["transcript"]
-        has_nihao = "你好吗" in t or "你好嗎" in t
+        has_nihao = any(text in t for text in ("你好吗", "你好嗎", "你好嘛"))
         has_zuodi = "坐低咗" in t
         ok = has_nihao and has_zuodi
         guardrail_ok = str(ok).lower()
