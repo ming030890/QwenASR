@@ -280,10 +280,6 @@ fn transcribe_segment(
     // Decoder prefill
     let t0 = get_time_ms();
     let prefill_len = total_seq - 1;
-    // Enabled by default; retain an explicit rollback switch for controlled A/Bs.
-    let use_static_prefix_cache = std::env::var("QWEN_STATIC_PREFIX_KV_CACHE")
-        .map(|value| value != "0")
-        .unwrap_or(true);
     let mut prefix_tokens = Vec::with_capacity(prefix_len);
     prefix_tokens.extend_from_slice(PREFIX_HEAD);
     if let Some(ref tokens) = ctx.prompt_tokens {
@@ -291,18 +287,13 @@ fn transcribe_segment(
     }
     prefix_tokens.extend_from_slice(PREFIX_TAIL);
 
-    let reused_prefix = if use_static_prefix_cache {
-        if let Some(cache) = ctx
-            .static_prefix_kv_cache
-            .as_ref()
-            .filter(|cache| cache.tokens == prefix_tokens)
-        {
-            ctx.kv_cache.restore_prefix(prefix_len, &cache.k, &cache.v);
-            prefix_len
-        } else {
-            ctx.kv_cache.len = 0;
-            0
-        }
+    let reused_prefix = if let Some(cache) = ctx
+        .static_prefix_kv_cache
+        .as_ref()
+        .filter(|cache| cache.tokens == prefix_tokens)
+    {
+        ctx.kv_cache.restore_prefix(prefix_len, &cache.k, &cache.v);
+        prefix_len
     } else {
         ctx.kv_cache.len = 0;
         0
@@ -318,7 +309,7 @@ fn transcribe_segment(
         prefill_len - reused_prefix,
     );
 
-    if use_static_prefix_cache && reused_prefix == 0 {
+    if reused_prefix == 0 {
         let (k, v) = ctx.kv_cache.snapshot_prefix(prefix_len);
         ctx.static_prefix_kv_cache = Some(StaticPrefixKvCache {
             tokens: prefix_tokens,

@@ -498,9 +498,6 @@ def main() -> None:
             "benchmark_environment": {
                 name: os.environ.get(name)
                 for name in (
-                    "QWEN_INT8_PREFILL_F32",
-                    "QWEN_INT8_PREFILL_TILE_ROWS",
-                    "QWEN_STATIC_PREFIX_KV_CACHE",
                 )
                 if os.environ.get(name) is not None
             },
