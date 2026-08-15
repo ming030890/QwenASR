@@ -31,6 +31,7 @@ Each completed or evaluated experiment has its own markdown file in the `android
 | **K5** | KleidiAI offline-packed decoder on Pixel 10. | Accept | [k5-kleidiai-offline-packed-pixel10.md](android-speed-results/k5-kleidiai-offline-packed-pixel10.md) |
 | **K6** | I8MM decoder, fat LTO, and OpenBLAS 0.3.34 follow-ups. | Accept | [k6-i8mm-lto-openblas-pixel10.md](android-speed-results/k6-i8mm-lto-openblas-pixel10.md) |
 | **K7** | Offline I8MM packing for already-INT8 encoder matrices. | Accept | [k7-i8mm-packed-encoder-pixel10.md](android-speed-results/k7-i8mm-packed-encoder-pixel10.md) |
+| **K8** | Quantize and offline-pack every encoder linear matrix; convolution extension failed transcript gate. | Accept linear / reject convolution | [k8-full-encoder-linear-int8-pixel10.md](android-speed-results/k8-full-encoder-linear-int8-pixel10.md) |
 
 ---
 
@@ -40,27 +41,23 @@ This list acts as a prioritized backlog of upcoming optimization experiments. Ea
 
 ### Priority Backlog
 
-1. **NEON BFDOT/BFMMLA BF16 matvec/matmul kernel (K1 / K3)**
-   - **Targets**: 1. Latency, 4. Memory usage (`encoder_ms`, `peak_rss_kb`)
-   - **Why**: Use native Armv8.6 hardware instructions (FEAT_BF16) for BF16 math to execute forward passes directly on BF16 weights. This avoids the F32 unpacking step, allowing us to keep the encoder weights in memory-mapped BF16 (M3-style memory savings) without paying the 3.5% latency conversion penalty.
-
-2. **INT8/FP16 KV Cache Quantization (KV1)**
+1. **INT8/FP16 KV Cache Quantization (KV1)**
    - **Targets**: 1. Latency, 4. Memory usage (`peak_rss_kb`, `decode_loop_ms_per_token`)
    - **Why**: The 2048-token KV cache allocates up to ~470 MB of F32 buffer space across 28 layers. Quantizing KV cache keys and values to FP16 or INT8 (group-wise/channel-wise) reduces maximum cache memory overhead by 50-75% and improves memory bandwidth during the autoregressive decode loop.
 
-3. **Cargo Release Profile Tweaks: Debug Stripping & Panic Abort (CT2)**
+2. **Cargo Release Profile Tweaks: Debug Stripping & Panic Abort (CT2)**
    - **Targets**: 3. Binary size, 1. Latency (`binary_size_bytes`)
    - **Why**: Currently, the release profile does not strip symbols or abort on panic. Adding `strip = true` and `panic = "abort"` in `Cargo.toml` strips debugging information and removes panic unwinding tables from the dynamic library. This can reduce the dynamic library (.so) binary footprint on Android by 50-80% and generate tighter, faster assembly.
 
-4. **FP16 Activation/Quantization for Encoder (E2)**
+3. **FP16 Activation/Quantization for Encoder (E2)**
    - **Targets**: 1. Latency, 4. Memory usage (`encoder_ms`)
    - **Why**: Keep intermediate activation buffers in FP16 instead of F32. On CPUs with native FP16 (`+fp16`), this cuts memory bandwidth usage in half, reduces cache line pressure, and doubles FLOPS throughput.
 
-5. **Cache line alignment for weight buffers (CL1)**
+4. **Cache line alignment for weight buffers (CL1)**
    - **Targets**: 1. Latency (`encoder_ms`, `prefill_ms`)
    - **Why**: Align memory-mapped weights and internal buffers to 64/128-byte boundaries to prevent split cache line loads and cache bank conflicts on the CPU.
 
-6. **Custom vectorized Softmax kernel (S1)**
+5. **Custom vectorized Softmax kernel (S1)**
    - **Targets**: 1. Latency (`encoder_ms`, `decode_loop_ms_per_token`)
    - **Why**: Attention layers perform row-wise softmax. Implementing a custom vectorized Softmax kernel with ARM NEON intrinsics (and math approximations for exp) will speed up attention overhead compared to scalar code.
 

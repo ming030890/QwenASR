@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from prepare_int8_model import get_tensor_np, read_safetensors
+from prepare_int8_model import get_tensor_np, quantize_bf16_to_int8, read_safetensors
 
 
 DECODER_PACKABLE_SUFFIXES = (
@@ -34,6 +34,11 @@ ENCODER_PACKABLE_SUFFIXES = (
     "self_attn.out_proj.weight",
     "fc1.weight",
     "fc2.weight",
+)
+ENCODER_PROJECTION_WEIGHTS = (
+    "thinker.audio_tower.conv_out.weight",
+    "thinker.audio_tower.proj1.weight",
+    "thinker.audio_tower.proj2.weight",
 )
 PACKED_SUFFIX = "_kleidiai_i8mm_packed"
 
@@ -81,10 +86,12 @@ def is_decoder_packable(name: str) -> bool:
 
 def is_encoder_packable(header: dict, name: str) -> bool:
     return (
-        "thinker.audio_tower.layers." in name
-        and name.endswith(ENCODER_PACKABLE_SUFFIXES)
-        and header[name]["dtype"] == "I8"
-    )
+        (
+            "thinker.audio_tower.layers." in name
+            and name.endswith(ENCODER_PACKABLE_SUFFIXES)
+        )
+        or name in ENCODER_PROJECTION_WEIGHTS
+    ) and header[name]["dtype"] in ("BF16", "I8")
 
 
 def is_packable(header: dict, name: str) -> bool:
@@ -186,7 +193,9 @@ def main() -> None:
     entries = []
     offset = 0
     for name in names:
-        n, k = header[name]["shape"]
+        shape = header[name]["shape"]
+        n = shape[0]
+        k = int(np.prod(shape[1:]))
         size = lib.kai_get_rhs_packed_size_rhs_pack_nxk_qsi8cxp_qsi8cx_neon(n, k, nr, kr, sr)
         packed_name = name + PACKED_SUFFIX
         entries.append((name, packed_name, n, k, size, offset))
@@ -203,14 +212,19 @@ def main() -> None:
         stream.write(struct.pack("<Q", len(header_bytes)))
         stream.write(header_bytes)
         for index, (name, _, n, k, size, _) in enumerate(entries, 1):
-            weights = np.ascontiguousarray(get_tensor_np(header, data, name), dtype=np.int8)
-            scales = np.ascontiguousarray(
-                get_tensor_np(header, data, name + "_int8_scale"), dtype=np.float32
-            )
+            source = get_tensor_np(header, data, name)
+            if header[name]["dtype"] == "BF16":
+                weights, scales = quantize_bf16_to_int8(source.reshape(n, k))
+            else:
+                weights = np.ascontiguousarray(source, dtype=np.int8)
+                scales = np.ascontiguousarray(
+                    get_tensor_np(header, data, name + "_int8_scale"),
+                    dtype=np.float32,
+                )
             bias_name = name.removesuffix("weight") + "bias"
             bias = (
                 np.ascontiguousarray(get_tensor_f32(header, data, bias_name))
-                if is_encoder_packable(header, name)
+                if is_encoder_packable(header, name) and bias_name in header
                 else np.zeros(n, dtype=np.float32)
             )
             packed = np.empty(size, dtype=np.uint8)

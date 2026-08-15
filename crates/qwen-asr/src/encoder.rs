@@ -151,12 +151,15 @@ pub struct Encoder {
     pub conv3_weight: Vec<f32>,
     pub conv3_bias: Vec<f32>,
     pub conv_out_weight_bf16: *const u16,
+    pub(crate) conv_out_weight_i8mm: Option<PackedInt8Buf>,
     pub layers: Vec<EncLayer>,
     pub ln_post_weight: Vec<f32>,
     pub ln_post_bias: Vec<f32>,
     pub proj1_weight_bf16: *const u16,
+    pub(crate) proj1_weight_i8mm: Option<PackedInt8Buf>,
     pub proj1_bias: Vec<f32>,
     pub proj2_weight_bf16: *const u16,
+    pub(crate) proj2_weight_i8mm: Option<PackedInt8Buf>,
     pub proj2_bias: Vec<f32>,
 }
 
@@ -370,7 +373,8 @@ impl Encoder {
         let conv2_bias = load_f32(ms, &format!("{}conv2d2.bias", p))?;
         let conv3_weight = load_f32(ms, &format!("{}conv2d3.weight", p))?;
         let conv3_bias = load_f32(ms, &format!("{}conv2d3.bias", p))?;
-        let conv_out_weight_bf16 = load_bf16_direct(ms, &format!("{}conv_out.weight", p))?;
+        let (conv_out_weight_bf16, _, conv_out_weight_i8mm, _, _) =
+            load_bf16_or_int8(ms, &format!("{}conv_out.weight", p), cfg.enc_d_model, 7680)?;
 
         let mut layers = Vec::new();
         for i in 0..cfg.enc_layers {
@@ -447,9 +451,19 @@ impl Encoder {
 
         let ln_post_weight = load_f32(ms, &format!("{}ln_post.weight", p))?;
         let ln_post_bias = load_f32(ms, &format!("{}ln_post.bias", p))?;
-        let proj1_weight_bf16 = load_bf16_direct(ms, &format!("{}proj1.weight", p))?;
+        let (proj1_weight_bf16, _, proj1_weight_i8mm, _, _) = load_bf16_or_int8(
+            ms,
+            &format!("{}proj1.weight", p),
+            cfg.enc_d_model,
+            cfg.enc_d_model,
+        )?;
         let proj1_bias = load_f32(ms, &format!("{}proj1.bias", p))?;
-        let proj2_weight_bf16 = load_bf16_direct(ms, &format!("{}proj2.weight", p))?;
+        let (proj2_weight_bf16, _, proj2_weight_i8mm, _, _) = load_bf16_or_int8(
+            ms,
+            &format!("{}proj2.weight", p),
+            cfg.enc_output_dim,
+            cfg.enc_d_model,
+        )?;
         let proj2_bias = load_f32(ms, &format!("{}proj2.bias", p))?;
 
         Some(Encoder {
@@ -460,12 +474,15 @@ impl Encoder {
             conv3_weight,
             conv3_bias,
             conv_out_weight_bf16,
+            conv_out_weight_i8mm,
             layers,
             ln_post_weight,
             ln_post_bias,
             proj1_weight_bf16,
+            proj1_weight_i8mm,
             proj1_bias,
             proj2_weight_bf16,
+            proj2_weight_i8mm,
             proj2_bias,
         })
     }
@@ -626,16 +643,26 @@ impl Encoder {
 
             // Project: [w3, 7680] -> [w3, d_model]
             let projected = &mut bufs.x[token_offset * d_model..(token_offset + w3) * d_model];
-            unsafe {
-                kernels::linear_nobias_bf16_scratch(
-                    projected,
-                    reshaped,
-                    self.conv_out_weight_bf16,
-                    w3,
-                    conv_proj_dim,
-                    d_model,
-                    &mut bufs.bf16_scratch,
-                );
+            if linear_i8mm(
+                projected,
+                reshaped,
+                &self.conv_out_weight_i8mm,
+                w3,
+                conv_proj_dim,
+                d_model,
+            ) {
+            } else {
+                unsafe {
+                    kernels::linear_nobias_bf16_scratch(
+                        projected,
+                        reshaped,
+                        self.conv_out_weight_bf16,
+                        w3,
+                        conv_proj_dim,
+                        d_model,
+                        &mut bufs.bf16_scratch,
+                    );
+                }
             }
 
             // Add per-chunk sinusoidal PE
@@ -939,32 +966,52 @@ impl Encoder {
         bufs.x[..td].copy_from_slice(&bufs.x_norm[..td]);
 
         // Projection: proj1 (GELU) -> proj2 (reuse scratch buffers)
-        unsafe {
-            kernels::linear_bf16_scratch(
-                &mut bufs.q[..td],
-                &bufs.x[..td],
-                self.proj1_weight_bf16,
-                Some(&self.proj1_bias),
-                total_tokens,
-                d_model,
-                d_model,
-                &mut bufs.bf16_scratch,
-            );
+        if linear_i8mm(
+            &mut bufs.q[..td],
+            &bufs.x[..td],
+            &self.proj1_weight_i8mm,
+            total_tokens,
+            d_model,
+            d_model,
+        ) {
+        } else {
+            unsafe {
+                kernels::linear_bf16_scratch(
+                    &mut bufs.q[..td],
+                    &bufs.x[..td],
+                    self.proj1_weight_bf16,
+                    Some(&self.proj1_bias),
+                    total_tokens,
+                    d_model,
+                    d_model,
+                    &mut bufs.bf16_scratch,
+                );
+            }
         }
         kernels::gelu(&mut bufs.q[..td], td);
 
         let mut enc_output = vec![0.0f32; total_tokens * output_dim];
-        unsafe {
-            kernels::linear_bf16_scratch(
-                &mut enc_output,
-                &bufs.q[..td],
-                self.proj2_weight_bf16,
-                Some(&self.proj2_bias),
-                total_tokens,
-                d_model,
-                output_dim,
-                &mut bufs.bf16_scratch,
-            );
+        if linear_i8mm(
+            &mut enc_output,
+            &bufs.q[..td],
+            &self.proj2_weight_i8mm,
+            total_tokens,
+            d_model,
+            output_dim,
+        ) {
+        } else {
+            unsafe {
+                kernels::linear_bf16_scratch(
+                    &mut enc_output,
+                    &bufs.q[..td],
+                    self.proj2_weight_bf16,
+                    Some(&self.proj2_bias),
+                    total_tokens,
+                    d_model,
+                    output_dim,
+                    &mut bufs.bf16_scratch,
+                );
+            }
         }
 
         Some((enc_output, total_tokens))
