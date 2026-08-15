@@ -3,6 +3,8 @@ fn main() {
     let blas_backend = std::env::var("QWEN_BLAS_BACKEND").unwrap_or_default();
     println!("cargo:rerun-if-env-changed=QWEN_BLAS_BACKEND");
     println!("cargo:rerun-if-env-changed=OPENBLAS_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=OPENBLAS_ANDROID_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=OPENBLAS_ANDROID_STATIC");
     println!("cargo:rerun-if-env-changed=KLEIDIAI_LIB_DIR");
     println!("cargo:rustc-check-cfg=cfg(qwen_openblas)");
 

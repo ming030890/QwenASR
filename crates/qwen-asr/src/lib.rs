@@ -89,6 +89,9 @@ pub fn optimization_flags() -> Vec<&'static str> {
     // Architecture-specific SIMD
     if cfg!(target_arch = "aarch64") {
         flags.push("NEON");
+        if cfg!(all(feature = "kleidiai", target_os = "android")) {
+            flags.push("KleidiAI-I8MM");
+        }
         if cfg!(target_feature = "dotprod") {
             flags.push("DotProd");
         }

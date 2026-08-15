@@ -1354,9 +1354,9 @@ fn int8_matvec_threaded(
 #[cfg(feature = "kleidiai")]
 pub fn kleidiai_packed_rhs_size(in_dim: usize, out_dim: usize) -> usize {
     unsafe extern "C" {
-        fn kai_get_nr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod() -> usize;
-        fn kai_get_kr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod() -> usize;
-        fn kai_get_sr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod() -> usize;
+        fn kai_get_nr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm() -> usize;
+        fn kai_get_kr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm() -> usize;
+        fn kai_get_sr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm() -> usize;
         fn kai_get_rhs_packed_size_rhs_pack_nxk_qsi8cxp_qsi8cx_neon(
             n: usize,
             k: usize,
@@ -1367,9 +1367,9 @@ pub fn kleidiai_packed_rhs_size(in_dim: usize, out_dim: usize) -> usize {
     }
 
     unsafe {
-        let nr = kai_get_nr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod();
-        let kr = kai_get_kr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod();
-        let sr = kai_get_sr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod();
+        let nr = kai_get_nr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm();
+        let kr = kai_get_kr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm();
+        let sr = kai_get_sr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm();
         kai_get_rhs_packed_size_rhs_pack_nxk_qsi8cxp_qsi8cx_neon(out_dim, in_dim, nr, kr, sr)
     }
 }
@@ -1387,9 +1387,9 @@ pub fn linear_nobias_int8_kleidiai(
     use std::ffi::c_void;
 
     unsafe extern "C" {
-        fn kai_get_mr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod() -> usize;
-        fn kai_get_kr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod() -> usize;
-        fn kai_get_sr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod() -> usize;
+        fn kai_get_mr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm() -> usize;
+        fn kai_get_kr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm() -> usize;
+        fn kai_get_sr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm() -> usize;
         fn kai_get_lhs_packed_size_lhs_quant_pack_qai8dxp_f32(
             m: usize,
             k: usize,
@@ -1408,7 +1408,7 @@ pub fn linear_nobias_int8_kleidiai(
             lhs_stride: usize,
             lhs_packed: *mut c_void,
         );
-        fn kai_run_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod(
+        fn kai_run_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm(
             m: usize,
             n: usize,
             k: usize,
@@ -1426,9 +1426,9 @@ pub fn linear_nobias_int8_kleidiai(
     debug_assert_eq!(y.len(), seq_len * out_dim);
 
     unsafe {
-        let mr = kai_get_mr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod();
-        let kr = kai_get_kr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod();
-        let sr = kai_get_sr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod();
+        let mr = kai_get_mr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm();
+        let kr = kai_get_kr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm();
+        let sr = kai_get_sr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm();
         let lhs_size =
             kai_get_lhs_packed_size_lhs_quant_pack_qai8dxp_f32(seq_len, in_dim, mr, kr, sr);
         let rhs_size = kleidiai_packed_rhs_size(in_dim, out_dim);
@@ -1450,7 +1450,7 @@ pub fn linear_nobias_int8_kleidiai(
             in_dim * size_of::<f32>(),
             lhs_packed.as_mut_ptr().cast(),
         );
-        kai_run_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod(
+        kai_run_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm(
             seq_len,
             out_dim,
             in_dim,

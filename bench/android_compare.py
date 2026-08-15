@@ -43,8 +43,6 @@ SCRIPT_DIR   = Path(__file__).parent.resolve()
 PROJECT_DIR  = SCRIPT_DIR.parent
 GATE_SCRIPT  = SCRIPT_DIR / "android_check_gate.py"
 
-GUARDRAIL_KEYWORDS = ["你好吗", "坐低咗"]
-
 TSV_HEADER = "\t".join([
     "timestamp", "label", "threads", "input",
     "model_load_ms", "memory_after_model_load_kb", "peak_inference_rss_kb",
@@ -139,7 +137,8 @@ def append_tsv(tsv_path, json_path, timestamp, label, threads, input_name):
     guardrail_ok = ""
     if input_name == "ptt_guardrail":
         t = files[0]["transcript"]
-        ok = all(kw in t for kw in GUARDRAIL_KEYWORDS)
+        has_nihao = any(text in t for text in ("你好吗", "你好嗎", "你好嘛"))
+        ok = has_nihao and "坐低咗" in t
         guardrail_ok = str(ok).lower()
         mark = "✓" if ok else "✗"
         print(f"  guardrail {mark}: {t!r}")

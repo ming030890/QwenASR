@@ -183,7 +183,7 @@ fn load_kleidiai_weight(
     in_dim: usize,
     out_dim: usize,
 ) -> Option<PackedInt8Buf> {
-    let packed_name = format!("{name}_kleidiai_dotprod_packed");
+    let packed_name = format!("{name}_kleidiai_i8mm_packed");
     let (ptr, len) = ms.get_i8_ptr(&packed_name)?;
     let expected = kernels::kleidiai_packed_rhs_size(in_dim, out_dim);
     if len != expected {
@@ -209,7 +209,7 @@ fn packed_decoder_tensor_counts(ms: &MultiSafetensors, cfg: &QwenConfig) -> (usi
     let found = (0..cfg.dec_layers)
         .flat_map(|layer| {
             SUFFIXES.into_iter().map(move |suffix| {
-                format!("thinker.model.layers.{layer}.{suffix}_kleidiai_dotprod_packed")
+                format!("thinker.model.layers.{layer}.{suffix}_kleidiai_i8mm_packed")
             })
         })
         .filter(|name| ms.get_i8_ptr(name).is_some())
@@ -400,6 +400,13 @@ impl Decoder {
             if packed_found != 0 && packed_found != packed_expected {
                 eprintln!(
                     "decoder: incomplete KleidiAI packed decoder: found {packed_found} of {packed_expected} projections"
+                );
+                return None;
+            }
+            #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+            if packed_found == packed_expected && !std::arch::is_aarch64_feature_detected!("i8mm") {
+                eprintln!(
+                    "decoder: KleidiAI I8MM-packed model requires an Arm CPU with I8MM support"
                 );
                 return None;
             }

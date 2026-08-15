@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Create a packed-only Android Qwen model for the KleidiAI decoder backend.
+"""Create an I8MM-packed-only Android Qwen model for the KleidiAI decoder backend.
 
 The output base model retains shared tensors but omits row-major decoder
 projection weights and scales. A second mmap-able safetensors file contains the
-complete DotProd-packed decoder layout used by both prefill and decode.
+complete I8MM-packed decoder layout used by both prefill and decode.
 """
 
 import argparse
@@ -26,7 +26,7 @@ PACKABLE_SUFFIXES = (
     "mlp.gate_up_fused.weight",
     "mlp.down_proj.weight",
 )
-PACKED_SUFFIX = "_kleidiai_dotprod_packed"
+PACKED_SUFFIX = "_kleidiai_i8mm_packed"
 
 
 class PackParams(ctypes.Structure):
@@ -36,9 +36,9 @@ class PackParams(ctypes.Structure):
 def load_kleidiai(path: Path):
     lib = ctypes.CDLL(str(path))
     for name in (
-        "kai_get_nr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod",
-        "kai_get_kr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod",
-        "kai_get_sr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod",
+        "kai_get_nr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm",
+        "kai_get_kr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm",
+        "kai_get_sr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm",
     ):
         getattr(lib, name).restype = ctypes.c_size_t
     lib.kai_get_rhs_packed_size_rhs_pack_nxk_qsi8cxp_qsi8cx_neon.argtypes = [
@@ -146,9 +146,9 @@ def main() -> None:
         raise SystemExit("no packed-decoder candidates found")
 
     lib = load_kleidiai(Path(args.kleidiai_lib).resolve())
-    nr = lib.kai_get_nr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod()
-    kr = lib.kai_get_kr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod()
-    sr = lib.kai_get_sr_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod()
+    nr = lib.kai_get_nr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm()
+    kr = lib.kai_get_kr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm()
+    sr = lib.kai_get_sr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm()
 
     entries = []
     offset = 0

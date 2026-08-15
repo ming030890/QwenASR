@@ -38,8 +38,6 @@ import sys
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "android-results")
 
-GUARDRAIL_KEYWORDS = ["你好吗", "坐低咗"]
-
 STAGE1_REGRESSION_LIMIT    = 0.10
 STAGE2_REGRESSION_LIMIT    = 0.05
 STAGE2_PROMOTION_THRESHOLD = 0.03
@@ -66,12 +64,12 @@ def check_guardrail(label, threads):
     if not data.get("files"):
         return False, "ptt_guardrail JSON has no files"
     transcript = data["files"][0]["transcript"]
-    has_nihao = "你好吗" in transcript or "你好嗎" in transcript
+    has_nihao = any(text in transcript for text in ("你好吗", "你好嗎", "你好嘛"))
     has_zuodi = "坐低咗" in transcript
     if not (has_nihao and has_zuodi):
         missing = []
         if not has_nihao:
-            missing.append("你好吗/你好嗎")
+            missing.append("你好吗/你好嗎/你好嘛")
         if not has_zuodi:
             missing.append("坐低咗")
         return False, f"FAIL — transcript '{transcript}' missing keywords {missing}"

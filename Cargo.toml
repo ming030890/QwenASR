@@ -14,4 +14,5 @@ qwen-asr = { version = "0.7.0", path = "crates/qwen-asr", default-features = fal
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
+codegen-units = 1
