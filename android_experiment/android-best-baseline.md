@@ -1,81 +1,81 @@
 # Android best baseline
 
-Canonical result for quick comparison:
+The current deployable baseline is K8, measured on a Pixel 10 with one engine
+thread and fixed-performance mode. The standalone canonical run is retained for
+reproduction; optimization deltas come from the same-session K7/K8 A/B because
+Android decoder timings vary materially between sessions.
 
-| Result | Label | Common Voice median | Common Voice encode | Common Voice decode | Guardrail median | Guardrail encode | Guardrail decode | Guardrail transcript |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| Best accepted (K4 INT8 SDOT prefill) | `android-accept-k4-int8-prefill-sdot-20260525-185000` | `1565.846 ms` | `427.531 ms` | `1131.815 ms` | `2481.900 ms` | `765.100 ms` | `1716.600 ms` | `Hello，你好吗？已经坐低咗啦。` |
-| Previous accepted (M1 transient prefill dequant) | `android-accept-m1-transient-prefill-dequant-20260525-141733` | `1722.546 ms` | `378.444 ms` | `1345.889 ms` | `2716.500 ms` | `748.495 ms` | `1967.856 ms` | `哈喽，你好吗？已经坐低咗啦。` |
-| Previous accepted (INT8 mmap) | `android-accept-q2b-int8-mmap-20260525-131609` | `1742.230 ms` | `378.124 ms` | `1364.184 ms` | `2750.264 ms` | `742.325 ms` | `2003.709 ms` | `哈喽，你好吗？已经坐低咗啦。` |
-| Best BF16 accepted | `android-baseline-openblas-fixedperf-t1-r3-20260524-215914` | `1677.491 ms` | `383.011 ms` | `1305.652 ms` | `2609.735 ms` | `722.009 ms` | `1908.856 ms` | `哈喽，你好吗？已经坐低咗啦。` |
+| Result | Label | Common Voice median | Encoder | First visible token | Peak RSS | Guardrail transcript |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| Current K8 full linear INT8 | `android-pixel10-k8-full-encoder-int8-20260815` | `2196.233 ms` | `252.257 ms` | `1497.915 ms` | `2192632 KiB` | `哈喽，你好嘛？已经坐低咗啦。` |
+| Historical K4 INT8 SDOT prefill | `android-accept-k4-int8-prefill-sdot-20260525-185000` | `1565.846 ms` | — | — | `1.42 GB` | `Hello，你好吗？已经坐低咗啦。` |
+| Historical M1 transient prefill dequant | `android-accept-m1-transient-prefill-dequant-20260525-141733` | `1722.546 ms` | — | — | `2.14 GB` | `哈喽，你好吗？已经坐低咗啦。` |
 
-K4 INT8 SDOT prefill delta versus previous M1 baseline:
+Historical rows were captured on different devices/builds and are not direct
+performance comparisons with K8.
 
-| Metric | Delta | Details |
-| --- | ---: | --- |
-| Common Voice median inference | `-9.1%` faster | `1565.8 ms` vs `1722.5 ms` |
-| Model load time | `-68.3%` faster | `128.1 ms` vs `404.7 ms` |
-| Memory after load (RSS) | `-67.6%` lower | `508.0 MB` vs `1.57 GB` |
-| Peak inference RSS | `-33.2%` lower | `1.42 GB` vs `2.14 GB` |
+## Controlled K7 to K8 result
 
-M1 transient prefill dequant delta versus previous Q2B baseline:
+The accepted same-session Pixel 10 A/B showed:
 
-| Metric | Delta | Details |
-| --- | ---: | --- |
-| Common Voice median inference | `-1.1%` faster | `1722.5 ms` vs `1742.2 ms` |
-| Model load time | `-56.7%` faster | `404.7 ms` vs `935.2 ms` |
-| Memory after load (RSS) | `-57.7%` lower | `1.57 GB` vs `3.71 GB` |
-| Peak inference RSS | `-44.3%` lower | `2.14 GB` vs `3.83 GB` |
+| Metric | K7 | K8 | Delta |
+| --- | ---: | ---: | ---: |
+| Common Voice median inference | `1574.075 ms` | `1500.350 ms` | `-4.7%` |
+| Common Voice median encoder | `238.371 ms` | `193.163 ms` | `-19.0%` |
+| Common Voice median first-visible token | `1088.979 ms` | `1017.995 ms` | `-6.5%` |
+| Guardrail inference | `2428.365 ms` | `2314.875 ms` | `-4.7%` |
+| Guardrail encoder | `457.682 ms` | `339.112 ms` | `-25.9%` |
+| Guardrail first-visible token | `1536.008 ms` | `1416.941 ms` | `-7.8%` |
+| Common Voice peak RSS | `2264128 KiB` | `2145332 KiB` | `-5.2%` |
+| Artifact size | `2027.83 MiB` | `1957.83 MiB` | `-3.5%` |
 
-Q2B INT8 mmap delta versus latest Python rerun:
+All five Common Voice transcripts and the push-to-talk guardrail transcript
+matched exactly. See
+[`android-speed-results/k8-full-encoder-linear-int8-pixel10.md`](android-speed-results/k8-full-encoder-linear-int8-pixel10.md)
+for the full experiment and rejected convolution extension.
 
-| Metric | Delta | Details |
-| --- | ---: | --- |
-| Common Voice median inference | `-2.0%` faster | `1742.2 ms` vs `1778.2 ms` |
-| Model load time | `-31.4%` faster | `935.2 ms` vs `1363.7 ms` |
-| Memory after load (RSS) | `-24.5%` lower | `3.71 GB` vs `4.91 GB` |
-| Peak inference RSS | `-23.9%` lower | `3.83 GB` vs `5.04 GB` |
+## Accepted configuration
 
-Best accepted config:
+- Model: `/Volumes/SSD/Qwen3-ASR-1.7B-int8-kleidiai-i8mm-full-encoder-packed`.
+- 315 matrices are INT8 and packed offline: 147 encoder and 168 decoder.
+- Every encoder linear weight uses the KleidiAI I8MM backend; runtime packing,
+  experimental fallbacks, and obsolete opt-in flags are absent.
+- The BF16 convolution filters remain because quantizing them caused all six
+  validation transcripts to become empty.
+- OpenBLAS 0.3.34 static Android arm64 archive at
+  `/private/tmp/OpenBLAS-0.3.34`, single-threaded CBLAS.
+- KleidiAI I8MM archive at `/private/tmp/qwen-kleidiai-review/build-android-qwen`.
+- Build features: `android-blas kleidiai`; Rust target feature: `+dotprod`.
+- Runtime: language `Auto`, prompt `音频是粤语，可能夹杂英语`, one engine
+  thread, three repetitions, fixed-performance mode.
 
-- Static Android arm64 OpenBLAS archive at `/private/tmp/OpenBLAS/libopenblas.a`.
-- OpenBLAS build: `TARGET=ARMV8`, `OSNAME=Android`, `BINARY=64`, `ONLY_CBLAS=1`, `NOFORTRAN=1`, `USE_THREAD=0`, `NUM_THREADS=1`.
-- Benchmark build: `CARGO_FEATURES_EXTRA=android-blas`, `RUSTFLAGS_EXTRA="-C target-feature=+dotprod"`, `OPENBLAS_ANDROID_STATIC=1`.
-- Model build: Pre-quantized using `prepare_int8_model.py` with zero-copy INT8 decoder projections and pre-fused gate+up MLP tensors.
-- Decoder prefill: INT8 projection weights dequantize transiently into a shared
-  F32 scratch buffer instead of permanent per-layer F32 heap copies.
-- Benchmark run: fixed-performance mode, `BENCH_LANGUAGE=Auto`, `BENCH_PROMPT="音频是粤语，可能夹杂英语"`, engine `threads=1`, `runs=3`.
-
-Rebuild the baseline OpenBLAS archive with:
+Rebuild OpenBLAS with:
 
 ```bash
 bench/build-openblas-android-baseline.sh --force
 ```
 
-Rerun the full baseline with:
+Rerun the baseline with:
 
 ```bash
-MODEL_DIR=/Volumes/SSD/qwen-asr-int8dec \
-OPENBLAS_ANDROID_LIB_DIR=/private/tmp/OpenBLAS \
+MODEL_DIR=/Volumes/SSD/Qwen3-ASR-1.7B-int8-kleidiai-i8mm-full-encoder-packed \
+KLEIDIAI_LIB_DIR=/private/tmp/qwen-kleidiai-review/build-android-qwen \
+OPENBLAS_ANDROID_LIB_DIR=/private/tmp/OpenBLAS-0.3.34 \
 OPENBLAS_ANDROID_STATIC=1 \
-CARGO_FEATURES_EXTRA=android-blas \
+CARGO_FEATURES_EXTRA="android-blas kleidiai" \
 RUSTFLAGS_EXTRA="-C target-feature=+dotprod" \
 BENCH_LANGUAGE=Auto \
 BENCH_PROMPT="音频是粤语，可能夹杂英语" \
 bench/android_run.py \
-  --label android-accept-m1-transient-prefill-dequant-$(date -u +%Y%m%d-%H%M%S) \
+  --label android-pixel10-k8-full-encoder-int8-$(date -u +%Y%m%d-%H%M%S) \
   --assets-dir bench/android-assets \
   --threads "1" \
   --runs 3
 ```
 
-JSON references:
+Canonical raw JSON (gitignored local benchmark output):
 
-- `bench/android-results/android-accept-m1-transient-prefill-dequant-20260525-141733/common_voice-t1.json`
-- `bench/android-results/android-accept-m1-transient-prefill-dequant-20260525-141733/ptt_guardrail-t1.json`
-- `bench/android-results/android-accept-q2b-int8-mmap-20260525-131609/common_voice-t1.json`
-- `bench/android-results/android-accept-q2b-int8-mmap-20260525-131609/ptt_guardrail-t1.json`
-- `bench/android-results/android-baseline-openblas-fixedperf-t1-r3-20260524-215914/common_voice-t1.json`
-- `bench/android-results/android-baseline-openblas-fixedperf-t1-r3-20260524-215914/ptt_guardrail-t1.json`
-- `bench/android-results/android-baseline-py-full-20260525-103710/common_voice-t1.json`
-- `bench/android-results/android-baseline-py-full-20260525-103710/ptt_guardrail-t1.json`
+- `bench/android-results/android-pixel10-k8-full-encoder-int8-20260815/common_voice-t1.json`
+- `bench/android-results/android-pixel10-k8-full-encoder-int8-20260815/ptt_guardrail-t1.json`
+
+The checked-in snapshot is `bench/latest_baseline.json`.
