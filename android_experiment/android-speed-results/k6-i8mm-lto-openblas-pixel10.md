@@ -53,12 +53,12 @@ are:
 
 Common Voice median inference changed from 2605.9 to 2599.0 ms (**-0.3%**) and
 guardrail inference from 4040.0 to 4028.8 ms (**-0.3%**). Encoder latency moved
-about 0.2%. This is measurement noise, so 0.3.34 is rejected as a performance
-change and the existing OpenBLAS revision remains pinned.
+about 0.2%. This is measurement noise, so 0.3.34 is not counted as a performance
+win. It is nevertheless accepted as a maintenance update after the separate
+request to update the library.
 
 ## Decision
 
 - Accept the I8MM-packed decoder.
 - Accept fat LTO with one codegen unit.
-- Reject the OpenBLAS 0.3.34 bump as a latency optimization.
-
+- Accept OpenBLAS 0.3.34 as a maintenance update, not a latency optimization.

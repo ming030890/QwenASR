@@ -119,8 +119,9 @@ Against a same-state DotProd control, Common Voice inference improved 7.5%,
 first-visible-token latency 7.4%, prefill 17.8%, and decode-loop latency 6.2%,
 with unchanged peak RSS and exact parity with the accepted packed transcripts.
 Fat LTO plus one codegen unit then provided another 1.7% median inference gain
-and reduced the binary by 11.6%. OpenBLAS 0.3.34 changed inference by only 0.3%
-and was rejected as noise. Full measurements are recorded in
+and reduced the binary by 11.6%. OpenBLAS 0.3.34 changed inference by only 0.3%,
+so it is retained as a maintenance update rather than credited as a latency
+win. Full measurements are recorded in
 [`k6-i8mm-lto-openblas-pixel10.md`](../../android_experiment/android-speed-results/k6-i8mm-lto-openblas-pixel10.md).
 
 The runner defaults to requiring a model detected by the engine as `1.7B`; this

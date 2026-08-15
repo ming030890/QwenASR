@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 OPENBLAS_REPO="${OPENBLAS_REPO:-https://github.com/OpenMathLib/OpenBLAS.git}"
-OPENBLAS_REF="${OPENBLAS_REF:-1bd74ad3d1e8d21f86d1a6be35abfcdf27c0208a}"
+OPENBLAS_REF="${OPENBLAS_REF:-e0166008be8e466242aa76b2ff75ce3f0fbf574a}"
 OPENBLAS_DIR="${OPENBLAS_DIR:-/private/tmp/OpenBLAS}"
 NDK_VERSION="${NDK_VERSION:-29.0.14206865}"
 ANDROID_API="${ANDROID_API:-35}"
