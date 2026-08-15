@@ -9,7 +9,6 @@ complete DotProd-packed decoder layout used by both prefill and decode.
 import argparse
 import ctypes
 import json
-import os
 import shutil
 import struct
 from pathlib import Path

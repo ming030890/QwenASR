@@ -16,44 +16,45 @@ Purpose:
 - Threads: 1.
 - Repetitions: 3 per input.
 - Inputs: five Common Voice clips plus `ptt_guardrail.wav`.
-- Model: Qwen3-ASR 1.7B INT8 encoder/decoder candidate plus a 1.35 GiB
-  offline-packed KleidiAI shard.
+- Final model: a 675.87 MiB shared/base shard plus a 1.35 GiB packed decoder
+  shard. All 168 row-major decoder projections and scales are omitted, reducing
+  logical deployed size from 3.3 GiB to 2.0 GiB.
 - Binary: same Android arm64 binary for control and candidate, linked with
   static OpenBLAS and KleidiAI revision
   `6787251d9cc2f38a3a6024b11fd7ace10cde4cd9`.
-- Control: `QWEN_KLEIDIAI_PREFILL=0`.
-- Prefill-only candidate: `QWEN_KLEIDIAI_PREFILL=1
-  QWEN_KLEIDIAI_PACK_CACHE=0`.
-- Fully packed candidate: `QWEN_KLEIDIAI_PREFILL=1
-  QWEN_KLEIDIAI_DECODE=1 QWEN_KLEIDIAI_PACK_CACHE=0`.
+- No backend environment flags. The Android KleidiAI build automatically uses
+  the packed backend only when all 168 projections are present.
 
 Result directories:
 
 - `bench/android-results/android-pixel10-kleidiai-control-20260815`
 - `bench/android-results/android-pixel10-kleidiai-offline-packed-20260815`
 - `bench/android-results/android-pixel10-kleidiai-packed-all-20260815`
+- `bench/android-results/android-pixel10-kleidiai-packed-only-20260815`
 
 ## Results
 
-| Metric | Control | Packed prefill + decode | Delta |
+| Metric | Control | Packed-only backend | Delta |
 | --- | ---: | ---: | ---: |
-| Common Voice median inference | 4766.391 ms | 2839.390 ms | **-40.4%** |
-| Common Voice median first-visible token | 3803.202 ms | 2087.632 ms | **-45.1%** |
-| Common Voice median prefill | 2324.371 ms | 699.970 ms | **-69.9%** |
-| Common Voice median decode loop | 1784.403 ms | 1472.354 ms | **-17.5%** |
-| Guardrail inference | 7615.522 ms | 4441.602 ms | **-41.7%** |
-| Guardrail first-visible token | 5867.167 ms | 3053.721 ms | **-48.0%** |
-| Guardrail prefill | 3854.890 ms | 1161.539 ms | **-69.9%** |
-| Guardrail decode loop | 2565.011 ms | 2097.701 ms | **-18.2%** |
-| Peak RSS, Common Voice | 2268456 KiB | 2279996 KiB | **+0.5%** |
-| Peak RSS, guardrail | 2282952 KiB | 2295168 KiB | **+0.5%** |
+| Common Voice median inference | 4766.391 ms | 2849.027 ms | **-40.2%** |
+| Common Voice median first-visible token | 3803.202 ms | 2115.961 ms | **-44.4%** |
+| Common Voice median prefill | 2324.371 ms | 708.485 ms | **-69.5%** |
+| Common Voice median decode loop | 1784.403 ms | 1471.657 ms | **-17.5%** |
+| Guardrail inference | 7615.522 ms | 4425.004 ms | **-41.9%** |
+| Guardrail first-visible token | 5867.167 ms | 3037.871 ms | **-48.2%** |
+| Guardrail prefill | 3854.890 ms | 1152.733 ms | **-70.1%** |
+| Guardrail decode loop | 2565.011 ms | 2090.337 ms | **-18.5%** |
+| Peak RSS, Common Voice | 2268456 KiB | 2253084 KiB | **-0.7%** |
+| Peak RSS, guardrail | 2282952 KiB | 2278588 KiB | **-0.2%** |
+| Load-time RSS, Common Voice | 59924 KiB | 43808 KiB | **-26.9%** |
 
 The first prefill-only candidate reduced TTFT but raised peak RSS by 60.7%:
 prefill faulted in the packed model-file pages while single-token decode still
 faulted in the original row-major INT8 pages. Routing decode through the same
 offline-packed weights prevents the duplicate projection layouts from becoming
-resident. This removes essentially the entire memory regression and also makes
-the decode loop 17.5-18.2% faster.
+resident. Routing both phases through one backend removed that regression. The
+final packed-only artifact also removes the unused row-major tensors from disk
+and eliminates their loader representation entirely.
 
 ## Transcript gate
 
@@ -63,18 +64,21 @@ Five of six clips match exactly. One fails:
 | --- | --- | --- |
 | `cv_yue_002.wav` | `證據嘅話，真係冇啊！` | `证据嘅话，真系冇啊！` |
 
-The guardrail transcript is restored exactly by the fully packed decode path.
+The final packed-only model matches all six transcripts from the prior
+dual-layout packed candidate. The guardrail transcript is restored exactly.
 All three repetitions are stable, so the remaining traditional/simplified
-character change is deterministic numerical behavior rather than run-to-run
-noise.
+character change versus row-major control is deterministic numerical behavior.
 
 ## Decision
 
-**Accept the memory/latency optimization as the Android packed candidate.** Use
-packed prefill and packed decode together; prefill-only is rejected because it
-makes both weight layouts resident. The remaining caveat is one exact transcript
-mismatch out of six, so the KleidiAI path remains isolated behind its Android
-feature and runtime switches rather than becoming the cross-platform default.
+**Accept the packed-only model as the Android packed candidate.** Prefill and
+decode are now one atomic backend; partial packed shards fail at model load.
+Independent runtime switches, transient packing, the packed-weight cache, the
+rejected INT8 prefill kernel, and unused F32 projection scratch were removed.
+The remaining caveat is one exact transcript mismatch out of six versus the
+row-major quality reference, so the backend remains Android-specific rather
+than becoming the cross-platform default.
 
-No F32 last-layer fallback is used: the fully packed path gives the lowest
-latency and keeps peak RSS within 0.5% of control.
+No F32 last-layer fallback is used. The packed-only path gives the lowest
+storage footprint while keeping latency and output equivalent to the prior
+dual-layout packed candidate.

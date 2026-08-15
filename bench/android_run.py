@@ -203,6 +203,10 @@ def main():
     p.add_argument("--runs",       type=int, default=3)
     p.add_argument("--threads",    default="1", help='space-separated thread counts, e.g. "1 2 4"')
     p.add_argument("--remote-dir", default="/data/local/tmp/qwen-asr-bench")
+    p.add_argument(
+        "--remote-model-dir",
+        help="Reuse an explicit on-device model directory (implies --skip-model-push)",
+    )
     p.add_argument("--adb",        default=env("ADB", os.path.expanduser("~/Library/Android/sdk/platform-tools/adb")))
     p.add_argument("--profile",     action="store_true", help="Enable kernel profiling counters")
     p.add_argument("--save-binary", metavar="PATH",
@@ -291,7 +295,7 @@ def main():
     log("\n── Push ─────────────────────────────────────────────────")
     bin_path      = PROJECT_DIR / "target/aarch64-linux-android/release/qwen-asr-bench-android"
     remote_bin    = f"{args.remote_dir}/qwen-asr-bench-android"
-    remote_model  = f"{args.remote_dir}/model"
+    remote_model  = args.remote_model_dir or f"{args.remote_dir}/model"
     remote_assets = f"{args.remote_dir}/assets"
     remote_cv     = f"{args.remote_dir}/common_voice"
 
@@ -305,7 +309,7 @@ def main():
              capture_output=True)
     if openblas_runtime:
         run_step("push OpenBLAS runtime", [args.adb, "push", openblas_runtime, f"{args.remote_dir}/"])
-    if args.skip_model_push:
+    if args.skip_model_push or args.remote_model_dir:
         log(f"  reusing model already present at {remote_model}")
     else:
         run_step(f"push model ({args.model_dir})", [args.adb, "push", f"{args.model_dir}/.", remote_model])

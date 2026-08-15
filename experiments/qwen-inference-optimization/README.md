@@ -23,9 +23,8 @@ Decoder projections and the tied LM head are stored mmap-ready as INT8, the
 duplicate BF16 token embedding is omitted, and prefill dequantizes only 256
 output rows at a time into reusable F32 scratch for OpenBLAS.
 
-The accepted prefill configuration is now the runtime default. Set
-`QWEN_INT8_PREFILL_F32=0` only for a diagnostic rollback; override
-`QWEN_INT8_PREFILL_TILE_ROWS` only for controlled tile-size experiments.
+The row-major fallback permanently uses the accepted 256-row tiled-F32 prefill
+path. The rejected INT8 matmat branch and its runtime tuning flags were removed.
 
 Against the optimized BF16 candidate (`018`), it reduced peak RSS by 56.4%,
 model files by 49.8%, median inference latency by 5.4%, and P95 latency by 2.7%.
@@ -54,11 +53,12 @@ Run `032` separately established the FFN boundary: including layer 6 changed one
 transcript. Use `025` as requested for the overall experiment baseline; use
 `045` as the accepted comparison point for subsequent encoder-specific work.
 
-Run `038` sized decoder F32 prefill scratch to the active INT8 tile (6 MiB
+Run `038` sized row-major decoder F32 prefill scratch to the active INT8 tile (6 MiB
 instead of 96 MiB). Exact transcripts passed, but peak RSS did not improve
 against the comparable `034` smoke run (2390.75 versus 2380.97 MiB), because
 the untouched zero-filled capacity was mostly lazy virtual memory. The bounded
-allocation is retained as hygiene, not counted as an RSS optimization.
+allocation is retained for the row-major fallback. The packed Android backend
+allocates no projection-conversion scratch.
 
 Phase-aware mmap eviction was implemented and measured in runs `036` and `037`.
 Full encoder/decoder eviction preserved transcripts but regressed latency 15.0%
@@ -75,9 +75,8 @@ for `PREFIX_HEAD + prompt + PREFIX_TAIL` across utterances in the same context.
 Against same-revision control `046`, it reduced median first-visible-token
 latency by 11.6% (576.52 to 509.91 ms), decoder prefill by 19.7%, median total
 inference by 5.3%, and P95 inference by 6.4%. All 54 transcripts matched
-exactly. Peak RSS increased by 6.48 MiB (0.3%). The optimization is enabled by
-default; set `QWEN_STATIC_PREFIX_KV_CACHE=0` only for a diagnostic rollback
-comparison.
+exactly. Peak RSS increased by 6.48 MiB (0.3%). The optimization is always
+enabled; its diagnostic rollback branch was removed.
 
 The benchmark now records `first_visible_token_ms` separately from
 `prefill_ms`. It starts at transcription entry and ends when the decoder emits
@@ -91,8 +90,9 @@ weights on every prefill (`049`) is rejected: TTFT regressed 154.1%. Moving all
 168 packed projections into a 1.35 GiB mmap-able safetensors shard (`052`)
 removed runtime packing and preserved all 54 transcripts, but TTFT still
 regressed 11.5%, prefill 21.8%, P95 15.3%, and peak RSS 57.9% against the
-same-binary tiled-F32 control (`048`). The packed path therefore remains an
-opt-in research feature and is not enabled by default on macOS.
+same-binary tiled-F32 control (`048`). Packed backend selection is therefore
+Android-only; the macOS runtime switch was removed and macOS always uses the
+accepted tiled-F32/OpenBLAS path.
 
 The isolated projection microbenchmark showed 2.4-7.3x gains when repeatedly
 reusing one packed matrix, but that cache-hot result did not predict the full
@@ -102,14 +102,17 @@ test on a connected device; the accepted Mac path remains tiled F32/OpenBLAS.
 
 The Android follow-up is recorded in
 [`k5-kleidiai-offline-packed-pixel10.md`](../../android_experiment/android-speed-results/k5-kleidiai-offline-packed-pixel10.md).
-On Pixel 10,
-using the offline-packed layout for both prefill and single-token decode reduced
-Common Voice TTFT by 45.1%, prefill by 69.9%, decode-loop latency by 17.5%, and
-total inference by 40.4%. Guardrail TTFT improved 48.0%. Peak RSS is only 0.5%
-above control because decode no longer faults the original row-major projection
-pages into memory; the prefill-only variant's 60.7% memory regression is
-rejected. Five of six exact transcripts pass, with one stable
-traditional-to-simplified character change. No last-layer F32 fallback is used.
+On Pixel 10, the final packed-only Android model reduced Common Voice TTFT by
+44.4%, prefill by 69.5%, decode-loop latency by 17.5%, and total inference by
+40.2%. Guardrail TTFT improved 48.2%. Peak RSS is 0.7% below control on Common
+Voice and 0.2% below control on the guardrail; load-time RSS is 26-27% lower.
+Removing the row-major decoder tensors reduced logical deployed size from 3.3
+GiB to 2.0 GiB. The Android KleidiAI build now selects one all-or-nothing
+decoder backend when all 168 packed projections are present. Independent
+prefill/decode switches, runtime packing, and the packed-weight cache were
+removed. Five of six exact transcripts pass against the row-major quality
+reference, with one stable traditional-to-simplified character change. No
+last-layer F32 fallback is used.
 
 The runner defaults to requiring a model detected by the engine as `1.7B`; this
 prevents a 0.6B model with a similarly named or sized weight file from becoming
@@ -179,8 +182,7 @@ Use the current baseline configuration when evaluating every new 1.7B
 candidate:
 
 ```bash
-QWEN_INT8_PREFILL_F32=1 QWEN_INT8_PREFILL_TILE_ROWS=256 \
-  python3 experiments/qwen-inference-optimization/run_experiment.py \
+python3 experiments/qwen-inference-optimization/run_experiment.py \
   --id 026-candidate \
   --baseline 025-mac-1.7b-full-int8-tiled256-prefill \
   --model-dir /Volumes/SSD/Qwen3-ASR-1.7B-int8-full \
