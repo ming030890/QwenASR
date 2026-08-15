@@ -85,6 +85,13 @@ pub struct DecLayer {
 unsafe impl Send for DecLayer {}
 unsafe impl Sync for DecLayer {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecoderBackend {
+    RowMajorInt8,
+    #[cfg(feature = "kleidiai")]
+    KleidiAiPacked,
+}
+
 pub struct Decoder {
     pub tok_embeddings_bf16: *const u16,
     pub tok_embeddings_int8: Option<Int8Buf>,
@@ -100,6 +107,8 @@ pub struct Decoder {
     /// INT8 quantized lm_head weights for fast argmax
     pub lm_head_int8: Option<Int8Buf>,
     pub lm_head_int8_scales: Option<Vec<f32>>,
+    #[cfg_attr(not(feature = "kleidiai"), allow(dead_code))]
+    backend: DecoderBackend,
 }
 
 unsafe impl Send for Decoder {}
@@ -161,6 +170,28 @@ fn register_offline_kleidiai_weight(
     }
 }
 
+#[cfg(feature = "kleidiai")]
+fn packed_decoder_tensor_counts(ms: &MultiSafetensors, cfg: &QwenConfig) -> (usize, usize) {
+    const SUFFIXES: [&str; 6] = [
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "mlp.gate_up_fused.weight",
+        "mlp.down_proj.weight",
+    ];
+    let expected = cfg.dec_layers * SUFFIXES.len();
+    let found = (0..cfg.dec_layers)
+        .flat_map(|layer| {
+            SUFFIXES.into_iter().map(move |suffix| {
+                format!("thinker.model.layers.{layer}.{suffix}_kleidiai_dotprod_packed")
+            })
+        })
+        .filter(|name| ms.get_i8_ptr(name).is_some())
+        .count();
+    (found, expected)
+}
+
 #[allow(dead_code)]
 fn dequantize_int8_to_f32_scratch<'a>(
     int8: &[i8],
@@ -193,12 +224,15 @@ fn linear_nobias_int8_f32_scratch(
     out_dim: usize,
     scratch: &mut [f32],
     tile_rows: usize,
+    use_kleidiai: bool,
 ) {
     #[cfg(feature = "kleidiai")]
-    if std::env::var("QWEN_KLEIDIAI_PREFILL").ok().as_deref() == Some("1") {
+    if use_kleidiai {
         kernels::linear_nobias_int8_kleidiai(y, x, int8, scales, seq_len, in_dim, out_dim);
         return;
     }
+    #[cfg(not(feature = "kleidiai"))]
+    let _ = use_kleidiai;
 
     let tile_rows = tile_rows.max(1).min(out_dim);
     for out_start in (0..out_dim).step_by(tile_rows) {
@@ -219,6 +253,17 @@ fn linear_nobias_int8_f32_scratch(
 }
 
 impl Decoder {
+    fn uses_kleidiai(&self) -> bool {
+        #[cfg(feature = "kleidiai")]
+        {
+            self.backend == DecoderBackend::KleidiAiPacked
+        }
+        #[cfg(not(feature = "kleidiai"))]
+        {
+            false
+        }
+    }
+
     /// F32 conversion scratch required by the active decoder representation.
     /// Prequantized INT8 prefill only materializes one output-row tile at a
     /// time; BF16 and aligner models retain the legacy full-matrix capacity.
@@ -330,6 +375,24 @@ impl Decoder {
             Some(Dtype::I8)
         );
 
+        #[cfg(feature = "kleidiai")]
+        let decoder_backend = {
+            let (packed_found, packed_expected) = packed_decoder_tensor_counts(ms, cfg);
+            if packed_found != 0 && packed_found != packed_expected {
+                eprintln!(
+                    "decoder: incomplete KleidiAI packed decoder: found {packed_found} of {packed_expected} projections"
+                );
+                return None;
+            }
+            if cfg!(target_os = "android") && packed_found == packed_expected {
+                DecoderBackend::KleidiAiPacked
+            } else {
+                DecoderBackend::RowMajorInt8
+            }
+        };
+        #[cfg(not(feature = "kleidiai"))]
+        let decoder_backend = DecoderBackend::RowMajorInt8;
+
         if use_int8_weights {
             #[cfg(not(target_arch = "aarch64"))]
             {
@@ -381,7 +444,7 @@ impl Decoder {
                     load_f32(ms, &format!("{}.mlp.down_proj.weight_int8_scale", lp))?;
 
                 #[cfg(feature = "kleidiai")]
-                {
+                if decoder_backend == DecoderBackend::KleidiAiPacked {
                     register_offline_kleidiai_weight(
                         ms,
                         &format!("{}.self_attn.q_proj.weight", lp),
@@ -653,6 +716,7 @@ impl Decoder {
             lm_head_bf16,
             lm_head_int8,
             lm_head_int8_scales,
+            backend: decoder_backend,
         })
     }
 }
@@ -1031,6 +1095,7 @@ pub fn decoder_prefill(
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value > 0)
         .unwrap_or(256);
+    let use_kleidiai = decoder.uses_kleidiai();
 
     // Ensure KV cache
     let needed = kv_cache.len + seq_len;
@@ -1125,6 +1190,7 @@ pub fn decoder_prefill(
                     q_dim,
                     &mut bufs.bf16_scratch,
                     int8_prefill_tile_rows,
+                    use_kleidiai,
                 );
                 linear_nobias_int8_f32_scratch(
                     k,
@@ -1136,6 +1202,7 @@ pub fn decoder_prefill(
                     kv_dim,
                     &mut bufs.bf16_scratch,
                     int8_prefill_tile_rows,
+                    use_kleidiai,
                 );
                 linear_nobias_int8_f32_scratch(
                     v,
@@ -1147,6 +1214,7 @@ pub fn decoder_prefill(
                     kv_dim,
                     &mut bufs.bf16_scratch,
                     int8_prefill_tile_rows,
+                    use_kleidiai,
                 );
             } else {
                 kernels::linear_nobias_int8_matmat(
@@ -1260,6 +1328,7 @@ pub fn decoder_prefill(
                     dim,
                     &mut bufs.bf16_scratch,
                     int8_prefill_tile_rows,
+                    use_kleidiai,
                 );
             } else {
                 kernels::linear_nobias_int8_matmat(
@@ -1356,6 +1425,7 @@ pub fn decoder_prefill(
                     2 * intermediate,
                     &mut bufs.bf16_scratch,
                     int8_prefill_tile_rows,
+                    use_kleidiai,
                 );
             } else {
                 kernels::linear_nobias_int8_matmat(
@@ -1409,6 +1479,7 @@ pub fn decoder_prefill(
                     dim,
                     &mut bufs.bf16_scratch,
                     int8_prefill_tile_rows,
+                    use_kleidiai,
                 );
             } else {
                 kernels::linear_nobias_int8_matmat(
@@ -1464,7 +1535,7 @@ pub fn decoder_forward(
     let scale = 1.0 / (head_dim as f32).sqrt();
 
     #[cfg(feature = "kleidiai")]
-    let use_kleidiai_decode = std::env::var("QWEN_KLEIDIAI_DECODE").ok().as_deref() == Some("1");
+    let use_kleidiai_decode = decoder.uses_kleidiai();
 
     for (layer_idx, layer) in decoder.layers.iter().enumerate() {
         kernels::rms_norm(
