@@ -215,7 +215,6 @@ fn packed_decoder_tensor_counts(ms: &MultiSafetensors, cfg: &QwenConfig) -> (usi
     (found, expected)
 }
 
-#[allow(dead_code)]
 fn dequantize_int8_to_f32_scratch<'a>(
     int8: &[i8],
     scales: &[f32],
@@ -226,8 +225,7 @@ fn dequantize_int8_to_f32_scratch<'a>(
     let n = out_dim * in_dim;
     debug_assert!(scratch.len() >= n);
     let out = &mut scratch[..n];
-    for row in 0..out_dim {
-        let s = scales[row];
+    for (row, &s) in scales.iter().enumerate().take(out_dim) {
         let row_off = row * in_dim;
         for col in 0..in_dim {
             out[row_off + col] = (int8[row_off + col] as f32) * s;
@@ -360,7 +358,7 @@ impl Decoder {
             && tok_embeddings_int8_scales_len % cfg.vocab_size == 0
         {
             let groups_per_row = tok_embeddings_int8_scales_len / cfg.vocab_size;
-            if cfg.dec_hidden % groups_per_row == 0 {
+            if cfg.dec_hidden.is_multiple_of(groups_per_row) {
                 cfg.dec_hidden / groups_per_row
             } else {
                 0
@@ -401,14 +399,14 @@ impl Decoder {
                 );
                 return None;
             }
-            #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+            #[cfg(target_arch = "aarch64")]
             if packed_found == packed_expected && !std::arch::is_aarch64_feature_detected!("i8mm") {
                 eprintln!(
                     "decoder: KleidiAI I8MM-packed model requires an Arm CPU with I8MM support"
                 );
                 return None;
             }
-            if cfg!(target_os = "android") && packed_found == packed_expected {
+            if cfg!(target_arch = "aarch64") && packed_found == packed_expected {
                 DecoderBackend::KleidiAiPacked
             } else {
                 DecoderBackend::RowMajorInt8
@@ -614,22 +612,22 @@ impl Decoder {
                 }
                 // INT8 quantize all decoder layer weights (on-device, heap-backed)
                 let (wq_i8, wq_int8_scales) =
-                    kernels::quantize_bf16_weights_to_int8(wq, q_dim, hidden);
+                    unsafe { kernels::quantize_bf16_weights_to_int8(wq, q_dim, hidden) };
                 let wq_int8 = Int8Buf::from_owned(wq_i8);
                 let (wk_i8, wk_int8_scales) =
-                    kernels::quantize_bf16_weights_to_int8(wk, kv_dim, hidden);
+                    unsafe { kernels::quantize_bf16_weights_to_int8(wk, kv_dim, hidden) };
                 let wk_int8 = Int8Buf::from_owned(wk_i8);
                 let (wv_i8, wv_int8_scales) =
-                    kernels::quantize_bf16_weights_to_int8(wv, kv_dim, hidden);
+                    unsafe { kernels::quantize_bf16_weights_to_int8(wv, kv_dim, hidden) };
                 let wv_int8 = Int8Buf::from_owned(wv_i8);
                 let (wo_i8, wo_int8_scales) =
-                    kernels::quantize_bf16_weights_to_int8(wo, hidden, q_dim);
+                    unsafe { kernels::quantize_bf16_weights_to_int8(wo, hidden, q_dim) };
                 let wo_int8 = Int8Buf::from_owned(wo_i8);
                 let (gate_up_i8, gate_up_int8_scales) = if gate_up_fused.is_empty() {
                     let (gate_i8, gate_scales) =
-                        kernels::quantize_bf16_weights_to_int8(gate_bf16, inter, hidden);
+                        unsafe { kernels::quantize_bf16_weights_to_int8(gate_bf16, inter, hidden) };
                     let (up_i8, up_scales) =
-                        kernels::quantize_bf16_weights_to_int8(up_bf16, inter, hidden);
+                        unsafe { kernels::quantize_bf16_weights_to_int8(up_bf16, inter, hidden) };
                     let mut fused_i8 = vec![0i8; 2 * inter * hidden];
                     let mut fused_scales = vec![0.0f32; 2 * inter];
                     for r in 0..inter {
@@ -642,15 +640,17 @@ impl Decoder {
                     }
                     (fused_i8, fused_scales)
                 } else {
-                    kernels::quantize_bf16_weights_to_int8(
-                        gate_up_fused.as_ptr(),
-                        2 * inter,
-                        hidden,
-                    )
+                    unsafe {
+                        kernels::quantize_bf16_weights_to_int8(
+                            gate_up_fused.as_ptr(),
+                            2 * inter,
+                            hidden,
+                        )
+                    }
                 };
                 let gate_up_int8 = Int8Buf::from_owned(gate_up_i8);
                 let (down_i8, down_int8_scales) =
-                    kernels::quantize_bf16_weights_to_int8(down_bf16, hidden, inter);
+                    unsafe { kernels::quantize_bf16_weights_to_int8(down_bf16, hidden, inter) };
                 let down_int8 = Int8Buf::from_owned(down_i8);
 
                 layers.push(DecLayer {
@@ -715,7 +715,7 @@ impl Decoder {
             _ => {
                 let lm_weight = lm_head_bf16.unwrap_or(tok_embeddings_bf16_opt?);
                 let (lm_int8, lm_scales) =
-                    kernels::quantize_bf16_weights_to_int8(lm_weight, lm_out_dim, lm_in_dim);
+                    unsafe { kernels::quantize_bf16_weights_to_int8(lm_weight, lm_out_dim, lm_in_dim) };
                 (Some(Int8Buf::from_owned(lm_int8)), Some(lm_scales))
             }
         };
@@ -1122,14 +1122,8 @@ pub fn decoder_prefill(
             layer.down_kleidiai.as_deref(),
         );
         #[cfg(not(feature = "kleidiai"))]
-        let (wq_packed, wk_packed, wv_packed, wo_packed, gate_up_packed, down_packed): (
-            Option<&[i8]>,
-            Option<&[i8]>,
-            Option<&[i8]>,
-            Option<&[i8]>,
-            Option<&[i8]>,
-            Option<&[i8]>,
-        ) = (None, None, None, None, None, None);
+        let (wq_packed, wk_packed, wv_packed, wo_packed, gate_up_packed, down_packed) =
+            (None::<&[i8]>, None, None, None, None, None);
         let x_norm = &mut bufs.pref_x_norm[..seq_len * dim];
         kernels::rms_norm(
             x_norm,
@@ -1838,19 +1832,54 @@ pub fn decoder_prefill_logits(
     logits
 }
 
-/// Convert a token embedding from bf16 to f32.
+/// Prefill and project only selected vocabulary rows at the final position.
 ///
-/// # Safety
-/// tok_emb_bf16 must point to valid memory for at least (token_id + 1) * dim bf16 values.
-pub unsafe fn tok_embed_bf16_to_f32(
-    dst: &mut [f32],
-    tok_emb_bf16: *const u16,
-    token_id: i32,
-    dim: usize,
-) {
-    let src = unsafe { std::slice::from_raw_parts(tok_emb_bf16.add(token_id as usize * dim), dim) };
-    kernels::bf16_to_f32_buf(dst, src);
+/// This is intended for confidence diagnostics on quantized checkpoints where
+/// the BF16 lm-head has deliberately been omitted. Returned logits preserve
+/// `rows` order and use the same INT8 activation quantization as greedy decode.
+pub fn decoder_prefill_last_selected_logits(
+    decoder: &Decoder,
+    cfg: &QwenConfig,
+    kv_cache: &mut KvCache,
+    rope: &mut RopeCache,
+    bufs: &mut DecoderBuffers,
+    input_embeds: &[f32],
+    seq_len: usize,
+    rows: &[usize],
+) -> Vec<f32> {
+    let dim = cfg.dec_hidden;
+    decoder_prefill(decoder, cfg, kv_cache, rope, bufs, input_embeds, seq_len);
+    let final_hidden = &bufs.pref_x[(seq_len - 1) * dim..seq_len * dim];
+    let mut normalized = vec![0.0f32; dim];
+    kernels::rms_norm(
+        &mut normalized,
+        final_hidden,
+        &decoder.norm,
+        1,
+        dim,
+        cfg.dec_rms_norm_eps,
+    );
+    if let (Some(int8_data), Some(scales)) =
+        (&decoder.lm_head_int8, &decoder.lm_head_int8_scales)
+    {
+        return kernels::matvec_int8_selected_logits(&normalized, int8_data, scales, dim, rows);
+    }
+    let lm_weight = decoder.lm_head_bf16.unwrap_or(decoder.tok_embeddings_bf16);
+    if lm_weight.is_null() {
+        panic!("decoder has neither INT8 nor BF16 lm-head weights");
+    }
+    rows.iter()
+        .map(|&row| unsafe {
+            let weights = std::slice::from_raw_parts(lm_weight.add(row * dim), dim);
+            normalized
+                .iter()
+                .zip(weights)
+                .map(|(&x, &w)| x * f32::from_bits((w as u32) << 16))
+                .sum()
+        })
+        .collect()
 }
+
 
 /// Look up a token embedding and convert/dequantize to f32.
 /// If tok_embeddings_bf16 is valid (non-null), reads from it in BF16.

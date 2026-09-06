@@ -117,13 +117,9 @@ pub struct QwenTokenizer {
     pub vocab_size: usize,
     id_to_text: Vec<Option<String>>,
     id_to_bytes: Vec<Option<Vec<u8>>>,
-    #[allow(dead_code)]
-    id_to_bpe: Vec<Option<String>>,
     vocab_map: HashMap<String, i32>,
     merge_map: HashMap<String, i32>,
     byte_to_unicode: [i32; 256],
-    #[allow(dead_code)]
-    unicode_to_byte: [i32; 512],
 }
 
 impl QwenTokenizer {
@@ -172,7 +168,6 @@ impl QwenTokenizer {
         let vocab_size = (max_id + 1) as usize;
         let mut id_to_text = vec![None; vocab_size];
         let mut id_to_bytes: Vec<Option<Vec<u8>>> = vec![None; vocab_size];
-        let mut id_to_bpe = vec![None; vocab_size];
         let mut vocab_map = HashMap::new();
 
         for (key, id) in entries {
@@ -183,8 +178,7 @@ impl QwenTokenizer {
                 let text = String::from_utf8_lossy(&raw_bytes).into_owned();
                 id_to_text[idx] = Some(text);
                 id_to_bytes[idx] = Some(raw_bytes);
-                vocab_map.insert(key.clone(), id);
-                id_to_bpe[idx] = Some(key);
+                vocab_map.insert(key, id);
             }
         }
 
@@ -195,11 +189,9 @@ impl QwenTokenizer {
             vocab_size,
             id_to_text,
             id_to_bytes,
-            id_to_bpe,
             vocab_map,
             merge_map,
             byte_to_unicode,
-            unicode_to_byte,
         })
     }
 
@@ -603,7 +595,7 @@ mod tests {
         for b in 0u8..=255 {
             let cp = btu[b as usize];
             assert!(
-                cp >= 0 && cp < 512,
+                (0..512).contains(&cp),
                 "byte {:#04x} mapped to out-of-range codepoint {}",
                 b,
                 cp
@@ -624,13 +616,10 @@ mod tests {
 
         // All 256 codepoints must be distinct
         let mut seen = std::collections::HashSet::new();
-        for b in 0..256 {
-            let cp = btu[b];
+        for &cp in &btu {
             assert!(
                 seen.insert(cp),
-                "byte {} and another byte both map to codepoint {}",
-                b,
-                cp
+                "codepoint {cp} mapped by multiple bytes"
             );
         }
         assert_eq!(seen.len(), 256);

@@ -33,7 +33,7 @@ pub unsafe extern "C" fn qwen_asr_load_model(
     kernels::set_verbose(verbosity);
 
     let threads = if n_threads <= 0 {
-        kernels::get_num_cpus()
+        kernels::default_num_threads()
     } else {
         n_threads as usize
     };

@@ -292,7 +292,7 @@ fn main() {
     kernels::set_verbose(0);
     kernels::set_profile(profile);
     if n_threads <= 0 {
-        n_threads = kernels::get_num_cpus() as i32;
+        n_threads = kernels::default_num_threads() as i32;
     }
     kernels::set_threads(n_threads as usize);
     let setup_ms = elapsed_ms(process_start);

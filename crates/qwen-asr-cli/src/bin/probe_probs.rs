@@ -10,7 +10,7 @@ const SUFFIX_BASE: &[i32] = &[151670, 151645, 198, 151644, 77091, 198];
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: probe_probs -d <model_dir> -i <audio.wav> --candidate <text> [--candidate <text> ...] [--language <lang>]"
+        "Usage: probe_probs -d <model_dir> -i <audio.wav> [--candidate <text> ...] [--next-after <text>] [--language <lang>]"
     );
     std::process::exit(2);
 }
@@ -189,6 +189,7 @@ fn main() {
     let mut model_dir = None;
     let mut audio_path = None;
     let mut candidates = Vec::new();
+    let mut next_after = None;
     let mut language = String::new();
 
     while let Some(arg) = args.next() {
@@ -196,6 +197,7 @@ fn main() {
             "-d" => model_dir = args.next(),
             "-i" => audio_path = args.next(),
             "--candidate" => candidates.push(args.next().unwrap_or_default()),
+            "--next-after" => next_after = args.next(),
             "--language" => language = args.next().unwrap_or_default(),
             "-h" | "--help" => usage(),
             _ => usage(),
@@ -203,7 +205,7 @@ fn main() {
     }
     let model_dir = model_dir.unwrap_or_else(|| usage());
     let audio_path = audio_path.unwrap_or_else(|| usage());
-    if candidates.is_empty() {
+    if candidates.is_empty() && next_after.is_none() {
         usage();
     }
 
@@ -218,6 +220,7 @@ fn main() {
 
     let cfg = ctx.config.clone();
     let dim = cfg.dec_hidden;
+    if !candidates.is_empty() {
     let out_dim = cfg.lm_head_dim();
     ctx.kv_cache.len = 0;
     let needed_scratch = cfg.lm_head_dim() * cfg.dec_hidden;
@@ -258,6 +261,55 @@ fn main() {
                 ch, toks, lp, p, rank
             );
         }
+    }
+    }
+
+    if let Some(text) = next_after {
+        let text_tokens = tokenizer.encode(&text).expect("next-after tokens");
+        let prefix_len = prefix_embeds.len() / dim;
+        let seq_len = prefix_len + text_tokens.len();
+        let mut input_embeds = vec![0.0f32; seq_len * dim];
+        input_embeds[..prefix_embeds.len()].copy_from_slice(&prefix_embeds);
+        for (i, &tok) in text_tokens.iter().enumerate() {
+            unsafe {
+                tok_embed_to_f32(
+                    &ctx.decoder,
+                    &mut input_embeds[(prefix_len + i) * dim..(prefix_len + i + 1) * dim],
+                    tok,
+                    dim,
+                )
+            };
+        }
+        let symbols = ["？", "?", "。", "，"];
+        let mut token_ids = vec![TOKEN_ENDOFTEXT as usize, TOKEN_IM_END as usize];
+        for symbol in symbols {
+            let tokens = tokenizer.encode(symbol).expect("symbol token");
+            assert_eq!(tokens.len(), 1, "expected one token for {symbol}");
+            token_ids.push(tokens[0] as usize);
+        }
+        ctx.kv_cache.len = 0;
+        let logits = decoder::decoder_prefill_last_selected_logits(
+            &ctx.decoder,
+            &cfg,
+            &mut ctx.kv_cache,
+            &mut ctx.rope_cache,
+            &mut ctx.dec_bufs,
+            &input_embeds,
+            seq_len,
+            &token_ids,
+        );
+        let q_logit = logits[2].max(logits[3]);
+        let stop_logit = logits[0].max(logits[1]);
+        let question_vs_stop = 1.0f32 / (1.0 + (stop_logit - q_logit).exp());
+        let terminal_max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let terminal_denom: f32 = logits.iter().map(|value| (*value - terminal_max).exp()).sum();
+        let question_terminal_probability =
+            ((logits[2] - terminal_max).exp() + (logits[3] - terminal_max).exp())
+                / terminal_denom;
+        println!(
+            "{{\"kind\":\"next_after\",\"eos_logit\":{:.6},\"im_end_logit\":{:.6},\"fullwidth_question_logit\":{:.6},\"ascii_question_logit\":{:.6},\"full_stop_logit\":{:.6},\"comma_logit\":{:.6},\"question_vs_stop_probability\":{:.9},\"question_terminal_probability\":{:.9}}}",
+            logits[0], logits[1], logits[2], logits[3], logits[4], logits[5], question_vs_stop, question_terminal_probability
+        );
     }
 
     for cand in candidates {

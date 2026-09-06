@@ -10,7 +10,7 @@ fn max_abs_err(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn test_bf16_roundtrip() {
-    let values: Vec<f32> = vec![0.0, 1.0, -1.0, 3.14, -2.71, 100.5, 0.001, -0.001];
+    let values: Vec<f32> = vec![0.0, 1.0, -1.0, std::f32::consts::PI, -std::f32::consts::E, 100.5, 0.001, -0.001];
     for &v in &values {
         let bf16 = ((v.to_bits() + 0x8000) >> 16) as u16;
         let back = kernels::bf16_to_f32(bf16);

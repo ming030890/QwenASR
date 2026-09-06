@@ -13,7 +13,7 @@ This repository is a highly-optimized fork of [antirez/qwen-asr](https://github.
 * **Dynamic Prefill Activation Quantization (`K4`):** Developed a custom dynamic quantization prefill kernel utilizing NEON `SDOT` (`vdotq_s32`) on `aarch64`, significantly accelerating prompt ingestion.
 * **Transient Prefill Dequantization (`M1`):** Optimized memory bandwidth by transiently dequantizing INT8 weights into a shared thread-local F32 scratch buffer during compute.
 * **Static OpenBLAS on Android:** Ported and optimized the engine for Android `arm64-v8a` environments, linking with a customized CBLAS-only static OpenBLAS target configuration.
-* **Offline I8MM-Packed Mobile Model:** Quantized every encoder linear matrix and packed the accepted INT8 decoder/encoder weights into their final KleidiAI I8MM layout in the model artifact, eliminating runtime packing and duplicate row-major copies.
+* **Offline I8MM-Packed Model:** Quantized every encoder linear matrix and packed the accepted INT8 decoder/encoder weights into their final KleidiAI I8MM layout in the model artifact, eliminating runtime packing and duplicate row-major copies on Android and I8MM-capable ARM64 macOS hosts.
 * **Same-Session Mobile Benchmark & Gate Checks:** Created an automated on-device testing and gate-check harness (`bench/android_run.py`, `bench/android_compare.py`, `bench/android_check_gate.py`) that monitors device thermals, enforces phonetic guardrails, and compares baseline vs. candidate builds on E2E latency, first-token latency, RSS/peak memory, and binary footprint.
 
 Supports 0.6B and 1.7B models with multiple modes: offline, segmented, streaming, live capture, VAD live, and forced alignment.
@@ -95,6 +95,11 @@ ffmpeg -i video.mp4 -f s16le -ar 16000 -ac 1 - | qwen-asr -d qwen3-asr-0.6b --st
 # macOS
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 
+# macOS ARM64 with an offline I8MM-packed model
+KLEIDIAI_LIB_DIR=/path/to/arm64/kleidiai/lib \
+  RUSTFLAGS="-C target-cpu=native" \
+  cargo build --release -p qwen-asr-cli --features kleidiai
+
 # Linux
 sudo apt install libopenblas-dev   # Debian/Ubuntu
 RUSTFLAGS="-C target-cpu=native" cargo build --release
@@ -113,6 +118,7 @@ cargo ndk -t arm64-v8a build --release --features android
 |---------|-------------|
 | `blas` (default) | BLAS linking (Accelerate on macOS, OpenBLAS on Linux) |
 | `vdsp` | Accelerate vDSP/vForce for AMX (macOS) |
+| `kleidiai` | Offline-packed KleidiAI I8MM weights (I8MM-capable ARM64 Android/macOS) |
 | `ios` | C-FFI API (`src/c_api.rs`) |
 | `android` | JNI API (`src/jni_api.rs`) |
 

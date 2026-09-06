@@ -6,6 +6,8 @@ pub mod generic;
 #[cfg(target_arch = "aarch64")]
 pub mod neon;
 
+use std::cell::RefCell;
+use std::ops::{Deref, DerefMut};
 use std::thread;
 
 // BLAS extern bindings
@@ -106,9 +108,6 @@ pub fn set_profile(enabled: bool) {
     PROFILE_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
-pub fn is_profiling() -> bool {
-    PROFILE_ENABLED.load(Ordering::Relaxed)
-}
 
 #[derive(Debug, Clone)]
 pub struct ProfileCounterSnapshot {
@@ -365,6 +364,18 @@ pub fn get_num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+/// Default worker count for inference. Apple Silicon performs best when the
+/// hot matvec path stays on the four performance cores; callers can still
+/// override this explicitly.
+pub fn default_num_threads() -> usize {
+    let cpus = get_num_cpus().min(MAX_THREADS);
+    if cfg!(all(target_vendor = "apple", target_arch = "aarch64")) {
+        cpus.min(4)
+    } else {
+        cpus
+    }
 }
 
 /// Run a closure in parallel using the persistent thread pool.
@@ -1118,88 +1129,6 @@ pub fn linear_bf16(
     linear(y, x, &w_f32, b, seq_len, in_dim, out_dim);
 }
 
-/// Fused Q/K/V matvec for single-token decode
-#[allow(clippy::too_many_arguments)]
-pub fn linear_nobias_bf16_qkv(
-    q: &mut [f32],
-    k: &mut [f32],
-    v: &mut [f32],
-    x: &[f32],
-    wq: *const u16,
-    wk: *const u16,
-    wv: *const u16,
-    in_dim: usize,
-    q_dim: usize,
-    kv_dim: usize,
-) {
-    let n_threads = get_num_threads();
-    if n_threads <= 1 {
-        bf16_matvec_fused(q, x, wq, None, in_dim, q_dim);
-        bf16_matvec_fused(k, x, wk, None, in_dim, kv_dim);
-        bf16_matvec_fused(v, x, wv, None, in_dim, kv_dim);
-        return;
-    }
-
-    let total_dim = q_dim + 2 * kv_dim;
-    let q_ptr = q.as_mut_ptr() as usize;
-    let k_ptr = k.as_mut_ptr() as usize;
-    let v_ptr = v.as_mut_ptr() as usize;
-    let x_ptr = x.as_ptr() as usize;
-    let wq_ptr = wq as usize;
-    let wk_ptr = wk as usize;
-    let wv_ptr = wv as usize;
-
-    parallel_for(|tid, nt| {
-        let chunk = total_dim.div_ceil(nt);
-        let start = tid * chunk;
-        let end = (start + chunk).min(total_dim);
-        if start >= end {
-            return;
-        }
-
-        let x_local = unsafe { std::slice::from_raw_parts(x_ptr as *const f32, in_dim) };
-        let q_end = q_dim;
-        let k_end = q_end + kv_dim;
-
-        // Q range
-        if start < q_end {
-            let s = start;
-            let e = end.min(q_end);
-            if s < e {
-                let y_local =
-                    unsafe { std::slice::from_raw_parts_mut((q_ptr as *mut f32).add(s), e - s) };
-                let w_local = unsafe { (wq_ptr as *const u16).add(s * in_dim) };
-                bf16_matvec_fused(y_local, x_local, w_local, None, in_dim, e - s);
-            }
-        }
-
-        // K range
-        if end > q_end && start < k_end {
-            let s = start.saturating_sub(q_end);
-            let e_abs = end.min(k_end);
-            let e = e_abs - q_end;
-            if s < e {
-                let y_local =
-                    unsafe { std::slice::from_raw_parts_mut((k_ptr as *mut f32).add(s), e - s) };
-                let w_local = unsafe { (wk_ptr as *const u16).add(s * in_dim) };
-                bf16_matvec_fused(y_local, x_local, w_local, None, in_dim, e - s);
-            }
-        }
-
-        // V range
-        if end > k_end {
-            let s = start.saturating_sub(k_end);
-            let e_abs = end.min(total_dim);
-            let e = e_abs - k_end;
-            if s < e {
-                let y_local =
-                    unsafe { std::slice::from_raw_parts_mut((v_ptr as *mut f32).add(s), e - s) };
-                let w_local = unsafe { (wv_ptr as *const u16).add(s * in_dim) };
-                bf16_matvec_fused(y_local, x_local, w_local, None, in_dim, e - s);
-            }
-        }
-    });
-}
 
 /// Fused gate_up matvec + SwiGLU for single-token decode.
 /// Computes: `ffn_out[j] = silu(gate[j]) * up[j]` where gate/up come from interleaved gate_up_fused matvec.
@@ -1281,7 +1210,7 @@ fn int8_matvec_threaded(
     in_dim: usize,
     out_dim: usize,
 ) {
-    let (x_int8, x_scale) = quantize_f32_to_int8(x);
+    let (x_int8, x_scale) = quantize_f32_to_int8_reused(x);
     let n_threads = get_num_threads();
 
     #[cfg(target_arch = "aarch64")]
@@ -1437,7 +1366,7 @@ pub fn linear_nobias_int8_kleidiai(
             rhs_size,
             "invalid offline KleidiAI packed weight size"
         );
-        let mut lhs_packed = vec![0u8; lhs_size];
+        let mut lhs_packed = kleidiai_lhs_scratch(lhs_size);
 
         kai_run_lhs_quant_pack_qai8dxp_f32(
             seq_len,
@@ -1483,7 +1412,7 @@ pub fn linear_nobias_int8_qkv(
     kv_dim: usize,
 ) {
     let _pg = ProfileGuard::new(&PROF.bf16_matvec);
-    let (x_int8, x_scale) = quantize_f32_to_int8(x);
+    let (x_int8, x_scale) = quantize_f32_to_int8_reused(x);
     let n_threads = get_num_threads();
 
     #[cfg(target_arch = "aarch64")]
@@ -1647,7 +1576,7 @@ pub fn linear_nobias_int8_swiglu(
     intermediate: usize,
 ) {
     let _pg = ProfileGuard::new(&PROF.bf16_matvec);
-    let (x_int8, x_scale) = quantize_f32_to_int8(x);
+    let (x_int8, x_scale) = quantize_f32_to_int8_reused(x);
     let n_threads = get_num_threads();
 
     #[cfg(target_arch = "aarch64")]
@@ -1747,14 +1676,6 @@ pub fn linear_nobias_int8_addto(
     int8_matvec_threaded(y, x, w_int8, w_scales, Some(bias), in_dim, out_dim);
 }
 
-pub fn matmul_t_bf16(c: &mut [f32], a: &[f32], b_bf16: *const u16, m: usize, k: usize, n: usize) {
-    if m == 1 {
-        bf16_matvec_threaded(c, a, b_bf16, None, k, n);
-    } else {
-        let b_f32 = bf16_to_f32_view(b_bf16, n * k);
-        matmul_t(c, a, &b_f32, m, k, n);
-    }
-}
 
 // ========================================================================
 // 2D Convolution (im2col + BLAS sgemm)
@@ -1799,32 +1720,6 @@ fn im2col(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn conv2d(
-    out: &mut [f32],
-    input: &[f32],
-    weight: &[f32],
-    bias: Option<&[f32]>,
-    c_in: usize,
-    c_out: usize,
-    h_in: usize,
-    w_in: usize,
-    kh: usize,
-    kw: usize,
-    stride: usize,
-    padding: usize,
-) {
-    let _pg = ProfileGuard::new(&PROF.conv2d_op);
-    let h_out = (h_in + 2 * padding - kh) / stride + 1;
-    let w_out = (w_in + 2 * padding - kw) / stride + 1;
-    let patch_size = c_in * kh * kw;
-    let spatial_out = h_out * w_out;
-
-    let mut cols = vec![0.0f32; patch_size * spatial_out];
-    conv2d_impl(
-        out, input, weight, bias, &mut cols, c_in, c_out, h_in, w_in, kh, kw, stride, padding,
-    );
-}
 
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_with_cols(
@@ -2548,13 +2443,13 @@ fn causal_attention_heads(
 
             // Pass 2: Softmax
             let mut max_s = scores[0];
-            for j in 1..k_end {
-                if scores[j] > max_s {
-                    max_s = scores[j];
+            for &s in &scores[1..k_end] {
+                if s > max_s {
+                    max_s = s;
                 }
             }
-            for j in 0..k_end {
-                scores[j] -= max_s;
+            for s in &mut scores[..k_end] {
+                *s -= max_s;
             }
 
             #[cfg(all(feature = "vdsp", target_vendor = "apple"))]
@@ -2566,19 +2461,19 @@ fn causal_attention_heads(
             }
             #[cfg(not(all(feature = "vdsp", target_vendor = "apple")))]
             {
-                for j in 0..k_end {
-                    scores[j] = scores[j].exp();
+                for s in &mut scores[..k_end] {
+                    *s = s.exp();
                 }
             }
 
             let mut sum_exp = 0.0f32;
-            for j in 0..k_end {
-                sum_exp += scores[j];
+            for &s in &scores[..k_end] {
+                sum_exp += s;
             }
             if sum_exp > 0.0 {
                 let inv = 1.0 / sum_exp;
-                for j in 0..k_end {
-                    scores[j] *= inv;
+                for s in &mut scores[..k_end] {
+                    *s *= inv;
                 }
             }
 
@@ -2774,30 +2669,6 @@ pub fn sinusoidal_pe(pe: &mut [f32], n_pos: usize, d_model: usize) {
     }
 }
 
-pub fn compute_rope_neox(
-    cos_out: &mut [f32],
-    sin_out: &mut [f32],
-    positions: &[i32],
-    seq: usize,
-    head_dim: usize,
-    theta: f32,
-) {
-    let half = head_dim / 2;
-
-    for s in 0..seq {
-        let pos = positions[s] as f32;
-        for d in 0..half {
-            let freq = 1.0 / theta.powf((2 * d) as f32 / head_dim as f32);
-            let angle = pos * freq;
-            let c = angle.cos();
-            let sn = angle.sin();
-            cos_out[s * head_dim + d] = c;
-            cos_out[s * head_dim + half + d] = c;
-            sin_out[s * head_dim + d] = sn;
-            sin_out[s * head_dim + half + d] = sn;
-        }
-    }
-}
 
 pub fn apply_rope_neox(
     x: &mut [f32],
@@ -2862,29 +2733,98 @@ pub fn apply_rope_neox(
 
 /// Streaming argmax: finds argmax(W_bf16 @ x) without materializing full logits.
 /// Quantize x (f32) to int8 with absmax scaling. Returns (x_int8, scale).
-pub fn quantize_f32_to_int8(x: &[f32]) -> (Vec<i8>, f32) {
+fn quantize_f32_to_int8_into(x: &[f32], int8: &mut Vec<i8>) -> f32 {
     let mut max_abs = 0.0f32;
     for &v in x {
         max_abs = max_abs.max(v.abs());
     }
     let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
     let inv_scale = 127.0 / max_abs.max(1e-10);
-    let int8: Vec<i8> = x
-        .iter()
-        .map(|&v| (v * inv_scale).round().clamp(-127.0, 127.0) as i8)
-        .collect();
+    int8.clear();
+    int8.extend(
+        x.iter()
+            .map(|&v| (v * inv_scale).round().clamp(-127.0, 127.0) as i8),
+    );
+    scale
+}
+
+pub fn quantize_f32_to_int8(x: &[f32]) -> (Vec<i8>, f32) {
+    let mut int8 = Vec::with_capacity(x.len());
+    let scale = quantize_f32_to_int8_into(x, &mut int8);
     (int8, scale)
 }
 
+thread_local! {
+    static INT8_ACTIVATION_SCRATCH: RefCell<Vec<i8>> = const { RefCell::new(Vec::new()) };
+    #[cfg(feature = "kleidiai")]
+    static KLEIDIAI_LHS_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+struct ReusableBuffer<T: 'static> {
+    data: Vec<T>,
+    pool: &'static std::thread::LocalKey<RefCell<Vec<T>>>,
+}
+
+impl<T: 'static> Deref for ReusableBuffer<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl<T: 'static> DerefMut for ReusableBuffer<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data
+    }
+}
+
+impl<T: 'static> Drop for ReusableBuffer<T> {
+    fn drop(&mut self) {
+        let data = std::mem::take(&mut self.data);
+        self.pool.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if data.capacity() > slot.capacity() {
+                *slot = data;
+            }
+        });
+    }
+}
+
+fn quantize_f32_to_int8_reused(x: &[f32]) -> (ReusableBuffer<i8>, f32) {
+    let mut data = INT8_ACTIVATION_SCRATCH.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    let scale = quantize_f32_to_int8_into(x, &mut data);
+    (
+        ReusableBuffer {
+            data,
+            pool: &INT8_ACTIVATION_SCRATCH,
+        },
+        scale,
+    )
+}
+
+#[cfg(feature = "kleidiai")]
+fn kleidiai_lhs_scratch(size: usize) -> ReusableBuffer<u8> {
+    let mut data = KLEIDIAI_LHS_SCRATCH.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    data.resize(size, 0);
+    ReusableBuffer {
+        data,
+        pool: &KLEIDIAI_LHS_SCRATCH,
+    }
+}
+
 /// Quantize BF16 weights to INT8 per-row. Returns (int8_data, per_row_scales).
-pub fn quantize_bf16_weights_to_int8(
+///
+/// # Safety
+/// `w_bf16` must point to at least `out_dim * in_dim` initialized `u16` values in memory.
+pub unsafe fn quantize_bf16_weights_to_int8(
     w_bf16: *const u16,
     out_dim: usize,
     in_dim: usize,
 ) -> (Vec<i8>, Vec<f32>) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        return neon::quantize_bf16_to_int8(w_bf16, out_dim, in_dim);
+        neon::quantize_bf16_to_int8(w_bf16, out_dim, in_dim)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -2919,7 +2859,7 @@ pub fn argmax_matvec_int8(
     in_dim: usize,
     out_dim: usize,
 ) -> usize {
-    let (x_int8, x_scale) = quantize_f32_to_int8(x);
+    let (x_int8, x_scale) = quantize_f32_to_int8_reused(x);
     let n_threads = get_num_threads();
     #[cfg(target_arch = "aarch64")]
     {
@@ -2986,7 +2926,7 @@ pub fn argmax_matvec_int8(
                 best = best_indices[i];
             }
         }
-        return best;
+        best
     }
 
     #[cfg(not(target_arch = "aarch64"))]
@@ -3008,7 +2948,7 @@ pub fn matvec_int8_selected_logits(
     in_dim: usize,
     rows: &[usize],
 ) -> Vec<f32> {
-    let (x_int8, x_scale) = quantize_f32_to_int8(x);
+    let (x_int8, x_scale) = quantize_f32_to_int8_reused(x);
     rows.iter()
         .map(|&row| {
             let weights = &w_int8[row * in_dim..(row + 1) * in_dim];
@@ -3066,4 +3006,32 @@ pub fn argmax_matvec_bf16(x: &[f32], w_bf16: *const u16, in_dim: usize, out_dim:
         }
     }
     best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reusable_activation_quantization_matches_owned_path() {
+        let input = [-3.25, -0.5, 0.0, 0.75, 4.0];
+        let (owned, owned_scale) = quantize_f32_to_int8(&input);
+        let (reused, reused_scale) = quantize_f32_to_int8_reused(&input);
+        assert_eq!(&*reused, owned);
+        assert_eq!(reused_scale, owned_scale);
+        drop(reused);
+
+        let (reused_again, scale_again) = quantize_f32_to_int8_reused(&input[..3]);
+        let (owned_again, owned_scale_again) = quantize_f32_to_int8(&input[..3]);
+        assert_eq!(&*reused_again, owned_again);
+        assert_eq!(scale_again, owned_scale_again);
+    }
+
+    #[test]
+    fn default_thread_count_is_valid() {
+        let threads = default_num_threads();
+        assert!((1..=MAX_THREADS).contains(&threads));
+        #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+        assert!(threads <= 4);
+    }
 }

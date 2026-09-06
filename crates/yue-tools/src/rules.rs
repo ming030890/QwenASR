@@ -251,16 +251,6 @@ pub fn sort_for_apply(rules: &mut [Rule]) {
     });
 }
 
-/// Apply rules to a normalized char sequence: single left-to-right longest-match pass.
-#[allow(dead_code)]
-pub fn apply(text: &[char], rules: &[Rule]) -> Vec<char> {
-    // Precompute rule char vectors once for speed.
-    let compiled: Vec<(Vec<char>, Vec<char>)> = rules
-        .iter()
-        .map(|r| (r.from.chars().collect(), r.to.chars().collect()))
-        .collect();
-    apply_compiled(text, &compiled)
-}
 
 pub fn apply_compiled(text: &[char], compiled: &[(Vec<char>, Vec<char>)]) -> Vec<char> {
     let mut out: Vec<char> = Vec::with_capacity(text.len());

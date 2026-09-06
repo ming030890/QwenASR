@@ -899,7 +899,7 @@ pub unsafe fn quantize_bf16_to_int8(
             let q16 = vqmovn_s32(q0);
             let q16b = vqmovn_s32(q1);
             let q8 = vqmovn_s16(vcombine_s16(q16, q16b));
-            vst1_s8(dst.as_mut_ptr().add(k) as *mut i8, q8);
+            vst1_s8(dst.as_mut_ptr().add(k), q8);
             k += 8;
         }
         while k < in_dim {
