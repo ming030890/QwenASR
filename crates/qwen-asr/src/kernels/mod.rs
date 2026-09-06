@@ -2649,7 +2649,14 @@ pub fn causal_attention(
 ) {
     let _pg = ProfileGuard::new(&PROF.attention_causal);
     let n_threads = get_num_threads();
-    if n_threads > 1 && n_heads >= 2 {
+    // The Android OpenBLAS build is intentionally single-threaded. Calling
+    // its SGEMM entry point concurrently from our worker threads corrupts
+    // multi-token prefill results. The single-token path does not call BLAS,
+    // so it remains safe (and useful) to parallelize across attention heads.
+    let can_parallelize = n_threads > 1
+        && n_heads >= 2
+        && (seq_q == 1 || !cfg!(all(feature = "blas", target_os = "android")));
+    if can_parallelize {
         let out_ptr = out.as_mut_ptr() as usize;
         let q_ptr = q.as_ptr() as usize;
         let k_ptr = k_base as usize;
@@ -3091,5 +3098,61 @@ mod tests {
         assert!((1..=MAX_THREADS).contains(&threads));
         #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
         assert!(threads <= 4);
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "android", feature = "blas"))]
+    #[test]
+    fn android_prefill_attention_matches_single_thread() {
+        let seq = 67;
+        let n_heads = 16;
+        let n_kv_heads = 2;
+        let head_dim = 64;
+        let q_hidden = n_heads * head_dim;
+        let head_stride = seq * head_dim;
+        let q: Vec<f32> = (0..seq * q_hidden)
+            .map(|i| ((i * 17 % 251) as f32 - 125.0) / 125.0)
+            .collect();
+        let k: Vec<f32> = (0..n_kv_heads * head_stride)
+            .map(|i| ((i * 29 % 241) as f32 - 120.0) / 120.0)
+            .collect();
+        let v: Vec<f32> = (0..n_kv_heads * head_stride)
+            .map(|i| ((i * 43 % 239) as f32 - 119.0) / 119.0)
+            .collect();
+
+        let mut reference = vec![0.0; seq * q_hidden];
+        set_threads(1);
+        causal_attention(
+            &mut reference,
+            &q,
+            k.as_ptr(),
+            v.as_ptr(),
+            head_stride,
+            seq,
+            seq,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            1.0 / (head_dim as f32).sqrt(),
+            0,
+        );
+
+        let mut threaded = vec![0.0; seq * q_hidden];
+        set_threads(get_num_cpus());
+        causal_attention(
+            &mut threaded,
+            &q,
+            k.as_ptr(),
+            v.as_ptr(),
+            head_stride,
+            seq,
+            seq,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            1.0 / (head_dim as f32).sqrt(),
+            0,
+        );
+        assert_eq!(threaded, reference);
+        set_threads(1);
     }
 }
