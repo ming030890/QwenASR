@@ -284,6 +284,7 @@ fn get_pool() -> &'static Arc<ThreadPool> {
 }
 
 fn pool_worker(pool: Arc<ThreadPool>, tid: usize) {
+    crate::affinity::ensure_current_thread_pinned();
     let mut last_gen: u64 = 0;
     loop {
         // Fast path: spin briefly on atomic generation counter
@@ -348,7 +349,14 @@ fn ensure_workers(pool: &Arc<ThreadPool>, n_threads: usize) {
 static THREAD_POOL_THREADS: AtomicUsize = AtomicUsize::new(1);
 
 pub fn set_threads(n: usize) {
-    let n = n.clamp(1, MAX_THREADS);
+    crate::affinity::ensure_current_thread_pinned();
+    let perf_cores = crate::affinity::get_performance_cores();
+    let max_threads = if perf_cores.is_empty() {
+        MAX_THREADS
+    } else {
+        perf_cores.len().min(MAX_THREADS)
+    };
+    let n = n.clamp(1, max_threads);
     THREAD_POOL_THREADS.store(n, Ordering::Relaxed);
     if n > 1 {
         let pool = get_pool();
@@ -376,6 +384,13 @@ pub fn default_num_threads() -> usize {
     let cpus = get_num_cpus().min(MAX_THREADS);
     if cfg!(all(target_vendor = "apple", target_arch = "aarch64")) {
         cpus.min(4)
+    } else if cfg!(any(target_os = "android", target_os = "linux")) {
+        let perf_cores = crate::affinity::get_performance_cores();
+        if !perf_cores.is_empty() {
+            perf_cores.len().min(4)
+        } else {
+            cpus.min(4)
+        }
     } else {
         cpus
     }
@@ -384,6 +399,7 @@ pub fn default_num_threads() -> usize {
 /// Run a closure in parallel using the persistent thread pool.
 /// The closure takes (thread_id, n_threads).
 fn parallel_for<F: Fn(usize, usize) + Send + Sync>(f: F) {
+    crate::affinity::ensure_current_thread_pinned();
     let n_threads = get_num_threads();
     if n_threads <= 1 {
         f(0, 1);

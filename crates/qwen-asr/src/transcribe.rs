@@ -480,6 +480,7 @@ fn should_insert_boundary_space(prev_ch: u8, next_ch: u8) -> bool {
 /// automatically split at low-energy boundaries.
 /// Returns `None` if the tokenizer or encoder fails to initialize.
 pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
+    crate::affinity::ensure_current_thread_pinned();
     ctx.reset_perf();
     let inference_t0 = get_time_ms();
     ctx.perf_audio_ms = 1000.0 * samples.len() as f64 / SAMPLE_RATE as f64;

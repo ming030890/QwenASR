@@ -57,6 +57,7 @@ pub mod align;
 pub mod audio;
 #[cfg(any(feature = "ios", feature = "android", feature = "macos-ffi"))]
 pub mod c_api;
+pub mod affinity;
 pub mod config;
 pub mod context;
 pub mod decoder;
