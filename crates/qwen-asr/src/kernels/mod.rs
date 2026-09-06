@@ -185,6 +185,9 @@ define_profile_counters!(
     swiglu,
     bf16_matvec,
     bf16_to_f32_conv,
+    output_head,
+    activation_pack,
+    packed_matmul,
     attention_bidir,
     attention_causal,
     sgemm,
@@ -1306,12 +1309,15 @@ pub fn kleidiai_packed_rhs_size(in_dim: usize, out_dim: usize) -> usize {
 #[cfg(feature = "kleidiai")]
 #[allow(clippy::too_many_arguments)]
 pub fn linear_nobias_int8_kleidiai(
-    y: &mut [f32],
-    x: &[f32],
-    rhs_packed: &[i8],
-    seq_len: usize,
-    in_dim: usize,
-    out_dim: usize,
+    y: &mut [f32], x: &[f32], rhs_packed: &[i8], seq_len: usize, in_dim: usize, out_dim: usize,
+) {
+    linear_int8_kleidiai_shared(&mut [(y, rhs_packed, out_dim)], x, seq_len, in_dim);
+}
+
+/// Quantize/pack one activation matrix and reuse it for independent projections.
+#[cfg(feature = "kleidiai")]
+pub fn linear_int8_kleidiai_shared(
+    projections: &mut [(&mut [f32], &[i8], usize)], x: &[f32], seq_len: usize, in_dim: usize,
 ) {
     use std::ffi::c_void;
 
@@ -1352,7 +1358,10 @@ pub fn linear_nobias_int8_kleidiai(
     }
 
     debug_assert_eq!(x.len(), seq_len * in_dim);
-    debug_assert_eq!(y.len(), seq_len * out_dim);
+    for (y, rhs, out_dim) in projections.iter() {
+        assert_eq!(y.len(), seq_len * out_dim);
+        assert_eq!(rhs.len(), kleidiai_packed_rhs_size(in_dim, *out_dim));
+    }
 
     unsafe {
         let mr = kai_get_mr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm();
@@ -1360,14 +1369,9 @@ pub fn linear_nobias_int8_kleidiai(
         let sr = kai_get_sr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm();
         let lhs_size =
             kai_get_lhs_packed_size_lhs_quant_pack_qai8dxp_f32(seq_len, in_dim, mr, kr, sr);
-        let rhs_size = kleidiai_packed_rhs_size(in_dim, out_dim);
-        assert_eq!(
-            rhs_packed.len(),
-            rhs_size,
-            "invalid offline KleidiAI packed weight size"
-        );
         let mut lhs_packed = kleidiai_lhs_scratch(lhs_size);
 
+        let pack_guard = ProfileGuard::new(&PROF.activation_pack);
         kai_run_lhs_quant_pack_qai8dxp_f32(
             seq_len,
             in_dim,
@@ -1379,18 +1383,22 @@ pub fn linear_nobias_int8_kleidiai(
             in_dim * size_of::<f32>(),
             lhs_packed.as_mut_ptr().cast(),
         );
+        drop(pack_guard);
+        let _matmul_guard = ProfileGuard::new(&PROF.packed_matmul);
+        for (y, rhs_packed, out_dim) in projections.iter_mut() {
         kai_run_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm(
             seq_len,
-            out_dim,
+            *out_dim,
             in_dim,
             lhs_packed.as_ptr().cast(),
             rhs_packed.as_ptr().cast(),
             y.as_mut_ptr(),
-            out_dim * size_of::<f32>(),
+            *out_dim * size_of::<f32>(),
             size_of::<f32>(),
             f32::NEG_INFINITY,
             f32::INFINITY,
         );
+        }
     }
 }
 
@@ -1569,6 +1577,7 @@ pub fn linear_nobias_int8_qkv(
 /// INT8 fused gate_up + SwiGLU
 pub fn linear_nobias_int8_swiglu(
     ffn_out: &mut [f32],
+    gate_buf: &mut [f32],
     x: &[f32],
     w_int8: &[i8],
     w_scales: &[f32],
@@ -1585,12 +1594,13 @@ pub fn linear_nobias_int8_swiglu(
         let w_int8_ptr = w_int8.as_ptr() as usize;
         let w_scales_ptr = w_scales.as_ptr() as usize;
         let ffn_ptr = ffn_out.as_mut_ptr() as usize;
+        let gate_buf_ptr = gate_buf.as_mut_ptr() as usize;
 
         if n_threads <= 1 {
-            let mut gate_buf = vec![0.0f32; 2 * intermediate];
+            let gate_buf_slice = &mut gate_buf[..2 * intermediate];
             unsafe {
                 neon::matvec_int8(
-                    &mut gate_buf,
+                    gate_buf_slice,
                     x_int8.as_ptr(),
                     x_scale,
                     w_int8.as_ptr(),
@@ -1601,8 +1611,8 @@ pub fn linear_nobias_int8_swiglu(
                 );
             }
             for j in 0..intermediate {
-                let g = gate_buf[2 * j];
-                let u = gate_buf[2 * j + 1];
+                let g = gate_buf_slice[2 * j];
+                let u = gate_buf_slice[2 * j + 1];
                 ffn_out[j] = g / (1.0 + (-g).exp()) * u;
             }
             return;
@@ -1622,10 +1632,12 @@ pub fn linear_nobias_int8_swiglu(
                 std::slice::from_raw_parts((w_scales_ptr as *const f32).add(2 * start), 2 * n_rows)
             };
 
-            let mut gate_up_local = vec![0.0f32; 2 * n_rows];
+            let gate_up_local = unsafe {
+                std::slice::from_raw_parts_mut((gate_buf_ptr as *mut f32).add(2 * start), 2 * n_rows)
+            };
             unsafe {
                 neon::matvec_int8(
-                    &mut gate_up_local,
+                    gate_up_local,
                     x_int8_ptr as *const i8,
                     x_scale,
                     w_local,
@@ -2859,6 +2871,7 @@ pub fn argmax_matvec_int8(
     in_dim: usize,
     out_dim: usize,
 ) -> usize {
+    let _pg = ProfileGuard::new(&PROF.output_head);
     let (x_int8, x_scale) = quantize_f32_to_int8_reused(x);
     let n_threads = get_num_threads();
     #[cfg(target_arch = "aarch64")]

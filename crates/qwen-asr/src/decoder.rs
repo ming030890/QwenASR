@@ -119,6 +119,27 @@ pub struct DecLayer {
 unsafe impl Send for DecLayer {}
 unsafe impl Sync for DecLayer {}
 
+#[cfg(feature = "kleidiai")]
+fn shared_qkv_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("QWEN_EXPERIMENT_QKV_REUSE").as_deref() == Ok("1"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_shared_qkv(q: &mut [f32], k: &mut [f32], v: &mut [f32], x: &[f32],
+    wq: Option<&[i8]>, wk: Option<&[i8]>, wv: Option<&[i8]>,
+    seq_len: usize, dim: usize, q_dim: usize, kv_dim: usize, use_kleidiai: bool) -> bool {
+    #[cfg(feature = "kleidiai")]
+    if use_kleidiai && shared_qkv_enabled() {
+        kernels::linear_int8_kleidiai_shared(&mut [
+            (q, wq.expect("packed Q"), q_dim), (k, wk.expect("packed K"), kv_dim),
+            (v, wv.expect("packed V"), kv_dim)], x, seq_len, dim);
+        return true;
+    }
+    let _ = (q, k, v, x, wq, wk, wv, seq_len, dim, q_dim, kv_dim, use_kleidiai);
+    false
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DecoderBackend {
     RowMajorInt8,
@@ -1138,7 +1159,9 @@ pub fn decoder_prefill(
         let k = &mut bufs.pref_k[..seq_len * kv_dim];
         let v = &mut bufs.pref_v[..seq_len * kv_dim];
 
-        if !layer.wq_weight_bf16.is_null() {
+        if try_shared_qkv(q, k, v, x_norm, wq_packed, wk_packed, wv_packed,
+            seq_len, dim, q_dim, kv_dim, use_kleidiai) {
+        } else if !layer.wq_weight_bf16.is_null() {
             unsafe {
                 kernels::linear_nobias_bf16_scratch(
                     q,
@@ -1441,6 +1464,9 @@ pub fn decoder_forward(
         // INT8 fused QKV projection (aarch64 only, BF16 fallback on x86_64)
         #[cfg(all(target_arch = "aarch64", feature = "kleidiai"))]
         if use_kleidiai_decode {
+            if !try_shared_qkv(&mut bufs.q[..q_dim], &mut bufs.k[..kv_dim], &mut bufs.v[..kv_dim],
+                &bufs.x_norm[..dim], layer.wq_kleidiai.as_deref(), layer.wk_kleidiai.as_deref(),
+                layer.wv_kleidiai.as_deref(), 1, dim, q_dim, kv_dim, true) {
             kernels::linear_nobias_int8_kleidiai(
                 &mut bufs.q[..q_dim],
                 &bufs.x_norm[..dim],
@@ -1474,6 +1500,7 @@ pub fn decoder_forward(
                 dim,
                 kv_dim,
             );
+            }
         } else {
             kernels::linear_nobias_int8_qkv(
                 &mut bufs.q[..q_dim],
@@ -1667,6 +1694,7 @@ pub fn decoder_forward(
         } else {
             kernels::linear_nobias_int8_swiglu(
                 &mut bufs.ffn_out[..intermediate],
+                &mut bufs.gate_buf[..2 * intermediate],
                 &bufs.x_norm[..dim],
                 &layer.gate_up_int8,
                 &layer.gate_up_int8_scales,
@@ -1677,6 +1705,7 @@ pub fn decoder_forward(
         #[cfg(all(target_arch = "aarch64", not(feature = "kleidiai")))]
         kernels::linear_nobias_int8_swiglu(
             &mut bufs.ffn_out[..intermediate],
+            &mut bufs.gate_buf[..2 * intermediate],
             &bufs.x_norm[..dim],
             &layer.gate_up_int8,
             &layer.gate_up_int8_scales,

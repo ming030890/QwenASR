@@ -138,8 +138,10 @@ fn full_int8_export_load_and_scalar_decode_reference() {
         );
         let intermediate = layer.gate_up_int8_scales.len() / 2;
         let mut ffn = vec![0.0; intermediate];
+        let mut gate_buf = vec![0.0; 2 * intermediate];
         kernels::linear_nobias_int8_swiglu(
             &mut ffn,
+            &mut gate_buf,
             &x,
             &layer.gate_up_int8,
             &layer.gate_up_int8_scales,
