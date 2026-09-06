@@ -99,9 +99,11 @@ def is_packable(
     name: str,
     pack_decoder: bool = True,
     pack_encoder: bool = True,
+    quantize_bf16: bool = True,
 ) -> bool:
     return (pack_decoder and is_decoder_packable(name)) or (
         pack_encoder and is_encoder_packable(header, name)
+        and (quantize_bf16 or header[name]["dtype"] == "I8")
     )
 
 
@@ -110,12 +112,13 @@ def is_removed_row_major_tensor(
     name: str,
     pack_decoder: bool,
     pack_encoder: bool,
+    quantize_bf16: bool = True,
 ) -> bool:
-    if is_packable(header, name, pack_decoder, pack_encoder):
+    if is_packable(header, name, pack_decoder, pack_encoder, quantize_bf16):
         return True
     scale_suffix = "_int8_scale"
     return name.endswith(scale_suffix) and is_packable(
-        header, name[: -len(scale_suffix)], pack_decoder, pack_encoder
+        header, name[: -len(scale_suffix)], pack_decoder, pack_encoder, quantize_bf16
     )
 
 
@@ -135,13 +138,14 @@ def write_filtered_base_model(
     data: np.ndarray,
     pack_decoder: bool,
     pack_encoder: bool,
+    quantize_bf16: bool = True,
 ) -> tuple[int, int]:
     kept_names = [
         name
         for name in header
         if name != "__metadata__"
         and not is_removed_row_major_tensor(
-            header, name, pack_decoder, pack_encoder
+            header, name, pack_decoder, pack_encoder, quantize_bf16
         )
     ]
     filtered_header = {}
@@ -194,7 +198,9 @@ def main() -> None:
         default="all",
         help="matrices to pack and remove from the base model (default: all)",
     )
+    parser.add_argument("--encoder-policy", choices=("quantize-bf16", "existing-int8"), default="quantize-bf16")
     args = parser.parse_args()
+    quantize_bf16 = args.encoder_policy == "quantize-bf16"
 
     source_dir = Path(args.model_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
@@ -212,7 +218,7 @@ def main() -> None:
         name
         for name in header
         if name != "__metadata__"
-        and is_packable(header, name, pack_decoder, pack_encoder)
+        and is_packable(header, name, pack_decoder, pack_encoder, quantize_bf16)
     )
     if not names:
         raise SystemExit("no I8MM packing candidates found")
@@ -278,7 +284,7 @@ def main() -> None:
             print(f"[{index:3d}/{len(entries)}] {name}: {size / 1048576:.2f} MiB", flush=True)
 
     kept, removed = write_filtered_base_model(
-        base_output_path, header, data, pack_decoder, pack_encoder
+        base_output_path, header, data, pack_decoder, pack_encoder, quantize_bf16
     )
     copy_support_files(source_dir, output_dir)
     print(
