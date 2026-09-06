@@ -317,6 +317,8 @@ fn main() {
             std::process::exit(2);
         }
     }
+    ctx.set_chinese_variant("").expect("empty Chinese variant");
+    ctx.segment_sec = 0.0;
     let model_load_ms = elapsed_ms(t0);
     let startup_ms = elapsed_ms(process_start);
     let memory_after_model_load_kb = current_rss_kb();
@@ -444,6 +446,11 @@ fn main() {
             json_escape(&median_run.transcript),
             run_details_json(&file_runs)
         ));
+        if std::env::var("QWEN_BENCH_STREAM").as_deref() == Ok("1") {
+            println!("QWEN_FILE {}", file_json.last().unwrap());
+            use std::io::Write;
+            std::io::stdout().flush().expect("flush result");
+        }
     }
 
     println!(

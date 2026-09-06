@@ -14,7 +14,7 @@ Env vars (all have defaults matching the accepted baseline config):
   RUST_TOOLCHAIN_BIN          rustup toolchain bin dir
   RUSTFLAGS_EXTRA             extra RUSTFLAGS  (default: -C target-feature=+dotprod)
   CARGO_FEATURES_EXTRA        cargo --features  (default: android-blas)
-  BENCH_LANGUAGE              benchmark language  (default: Auto)
+  BENCH_LANGUAGE              benchmark language  (default: Cantonese)
   BENCH_PROMPT                benchmark prompt text
   BENCH_REMOTE_ENV            space-separated VAR=VAL pairs prepended to the device command
   OPENBLAS_ANDROID_LIB_DIR    dir containing libopenblas.a or libopenblas.so
@@ -222,8 +222,8 @@ def main():
                        os.path.expanduser("~/.rustup/toolchains/stable-aarch64-apple-darwin/bin"))
     rustflags    = env("RUSTFLAGS_EXTRA", "-C target-feature=+dotprod")
     cargo_feats  = env("CARGO_FEATURES_EXTRA", "android-blas")
-    bench_lang   = env("BENCH_LANGUAGE", "Auto")
-    bench_prompt = env("BENCH_PROMPT", "音频是粤语，可能夹杂英语")
+    bench_lang   = env("BENCH_LANGUAGE", "Cantonese")
+    bench_prompt = env("BENCH_PROMPT", "")
     remote_env   = env("BENCH_REMOTE_ENV", "")
     openblas_dir = env("OPENBLAS_ANDROID_LIB_DIR", "/private/tmp/OpenBLAS")
     openblas_static  = env("OPENBLAS_ANDROID_STATIC", "1")
