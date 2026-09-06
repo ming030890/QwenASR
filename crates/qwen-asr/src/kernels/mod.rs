@@ -1343,6 +1343,10 @@ pub fn linear_int8_kleidiai_shared(
             lhs_stride: usize,
             lhs_packed: *mut c_void,
         );
+        fn kai_get_rhs_packed_offset_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm(
+            n_idx: usize,
+            k: usize,
+        ) -> usize;
         fn kai_run_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm(
             m: usize,
             n: usize,
@@ -1385,19 +1389,60 @@ pub fn linear_int8_kleidiai_shared(
         );
         drop(pack_guard);
         let _matmul_guard = ProfileGuard::new(&PROF.packed_matmul);
+        let n_threads = get_num_threads();
         for (y, rhs_packed, out_dim) in projections.iter_mut() {
-        kai_run_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm(
-            seq_len,
-            *out_dim,
-            in_dim,
-            lhs_packed.as_ptr().cast(),
-            rhs_packed.as_ptr().cast(),
-            y.as_mut_ptr(),
-            *out_dim * size_of::<f32>(),
-            size_of::<f32>(),
-            f32::NEG_INFINITY,
-            f32::INFINITY,
-        );
+            let out_dim = *out_dim;
+            if seq_len >= 16 && n_threads > 1 {
+                let y_ptr = y.as_mut_ptr() as usize;
+                let rhs_ptr = rhs_packed.as_ptr() as usize;
+                let lhs_ptr = lhs_packed.as_ptr() as usize;
+                let nr = 4;
+                let total_blocks = out_dim.div_ceil(nr);
+
+                parallel_for(|tid, nt| {
+                    let blocks_per_thread = total_blocks.div_ceil(nt);
+                    let start_block = tid * blocks_per_thread;
+                    let end_block = (start_block + blocks_per_thread).min(total_blocks);
+                    if start_block >= end_block {
+                        return;
+                    }
+                    let n_start = start_block * nr;
+                    let n_len = (end_block - start_block) * nr;
+                    let n_actual = n_len.min(out_dim - n_start);
+
+                    let rhs_offset = kai_get_rhs_packed_offset_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm(
+                        n_start, in_dim,
+                    );
+                    let local_rhs = (rhs_ptr as *const u8).add(rhs_offset);
+                    let local_dst = (y_ptr as *mut f32).add(n_start);
+
+                    kai_run_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm(
+                        seq_len,
+                        n_actual,
+                        in_dim,
+                        lhs_ptr as *const c_void,
+                        local_rhs as *const c_void,
+                        local_dst,
+                        out_dim * size_of::<f32>(),
+                        size_of::<f32>(),
+                        f32::NEG_INFINITY,
+                        f32::INFINITY,
+                    );
+                });
+            } else {
+                kai_run_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm(
+                    seq_len,
+                    out_dim,
+                    in_dim,
+                    lhs_packed.as_ptr().cast(),
+                    rhs_packed.as_ptr().cast(),
+                    y.as_mut_ptr(),
+                    out_dim * size_of::<f32>(),
+                    size_of::<f32>(),
+                    f32::NEG_INFINITY,
+                    f32::INFINITY,
+                );
+            }
         }
     }
 }
