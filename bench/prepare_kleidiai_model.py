@@ -94,15 +94,29 @@ def is_encoder_packable(header: dict, name: str) -> bool:
     ) and header[name]["dtype"] in ("BF16", "I8")
 
 
-def is_packable(header: dict, name: str) -> bool:
-    return is_decoder_packable(name) or is_encoder_packable(header, name)
+def is_packable(
+    header: dict,
+    name: str,
+    pack_decoder: bool = True,
+    pack_encoder: bool = True,
+) -> bool:
+    return (pack_decoder and is_decoder_packable(name)) or (
+        pack_encoder and is_encoder_packable(header, name)
+    )
 
 
-def is_removed_row_major_tensor(header: dict, name: str) -> bool:
-    if is_packable(header, name):
+def is_removed_row_major_tensor(
+    header: dict,
+    name: str,
+    pack_decoder: bool,
+    pack_encoder: bool,
+) -> bool:
+    if is_packable(header, name, pack_decoder, pack_encoder):
         return True
     scale_suffix = "_int8_scale"
-    return name.endswith(scale_suffix) and is_packable(header, name[: -len(scale_suffix)])
+    return name.endswith(scale_suffix) and is_packable(
+        header, name[: -len(scale_suffix)], pack_decoder, pack_encoder
+    )
 
 
 def get_tensor_f32(header: dict, data: np.ndarray, name: str) -> np.ndarray:
@@ -116,12 +130,19 @@ def get_tensor_f32(header: dict, data: np.ndarray, name: str) -> np.ndarray:
 
 
 def write_filtered_base_model(
-    path: Path, header: dict, data: np.ndarray
+    path: Path,
+    header: dict,
+    data: np.ndarray,
+    pack_decoder: bool,
+    pack_encoder: bool,
 ) -> tuple[int, int]:
     kept_names = [
         name
         for name in header
-        if name != "__metadata__" and not is_removed_row_major_tensor(header, name)
+        if name != "__metadata__"
+        and not is_removed_row_major_tensor(
+            header, name, pack_decoder, pack_encoder
+        )
     ]
     filtered_header = {}
     if "__metadata__" in header:
@@ -167,6 +188,12 @@ def main() -> None:
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--kleidiai-lib", required=True)
+    parser.add_argument(
+        "--pack-scope",
+        choices=("all", "decoder", "encoder"),
+        default="all",
+        help="matrices to pack and remove from the base model (default: all)",
+    )
     args = parser.parse_args()
 
     source_dir = Path(args.model_dir).resolve()
@@ -179,8 +206,13 @@ def main() -> None:
             raise SystemExit(f"refusing to overwrite {path}")
 
     header, data = read_safetensors(str(source_dir / "model.safetensors"))
+    pack_decoder = args.pack_scope in ("all", "decoder")
+    pack_encoder = args.pack_scope in ("all", "encoder")
     names = sorted(
-        name for name in header if name != "__metadata__" and is_packable(header, name)
+        name
+        for name in header
+        if name != "__metadata__"
+        and is_packable(header, name, pack_decoder, pack_encoder)
     )
     if not names:
         raise SystemExit("no I8MM packing candidates found")
@@ -245,7 +277,9 @@ def main() -> None:
             stream.write(packed.tobytes())
             print(f"[{index:3d}/{len(entries)}] {name}: {size / 1048576:.2f} MiB", flush=True)
 
-    kept, removed = write_filtered_base_model(base_output_path, header, data)
+    kept, removed = write_filtered_base_model(
+        base_output_path, header, data, pack_decoder, pack_encoder
+    )
     copy_support_files(source_dir, output_dir)
     print(
         f"wrote {base_output_path} ({base_output_path.stat().st_size / 1048576:.2f} MiB; "

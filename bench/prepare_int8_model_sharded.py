@@ -11,10 +11,12 @@ RAM.
 """
 
 import argparse
+from collections import defaultdict
 import json
+import re
 import shutil
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +47,13 @@ class SourceTensor:
         for dim in self.shape:
             result *= dim
         return result
+
+
+@dataclass
+class LoRAProjection:
+    a: np.ndarray
+    b: np.ndarray
+    scale: float
 
 
 @dataclass
@@ -101,6 +110,76 @@ def load_sources(model_dir: Path) -> tuple[list[str], dict[str, SourceTensor]]:
             end=end,
         )
     return names, sources
+
+
+LORA_KEY_RE = re.compile(r"^(.*)\.lora_([AB])(?:\.[^.]+)?\.weight$")
+
+
+def adapter_target_to_base(name: str) -> str:
+    for prefix in ("base_model.model.",):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+    if name.startswith("thinker."):
+        return name + ".weight"
+    return "thinker." + name + ".weight"
+
+
+def load_lora_adapter(adapter_dir: Path) -> dict[str, LoRAProjection]:
+    config = json.loads((adapter_dir / "adapter_config.json").read_text())
+    if config.get("use_dora"):
+        raise NotImplementedError("direct INT8 export does not support DoRA adapters")
+    if config.get("fan_in_fan_out"):
+        raise NotImplementedError("direct INT8 export does not support fan_in_fan_out")
+    if (adapter_dir / "mega_lora_blocks.json").exists():
+        raise NotImplementedError("direct INT8 export does not support block-composed LoRA")
+
+    path = adapter_dir / "adapter_model.safetensors"
+    header, data_start = read_header(path)
+    grouped = defaultdict(dict)
+    raw_names = {}
+    for key, meta in header.items():
+        if key == "__metadata__":
+            continue
+        match = LORA_KEY_RE.match(key)
+        if not match:
+            continue
+        raw_name, which = match.groups()
+        if meta["dtype"] != "F32":
+            raise ValueError(f"adapter tensor must be F32, got {meta['dtype']}: {key}")
+        start, end = meta["data_offsets"]
+        tensor = np.memmap(
+            path,
+            dtype=np.float32,
+            mode="r",
+            offset=data_start + start,
+            shape=tuple(meta["shape"]),
+        )
+        base_name = adapter_target_to_base(raw_name)
+        grouped[base_name][which] = np.asarray(tensor)
+        raw_names[base_name] = raw_name
+
+    default_rank = config.get("r")
+    default_alpha = config.get("lora_alpha", default_rank)
+    rank_pattern = config.get("rank_pattern") or {}
+    alpha_pattern = config.get("alpha_pattern") or {}
+    projections = {}
+    for base_name, pair in grouped.items():
+        if set(pair) != {"A", "B"}:
+            raise ValueError(f"incomplete adapter pair for {base_name}: {sorted(pair)}")
+        raw_name = raw_names[base_name]
+        short_name = raw_name.removeprefix("base_model.model.")
+        rank = rank_pattern.get(raw_name, rank_pattern.get(short_name, default_rank))
+        if rank is None:
+            rank = pair["A"].shape[0]
+        alpha = alpha_pattern.get(raw_name, alpha_pattern.get(short_name, default_alpha))
+        projections[base_name] = LoRAProjection(
+            a=pair["A"],
+            b=pair["B"],
+            scale=float(alpha) / float(rank),
+        )
+    if not projections:
+        raise ValueError(f"no LoRA A/B pairs found in {path}")
+    return projections
 
 
 def is_encoder_ffn_weight(name: str) -> bool:
@@ -275,7 +354,11 @@ def mmap_tensor(source: SourceTensor, dtype) -> np.ndarray:
     )
 
 
-def quantize_rows(source: SourceTensor, rows_per_chunk: int):
+def quantize_rows(
+    source: SourceTensor,
+    rows_per_chunk: int,
+    adapter: LoRAProjection | None = None,
+):
     assert source.dtype == "BF16" and len(source.shape) == 2
     values = mmap_tensor(source, np.uint16)
     rows, _ = source.shape
@@ -283,6 +366,13 @@ def quantize_rows(source: SourceTensor, rows_per_chunk: int):
         row_end = min(row_start + rows_per_chunk, rows)
         bf16 = np.asarray(values[row_start:row_end])
         f32 = (bf16.astype(np.uint32) << 16).view(np.float32)
+        if adapter is not None:
+            if adapter.a.shape[1] != f32.shape[1] or adapter.b.shape[0] != rows:
+                raise ValueError(
+                    f"LoRA shape mismatch: base={source.shape} "
+                    f"A={adapter.a.shape} B={adapter.b.shape}"
+                )
+            f32 = f32 + (adapter.b[row_start:row_end] @ adapter.a) * adapter.scale
         max_abs = np.max(np.abs(f32), axis=1)
         scales = np.where(max_abs > 0.0, max_abs / 127.0, 1.0).astype(np.float32)
         inverse = (127.0 / np.maximum(max_abs, 1e-10)).astype(np.float32)
@@ -290,7 +380,12 @@ def quantize_rows(source: SourceTensor, rows_per_chunk: int):
         yield quantized, scales
 
 
-def quantize_groups(source: SourceTensor, rows_per_chunk: int, group_size: int):
+def quantize_groups(
+    source: SourceTensor,
+    rows_per_chunk: int,
+    group_size: int,
+    adapter: LoRAProjection | None = None,
+):
     assert source.dtype == "BF16" and len(source.shape) == 2
     values = mmap_tensor(source, np.uint16)
     rows, cols = source.shape
@@ -300,6 +395,13 @@ def quantize_groups(source: SourceTensor, rows_per_chunk: int, group_size: int):
         row_end = min(row_start + rows_per_chunk, rows)
         bf16 = np.asarray(values[row_start:row_end])
         f32 = (bf16.astype(np.uint32) << 16).view(np.float32)
+        if adapter is not None:
+            if adapter.a.shape[1] != f32.shape[1] or adapter.b.shape[0] != rows:
+                raise ValueError(
+                    f"LoRA shape mismatch: base={source.shape} "
+                    f"A={adapter.a.shape} B={adapter.b.shape}"
+                )
+            f32 = f32 + (adapter.b[row_start:row_end] @ adapter.a) * adapter.scale
         grouped = f32.reshape(row_end - row_start, groups, group_size)
         max_abs = np.max(np.abs(grouped), axis=2)
         scales = np.where(max_abs > 0.0, max_abs / 127.0, 1.0).astype(np.float32)
@@ -320,8 +422,43 @@ def write_copy(stream, source: SourceTensor, chunk_bytes: int = 64 * 1024 * 1024
         stream.write(memoryview(raw[start : start + chunk_bytes]))
 
 
-def write_quant(stream, source: SourceTensor, rows_per_chunk: int, scales_only: bool):
-    for quantized, scales in quantize_rows(source, rows_per_chunk):
+def f32_to_bf16_bits(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    bits = values.view(np.uint32)
+    rounded = bits + np.uint32(0x7FFF) + ((bits >> 16) & 1)
+    return (rounded >> 16).astype(np.uint16)
+
+
+def write_lora_merged_bf16(
+    stream,
+    source: SourceTensor,
+    adapter: LoRAProjection,
+    rows_per_chunk: int,
+):
+    assert source.dtype == "BF16" and len(source.shape) == 2
+    values = mmap_tensor(source, np.uint16)
+    rows, cols = source.shape
+    if adapter.a.shape[1] != cols or adapter.b.shape[0] != rows:
+        raise ValueError(
+            f"LoRA shape mismatch: base={source.shape} "
+            f"A={adapter.a.shape} B={adapter.b.shape}"
+        )
+    for row_start in range(0, rows, rows_per_chunk):
+        row_end = min(row_start + rows_per_chunk, rows)
+        bf16 = np.asarray(values[row_start:row_end])
+        f32 = (bf16.astype(np.uint32) << 16).view(np.float32)
+        effective = f32 + (adapter.b[row_start:row_end] @ adapter.a) * adapter.scale
+        stream.write(memoryview(f32_to_bf16_bits(effective)).cast("B"))
+
+
+def write_quant(
+    stream,
+    source: SourceTensor,
+    rows_per_chunk: int,
+    scales_only: bool,
+    adapter: LoRAProjection | None = None,
+):
+    for quantized, scales in quantize_rows(source, rows_per_chunk, adapter):
         array = scales if scales_only else quantized
         stream.write(memoryview(np.ascontiguousarray(array)).cast("B"))
 
@@ -332,8 +469,11 @@ def write_group_quant(
     rows_per_chunk: int,
     group_size: int,
     scales_only: bool,
+    adapter: LoRAProjection | None = None,
 ):
-    for quantized, scales in quantize_groups(source, rows_per_chunk, group_size):
+    for quantized, scales in quantize_groups(
+        source, rows_per_chunk, group_size, adapter
+    ):
         array = scales if scales_only else quantized
         stream.write(memoryview(np.ascontiguousarray(array)).cast("B"))
 
@@ -344,9 +484,11 @@ def write_fused(
     up: SourceTensor,
     rows_per_chunk: int,
     scales_only: bool,
+    gate_adapter: LoRAProjection | None = None,
+    up_adapter: LoRAProjection | None = None,
 ):
-    gate_chunks = quantize_rows(gate, rows_per_chunk)
-    up_chunks = quantize_rows(up, rows_per_chunk)
+    gate_chunks = quantize_rows(gate, rows_per_chunk, gate_adapter)
+    up_chunks = quantize_rows(up, rows_per_chunk, up_adapter)
     for (gate_q, gate_s), (up_q, up_s) in zip(gate_chunks, up_chunks, strict=True):
         if scales_only:
             fused = np.empty(gate_s.size * 2, dtype=np.float32)
@@ -364,7 +506,9 @@ def write_model(
     plan: list[OutputTensor],
     sources: dict[str, SourceTensor],
     rows_per_chunk: int,
+    adapters: dict[str, LoRAProjection] | None = None,
 ):
+    adapters = adapters or {}
     header = {}
     offset = 0
     for output in plan:
@@ -385,24 +529,69 @@ def write_model(
             tensors = tuple(sources[name] for name in output.sources)
             if output.kind == "copy":
                 write_copy(stream, tensors[0])
+            elif output.kind == "copy_lora":
+                write_lora_merged_bf16(
+                    stream,
+                    tensors[0],
+                    adapters[output.sources[0]],
+                    rows_per_chunk,
+                )
             elif output.kind == "quant":
-                write_quant(stream, tensors[0], rows_per_chunk, scales_only=False)
+                write_quant(
+                    stream,
+                    tensors[0],
+                    rows_per_chunk,
+                    scales_only=False,
+                    adapter=adapters.get(output.sources[0]),
+                )
             elif output.kind == "scale":
-                write_quant(stream, tensors[0], rows_per_chunk, scales_only=True)
+                write_quant(
+                    stream,
+                    tensors[0],
+                    rows_per_chunk,
+                    scales_only=True,
+                    adapter=adapters.get(output.sources[0]),
+                )
             elif output.kind.startswith("group_quant:"):
                 group_size = int(output.kind.split(":", 1)[1])
                 write_group_quant(
-                    stream, tensors[0], rows_per_chunk, group_size, scales_only=False
+                    stream,
+                    tensors[0],
+                    rows_per_chunk,
+                    group_size,
+                    scales_only=False,
+                    adapter=adapters.get(output.sources[0]),
                 )
             elif output.kind.startswith("group_scale:"):
                 group_size = int(output.kind.split(":", 1)[1])
                 write_group_quant(
-                    stream, tensors[0], rows_per_chunk, group_size, scales_only=True
+                    stream,
+                    tensors[0],
+                    rows_per_chunk,
+                    group_size,
+                    scales_only=True,
+                    adapter=adapters.get(output.sources[0]),
                 )
             elif output.kind == "fused_quant":
-                write_fused(stream, tensors[0], tensors[1], rows_per_chunk, scales_only=False)
+                write_fused(
+                    stream,
+                    tensors[0],
+                    tensors[1],
+                    rows_per_chunk,
+                    scales_only=False,
+                    gate_adapter=adapters.get(output.sources[0]),
+                    up_adapter=adapters.get(output.sources[1]),
+                )
             elif output.kind == "fused_scale":
-                write_fused(stream, tensors[0], tensors[1], rows_per_chunk, scales_only=True)
+                write_fused(
+                    stream,
+                    tensors[0],
+                    tensors[1],
+                    rows_per_chunk,
+                    scales_only=True,
+                    gate_adapter=adapters.get(output.sources[0]),
+                    up_adapter=adapters.get(output.sources[1]),
+                )
             else:
                 raise ValueError(output.kind)
         stream.flush()
@@ -415,6 +604,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--lora-adapter-dir",
+        help=(
+            "merge an F32 LoRA adapter directly into each F32 row chunk before "
+            "INT8 quantization, avoiding an intermediate BF16 merged checkpoint"
+        ),
+    )
     parser.add_argument("--rows-per-chunk", type=int, default=256)
     parser.add_argument(
         "--drop-embed-tokens",
@@ -469,6 +665,11 @@ def main():
     source_dir = Path(args.model_dir)
     output_dir = Path(args.output_dir)
     names, sources = load_sources(source_dir)
+    adapters = (
+        load_lora_adapter(Path(args.lora_adapter_dir))
+        if args.lora_adapter_dir
+        else {}
+    )
     plan = build_plan(
         names,
         sources,
@@ -483,6 +684,26 @@ def main():
         encoder_attention_layer_start=args.encoder_attention_layer_start,
         encoder_attention_layer_limit=args.encoder_attention_layer_limit,
     )
+    plan = [
+        replace(output, kind="copy_lora")
+        if output.kind == "copy" and output.sources[0] in adapters
+        else output
+        for output in plan
+    ]
+    handled_sources = {
+        name
+        for output in plan
+        if output.kind != "copy"
+        for name in output.sources
+    }
+    unmerged = sorted(set(adapters) - handled_sources)
+    missing = sorted(set(adapters) - set(sources))
+    if missing:
+        raise ValueError(f"adapter targets missing from base model: {missing[:5]}")
+    if unmerged:
+        raise ValueError(
+            f"adapter targets would remain unmerged: {unmerged[:5]}"
+        )
 
     source_bytes = sum(source.end - source.start for source in sources.values())
     output_bytes = sum(output.size for output in plan)
@@ -493,10 +714,33 @@ def main():
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_model(output_dir / "model.safetensors", plan, sources, args.rows_per_chunk)
+    write_model(
+        output_dir / "model.safetensors",
+        plan,
+        sources,
+        args.rows_per_chunk,
+        adapters,
+    )
     for source in source_dir.iterdir():
         if source.is_file() and not source.name.endswith(".safetensors") and source.name != "model.safetensors.index.json":
             shutil.copy2(source, output_dir / source.name)
+    if adapters:
+        (output_dir / "int8_export_metadata.json").write_text(
+            json.dumps(
+                {
+                    "lora_adapter_dir": str(Path(args.lora_adapter_dir).resolve()),
+                    "lora_merge_dtype": "F32",
+                    "intermediate_bf16_merge": False,
+                    "quantizer": "symmetric_per_output_row_int8",
+                    "range": [-127, 127],
+                    "rounding": "nearest_even",
+                    "adapter_targets": len(adapters),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
     print(f"Wrote streaming INT8 model to {output_dir}")
 
 
