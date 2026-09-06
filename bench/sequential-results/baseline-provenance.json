@@ -1,0 +1,21 @@
+{
+  "git_head": "97348a40680fd6dbee1d71a2aac48b6f0fd7209e",
+  "language": "Cantonese",
+  "prompt": "",
+  "android_threads": 1,
+  "eval": {
+    "pure_cantonese": {
+      "rows": 363,
+      "unique_ids": 363,
+      "manifest_sha256": "10c92d7072fc415d7b6c1a03d4c87aabdf960b24f4bc642c5ee47408b182608a",
+      "missing_audio": []
+    },
+    "mixed_script": {
+      "rows": 126,
+      "unique_ids": 126,
+      "manifest_sha256": "2f617b145889453057106c9fc802dfb78d24f6d2b00016ae7659b79485765f2a",
+      "missing_audio": []
+    }
+  },
+  "model_sha256": "037e71b7a2efb9a5132ab1ac0b6ac4ac4468c12c80256a303111b57eb7e74092"
+}

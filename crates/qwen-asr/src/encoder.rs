@@ -551,6 +551,17 @@ impl Encoder {
         let td = total_tokens * d_model;
         let mut token_offset = 0;
 
+        // E2: stem operations do not use bf16_scratch. Keep the conversion
+        // there across chunks; later transformer operations may overwrite it.
+        let reuse_conv_projection = self.conv_out_weight_i8mm.is_none()
+            && std::env::var("QWEN_EXPERIMENT_CONV_REUSE").as_deref() != Ok("0");
+        if reuse_conv_projection && !chunk_sizes.is_empty() {
+            bufs.ensure_stem(chunk_size.min(mel_frames), d_model);
+            let n = 7680 * d_model;
+            let weights = unsafe { std::slice::from_raw_parts(self.conv_out_weight_bf16, n) };
+            kernels::bf16_to_f32_buf(&mut bufs.bf16_scratch[..n], weights);
+        }
+
         // Process each chunk through Conv2D + reshape + project + sinusoidal PE
         for &(start, end, w3) in &chunk_sizes {
             let chunk_w = end - start;
@@ -651,6 +662,10 @@ impl Encoder {
                 conv_proj_dim,
                 d_model,
             ) {
+            } else if reuse_conv_projection && w3 > 1 {
+                kernels::linear_nobias(projected, reshaped,
+                    &bufs.bf16_scratch[..conv_proj_dim * d_model],
+                    w3, conv_proj_dim, d_model);
             } else {
                 unsafe {
                     kernels::linear_nobias_bf16_scratch(
