@@ -18,6 +18,35 @@ pub enum Dtype {
     Unknown,
 }
 
+#[inline]
+pub(crate) fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) & 1) as u32;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let mant = (h & 0x3ff) as u32;
+    if exp == 0 {
+        if mant == 0 {
+            f32::from_bits(sign << 31)
+        } else {
+            let mut e = 0i32;
+            let mut m = mant;
+            while (m & 0x400) == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            let f_exp = (((127 - 15 + 1 + e) as u32) & 0xff) << 23;
+            let f_mant = (m & 0x3ff) << 13;
+            f32::from_bits((sign << 31) | f_exp | f_mant)
+        }
+    } else if exp == 31 {
+        let f_mant = mant << 13;
+        f32::from_bits((sign << 31) | (0xff << 23) | f_mant)
+    } else {
+        let f_exp = (exp + 127 - 15) << 23;
+        let f_mant = mant << 13;
+        f32::from_bits((sign << 31) | f_exp | f_mant)
+    }
+}
+
 impl Dtype {
     fn from_str(s: &str) -> Self {
         match s {
@@ -31,7 +60,6 @@ impl Dtype {
             _ => Dtype::Unknown,
         }
     }
-
 }
 
 #[derive(Clone, Debug)]
@@ -178,6 +206,14 @@ impl SafetensorsFile {
                 }
                 Some(out)
             }
+            Dtype::F16 => {
+                let src = unsafe { std::slice::from_raw_parts(ptr as *const u16, n) };
+                let mut out = vec![0.0f32; n];
+                for i in 0..n {
+                    out[i] = f16_to_f32(src[i]);
+                }
+                Some(out)
+            }
             _ => None,
         }
     }
@@ -201,6 +237,23 @@ impl SafetensorsFile {
         }
         let ptr = self.data_ptr(tensor) as *const i8;
         let mut out = vec![0i8; n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), n);
+        }
+        Some(out)
+    }
+
+    /// Copy an I32 tensor into an owned vector.
+    pub fn get_i32_vec(&self, tensor: &TensorMeta) -> Option<Vec<i32>> {
+        if tensor.dtype != Dtype::I32 {
+            return None;
+        }
+        let n = tensor.numel();
+        if n == 0 {
+            return None;
+        }
+        let ptr = self.data_ptr(tensor) as *const i32;
+        let mut out = vec![0i32; n];
         unsafe {
             std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), n);
         }

@@ -160,7 +160,11 @@ pub fn mine(pairs: &[(Vec<char>, Vec<char>)], params: MineParams) -> Vec<Rule> {
         .into_iter()
         .filter(|((from, _), cnt)| {
             let len = from.chars().count();
-            let nmin = if len == 1 { params.n_min_single } else { params.n_min };
+            let nmin = if len == 1 {
+                params.n_min_single
+            } else {
+                params.n_min
+            };
             *cnt >= nmin
         })
         .collect();
@@ -186,9 +190,19 @@ pub fn mine(pairs: &[(Vec<char>, Vec<char>)], params: MineParams) -> Vec<Rule> {
         let occ = *occ_cache.get(&from).unwrap_or(&1);
         let precision = cnt as f64 / occ as f64;
         let len = from.chars().count();
-        let pbar = if len == 1 { params.p_high_single } else { params.p_high };
+        let pbar = if len == 1 {
+            params.p_high_single
+        } else {
+            params.p_high
+        };
         if precision >= pbar {
-            kept.push(Rule { from, to, count: cnt, occ, precision });
+            kept.push(Rule {
+                from,
+                to,
+                count: cnt,
+                occ,
+                precision,
+            });
         }
     }
 
@@ -250,7 +264,6 @@ pub fn sort_for_apply(rules: &mut [Rule]) {
             .then(b.precision.partial_cmp(&a.precision).unwrap())
     });
 }
-
 
 pub fn apply_compiled(text: &[char], compiled: &[(Vec<char>, Vec<char>)]) -> Vec<char> {
     let mut out: Vec<char> = Vec::with_capacity(text.len());

@@ -663,9 +663,14 @@ impl Encoder {
                 d_model,
             ) {
             } else if reuse_conv_projection && w3 > 1 {
-                kernels::linear_nobias(projected, reshaped,
+                kernels::linear_nobias(
+                    projected,
+                    reshaped,
                     &bufs.bf16_scratch[..conv_proj_dim * d_model],
-                    w3, conv_proj_dim, d_model);
+                    w3,
+                    conv_proj_dim,
+                    d_model,
+                );
             } else {
                 unsafe {
                     kernels::linear_nobias_bf16_scratch(

@@ -617,10 +617,7 @@ mod tests {
         // All 256 codepoints must be distinct
         let mut seen = std::collections::HashSet::new();
         for &cp in &btu {
-            assert!(
-                seen.insert(cp),
-                "codepoint {cp} mapped by multiple bytes"
-            );
+            assert!(seen.insert(cp), "codepoint {cp} mapped by multiple bytes");
         }
         assert_eq!(seen.len(), 256);
     }

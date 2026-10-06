@@ -11,7 +11,10 @@ pub fn get_performance_cores() -> &'static [usize] {
         let num_cpus = crate::kernels::get_num_cpus();
 
         for cpu in 0..num_cpus {
-            let path = format!("/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_max_freq", cpu);
+            let path = format!(
+                "/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_max_freq",
+                cpu
+            );
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if let Ok(freq) = content.trim().parse::<u64>() {
                     core_freqs.push((cpu, freq));

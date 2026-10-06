@@ -101,7 +101,10 @@ fn test_loudness_normalization_boosts_very_quiet_audio() {
         .collect();
     let before_peak = samples.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
     let applied = audio::normalize_loudness_in_place(&mut samples);
-    assert!(applied.is_some(), "very quiet non-silent audio should be boosted");
+    assert!(
+        applied.is_some(),
+        "very quiet non-silent audio should be boosted"
+    );
     let after_peak = samples.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
     assert!(after_peak > before_peak);
     assert!(after_peak <= 0.95 + 1e-6);
@@ -114,7 +117,10 @@ fn test_loudness_normalization_leaves_normal_audio() {
         .collect();
     let original = samples.clone();
     let applied = audio::normalize_loudness_in_place(&mut samples);
-    assert!(applied.is_none(), "normal-level audio should be left unchanged");
+    assert!(
+        applied.is_none(),
+        "normal-level audio should be left unchanged"
+    );
     assert_eq!(samples, original);
 }
 

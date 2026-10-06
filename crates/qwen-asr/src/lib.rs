@@ -53,11 +53,12 @@
 //! The remaining modules (`encoder`, `decoder`, `kernels`, `safetensors`) are
 //! implementation details and not intended for direct use.
 
+pub mod adapter;
+pub mod affinity;
 pub mod align;
 pub mod audio;
 #[cfg(any(feature = "ios", feature = "android", feature = "macos-ffi"))]
 pub mod c_api;
-pub mod affinity;
 pub mod config;
 pub mod context;
 pub mod decoder;
@@ -68,6 +69,8 @@ pub mod kernels;
 pub mod safetensors;
 pub mod tokenizer;
 pub mod transcribe;
+pub mod vad_stream;
+pub use silero_vad_rust;
 
 /// Returns a list of compile-time optimization flags enabled for this build.
 pub fn optimization_flags() -> Vec<&'static str> {

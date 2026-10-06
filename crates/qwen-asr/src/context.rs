@@ -63,6 +63,7 @@ pub struct QwenCtx {
     pub stream_max_new_tokens: i32,
     pub past_text_conditioning: bool,
     pub skip_silence: bool,
+    pub stream_adaptive_drain: bool,
 
     // Optional prompt/language
     pub prompt: Option<String>,
@@ -71,6 +72,8 @@ pub struct QwenCtx {
     // Optional Simplified->Traditional (or other variant) output conversion.
     // None = no conversion (raw model output).
     pub chinese_variant: Option<zhconv::Variant>,
+    /// Optional in-decoder Cantonese Chinese conversion adapter.
+    pub adapter: Option<crate::adapter::CantoneseZhconvAdapter>,
     pub prompt_tokens: Option<Vec<i32>>,
     pub force_prompt_tokens: Option<Vec<i32>>,
     pub prompt_tokens_ready: bool,
@@ -166,6 +169,8 @@ impl QwenCtx {
         let kv_cache = KvCache::new(cfg.dec_layers, 2048, cfg.dec_kv_heads, cfg.dec_head_dim);
         let dec_bufs = DecoderBuffers::new(&cfg, decoder.prefill_scratch_len(&cfg));
 
+        let adapter = crate::adapter::CantoneseZhconvAdapter::load(model_dir);
+
         if kernels::verbose() >= 1 {
             eprintln!("Model loaded.");
         }
@@ -184,15 +189,17 @@ impl QwenCtx {
             token_cb: None,
             segment_sec: 0.0,
             search_sec: 3.0,
-            stream_chunk_sec: 8.0,
-            stream_rollback: 5,
-            stream_unfixed_chunks: 99,
-            stream_max_new_tokens: 32,
-            past_text_conditioning: false,
+            stream_chunk_sec: 0.48,
+            stream_rollback: 1,
+            stream_unfixed_chunks: 1,
+            stream_max_new_tokens: 16,
+            past_text_conditioning: true,
             skip_silence: true,
+            stream_adaptive_drain: false,
             prompt: None,
             force_language: None,
             chinese_variant: None,
+            adapter,
             prompt_tokens: None,
             force_prompt_tokens: None,
             prompt_tokens_ready: false,

@@ -127,7 +127,7 @@ fn main() {
     let mut force_language: Option<String> = None;
     let mut chinese_variant: Option<String> = None;
     let mut past_text_mode: i32 = -1; // -1 auto, 0 off, 1 on
-    let mut skip_silence = false;
+    let mut skip_silence: Option<bool> = None;
     let mut profile = false;
     let mut align_text: Option<String> = None;
     let mut align_language: Option<String> = None;
@@ -190,7 +190,10 @@ fn main() {
                 }
             }
             "--skip-silence" => {
-                skip_silence = true;
+                skip_silence = Some(true);
+            }
+            "--no-skip-silence" => {
+                skip_silence = Some(false);
             }
             "--prompt" => {
                 i += 1;
@@ -292,10 +295,15 @@ fn main() {
     }
 
     // Check mutual exclusivity of input modes
-    let input_count = [input_wav.is_some(), use_stdin, live_mode, manifest_path.is_some()]
-        .iter()
-        .filter(|&&x| x)
-        .count();
+    let input_count = [
+        input_wav.is_some(),
+        use_stdin,
+        live_mode,
+        manifest_path.is_some(),
+    ]
+    .iter()
+    .filter(|&&x| x)
+    .count();
     if input_count > 1 {
         eprintln!("Error: -i, --stdin, and --live are mutually exclusive");
         std::process::exit(1);
@@ -356,8 +364,8 @@ fn main() {
     } else if stream_mode {
         ctx.past_text_conditioning = true;
     }
-    if skip_silence {
-        ctx.skip_silence = true;
+    if let Some(skip) = skip_silence {
+        ctx.skip_silence = skip;
     }
     if let Some(ref prompt) = prompt_text {
         if ctx.set_prompt(prompt).is_err() {
@@ -400,7 +408,23 @@ fn main() {
         use std::io::Write;
         let stdout = std::io::stdout();
         for (idx, path) in paths.iter().enumerate() {
-            let text = transcribe::transcribe(&mut ctx, path).unwrap_or_default();
+            let text = if stream_mode && vad_mode {
+                let samples = match audio::load_wav(path) {
+                    Some(s) => s,
+                    None => Vec::new(),
+                };
+                let cfg = qwen_asr::vad_stream::VadStreamConfig::default();
+                let metrics = qwen_asr::vad_stream::simulate_vad_stream(&mut ctx, &samples, &cfg);
+                metrics.text
+            } else if stream_mode {
+                let samples = match audio::load_wav(path) {
+                    Some(s) => s,
+                    None => Vec::new(),
+                };
+                transcribe::transcribe_stream(&mut ctx, &samples).unwrap_or_default()
+            } else {
+                transcribe::transcribe(&mut ctx, path).unwrap_or_default()
+            };
             let infer_ms = ctx.perf_total_ms;
             let mut lock = stdout.lock();
             let _ = writeln!(

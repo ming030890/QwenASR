@@ -18,6 +18,7 @@ pub const TOKEN_AUDIO_END: i32 = 151670;
 pub const TOKEN_AUDIO_PAD: i32 = 151676;
 pub const TOKEN_ASR_TEXT: i32 = 151704;
 pub const TOKEN_TIMESTAMP: i32 = 151705;
+pub const TOKEN_PIPE: i32 = 91; // Confucius4-R2T2 chunk boundary delimiter '|'
 
 // Conv2D stem constants
 pub const CONV_HIDDEN: usize = 480;
@@ -211,6 +212,14 @@ pub fn normalize_language(language: &str) -> Option<String> {
     let trimmed = language.trim();
     if trimmed.is_empty() {
         return None;
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "yue" | "cantonese" => return Some("Cantonese".to_string()),
+        "zh" | "cmn" | "chinese" | "mandarin" => return Some("Chinese".to_string()),
+        "en" | "english" => return Some("English".to_string()),
+        "ja" | "japanese" => return Some("Japanese".to_string()),
+        "ko" | "korean" => return Some("Korean".to_string()),
+        _ => {}
     }
     let mut chars = trimmed.chars();
     let first = chars.next()?.to_uppercase().to_string();

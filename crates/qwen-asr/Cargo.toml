@@ -19,6 +19,7 @@ libc = "0.2"
 jni = { version = "0.21.1", optional = true }
 silero_vad_rust = { path = "../../../silero_vad_rust" }
 zhconv = "0.4.1"
+serde_json = "1.0"
 
 [package.metadata.docs.rs]
 no-default-features = true

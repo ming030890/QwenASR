@@ -26,16 +26,24 @@ struct HypRec {
 }
 
 fn arg(args: &[String], flag: &str) -> Option<String> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1).cloned())
 }
 fn arg_f64(args: &[String], flag: &str, default: f64) -> f64 {
-    arg(args, flag).and_then(|s| s.parse().ok()).unwrap_or(default)
+    arg(args, flag)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 fn arg_u32(args: &[String], flag: &str, default: u32) -> u32 {
-    arg(args, flag).and_then(|s| s.parse().ok()).unwrap_or(default)
+    arg(args, flag)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 fn arg_usize(args: &[String], flag: &str, default: usize) -> usize {
-    arg(args, flag).and_then(|s| s.parse().ok()).unwrap_or(default)
+    arg(args, flag)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 fn main() {
@@ -141,8 +149,10 @@ fn cmd_transcribe(args: &[String]) {
     }
 
     // resume: skip paths already present in out
-    let done: HashSet<String> =
-        read_hyp_jsonl(&out_path).into_iter().map(|r| r.path).collect();
+    let done: HashSet<String> = read_hyp_jsonl(&out_path)
+        .into_iter()
+        .map(|r| r.path)
+        .collect();
 
     let mut ctx = qwen_asr::context::QwenCtx::load(&model).expect("load model");
     if ctx.set_force_language(&language).is_err() {
@@ -181,7 +191,11 @@ fn cmd_transcribe(args: &[String]) {
                 String::new()
             }
         };
-        let rec = HypRec { path: stem, hyp, reference: sent.clone() };
+        let rec = HypRec {
+            path: stem,
+            hyp,
+            reference: sent.clone(),
+        };
         writeln!(out, "{}", serde_json::to_string(&rec).unwrap()).unwrap();
         out.flush().ok();
         n_done += 1;
@@ -189,7 +203,10 @@ fn cmd_transcribe(args: &[String]) {
             eprintln!("  {} / {} (newly transcribed {})", i + 1, total, n_done);
         }
     }
-    eprintln!("done: {} clips, {} newly transcribed -> {}", total, n_done, out_path);
+    eprintln!(
+        "done: {} clips, {} newly transcribed -> {}",
+        total, n_done, out_path
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -225,8 +242,10 @@ fn cmd_cer(args: &[String]) {
 
     for &sp in &[true, false] {
         let tag = if sp { "no-punct" } else { "with-punct" };
-        let pairs: Vec<(&str, &str)> =
-            recs.iter().map(|r| (r.hyp.as_str(), r.reference.as_str())).collect();
+        let pairs: Vec<(&str, &str)> = recs
+            .iter()
+            .map(|r| (r.hyp.as_str(), r.reference.as_str()))
+            .collect();
         let s = text::cer(pairs.iter().copied(), sp);
         println!(
             "[baseline {:9}] corpus_cer={:.4} macro_cer={:.4} edits={} chars={} n={}",
@@ -279,12 +298,20 @@ fn report_examples(recs: &[HypRec], compiled: &[(Vec<char>, Vec<char>)]) {
         if d1 < d0 {
             fixed += 1;
             if samples_fix.len() < 8 {
-                samples_fix.push((h.iter().collect::<String>(), hc.iter().collect::<String>(), rf.iter().collect::<String>()));
+                samples_fix.push((
+                    h.iter().collect::<String>(),
+                    hc.iter().collect::<String>(),
+                    rf.iter().collect::<String>(),
+                ));
             }
         } else if d1 > d0 {
             broke += 1;
             if samples_break.len() < 8 {
-                samples_break.push((h.iter().collect::<String>(), hc.iter().collect::<String>(), rf.iter().collect::<String>()));
+                samples_break.push((
+                    h.iter().collect::<String>(),
+                    hc.iter().collect::<String>(),
+                    rf.iter().collect::<String>(),
+                ));
             }
         }
     }
@@ -315,7 +342,11 @@ fn cmd_mine(args: &[String]) {
     let params = params_from_args(args);
     let recs = read_hyp_jsonl(&in_path);
     let pairs = norm_pairs(&recs, true);
-    eprintln!("mining from {} utterances, params={:?}", pairs.len(), params);
+    eprintln!(
+        "mining from {} utterances, params={:?}",
+        pairs.len(),
+        params
+    );
     let rules = rules::mine(&pairs, params);
     eprintln!("mined {} rules", rules.len());
     let rs = RuleSet { params, rules };
@@ -325,22 +356,24 @@ fn cmd_mine(args: &[String]) {
     let mut preview = rs.rules.clone();
     preview.sort_by(|a, b| b.count.cmp(&a.count));
     for r in preview.iter().take(20) {
-        eprintln!("  {:>5}x p={:.3}  {:?} -> {:?}", r.count, r.precision, r.from, r.to);
+        eprintln!(
+            "  {:>5}x p={:.3}  {:?} -> {:?}",
+            r.count, r.precision, r.from, r.to
+        );
     }
 }
 
 // ---------------------------------------------------------------------------
 
-fn net_benefit_prune(
-    mut rules: Vec<Rule>,
-    dev: &[(Vec<char>, Vec<char>)],
-) -> Vec<Rule> {
+fn net_benefit_prune(mut rules: Vec<Rule>, dev: &[(Vec<char>, Vec<char>)]) -> Vec<Rule> {
     // greedily add rules (by count desc); keep only if it reduces total dev edits.
     rules.sort_by(|a, b| b.count.cmp(&a.count));
     let mut kept: Vec<Rule> = Vec::new();
     let base_edits = |kr: &[Rule]| -> usize {
-        let compiled: Vec<(Vec<char>, Vec<char>)> =
-            kr.iter().map(|r| (r.from.chars().collect(), r.to.chars().collect())).collect();
+        let compiled: Vec<(Vec<char>, Vec<char>)> = kr
+            .iter()
+            .map(|r| (r.from.chars().collect(), r.to.chars().collect()))
+            .collect();
         dev.iter()
             .map(|(h, r)| text::levenshtein(&rules::apply_compiled(h, &compiled), r))
             .sum()
@@ -373,7 +406,11 @@ fn cmd_tune(args: &[String]) {
         dev.truncate(n);
     }
     let (base_cer, _, _) = corpus_cer_chars(&dev);
-    eprintln!("dev baseline corpus_cer(no-punct) = {:.4} over {} utts", base_cer, dev.len());
+    eprintln!(
+        "dev baseline corpus_cer(no-punct) = {:.4} over {} utts",
+        base_cer,
+        dev.len()
+    );
 
     let p_highs = [0.85, 0.90, 0.95];
     let n_mins = [10u32, 20, 40];
@@ -402,7 +439,12 @@ fn cmd_tune(args: &[String]) {
                 let (cer, _, _) = corpus_cer_chars(&corr);
                 eprintln!(
                     "  p={:.2} n={} k={} -> {} rules, dev_cer={:.4} (delta {:+.4})",
-                    p, nm, k, mined.len(), cer, cer - base_cer
+                    p,
+                    nm,
+                    k,
+                    mined.len(),
+                    cer,
+                    cer - base_cer
                 );
                 let better = best.as_ref().map(|(bc, _, _)| cer < *bc).unwrap_or(true);
                 if better {
@@ -421,8 +463,10 @@ fn cmd_tune(args: &[String]) {
         .iter()
         .map(|r| (r.from.chars().collect(), r.to.chars().collect()))
         .collect();
-    let corr: Vec<(Vec<char>, Vec<char>)> =
-        dev.iter().map(|(h, r)| (rules::apply_compiled(h, &compiled), r.clone())).collect();
+    let corr: Vec<(Vec<char>, Vec<char>)> = dev
+        .iter()
+        .map(|(h, r)| (rules::apply_compiled(h, &compiled), r.clone()))
+        .collect();
     let (cer2, _, _) = corpus_cer_chars(&corr);
     eprintln!(
         "after net-benefit prune: {} rules, dev_cer={:.4} (baseline {:.4})",
@@ -435,7 +479,10 @@ fn cmd_tune(args: &[String]) {
         eprintln!("WARNING: pruned set regresses dev; writing empty rule set");
     }
     let final_rules = if cer2 <= base_cer { pruned } else { Vec::new() };
-    let rs = RuleSet { params, rules: final_rules };
+    let rs = RuleSet {
+        params,
+        rules: final_rules,
+    };
     std::fs::write(&out_path, serde_json::to_string_pretty(&rs).unwrap()).unwrap();
     eprintln!("wrote {} ({} rules)", out_path, rs.rules.len());
 }
@@ -518,7 +565,8 @@ fn score_sequence(
 
     let (enc_output, enc_seq_len) = if let Some(samples) = audio_samples {
         let (mel, mel_frames) = qwen_asr::audio::mel_spectrogram(samples).expect("mel");
-        let (win_enc, win_seq) = ctx.encoder
+        let (win_enc, win_seq) = ctx
+            .encoder
             .forward(&ctx.config, &mel, mel_frames, Some(&mut ctx.enc_bufs))
             .expect("encoder forward");
         (win_enc, win_seq)
@@ -653,7 +701,13 @@ fn score_sequence(
 
         let char_bytes = tokenizer.decode_bytes(target_tok);
         let char_str = String::from_utf8_lossy(char_bytes);
-        println!("    pos {:>2} | token: {:>6} ({:^6}) | log_prob: {:.4}", i, target_tok, char_str.trim(), tok_log_prob);
+        println!(
+            "    pos {:>2} | token: {:>6} ({:^6}) | log_prob: {:.4}",
+            i,
+            target_tok,
+            char_str.trim(),
+            tok_log_prob
+        );
     }
 
     total_log_prob

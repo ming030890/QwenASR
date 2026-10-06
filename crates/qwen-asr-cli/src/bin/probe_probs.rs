@@ -221,47 +221,47 @@ fn main() {
     let cfg = ctx.config.clone();
     let dim = cfg.dec_hidden;
     if !candidates.is_empty() {
-    let out_dim = cfg.lm_head_dim();
-    ctx.kv_cache.len = 0;
-    let needed_scratch = cfg.lm_head_dim() * cfg.dec_hidden;
-    if ctx.dec_bufs.bf16_scratch.len() < needed_scratch {
-        ctx.dec_bufs.bf16_scratch.resize(needed_scratch, 0.0);
-    }
-    let first_logits = decoder::decoder_prefill_logits(
-        &ctx.decoder,
-        &cfg,
-        &mut ctx.kv_cache,
-        &mut ctx.rope_cache,
-        &mut ctx.dec_bufs,
-        &prefix_embeds,
-        prefix_embeds.len() / dim,
-    );
-    let first_row = &first_logits[(prefix_embeds.len() / dim - 1) * out_dim
-        ..(prefix_embeds.len() / dim) * out_dim];
-    let (top_id, top_logit) = top_token(first_row);
-    println!(
-        "{{\"kind\":\"first_top\",\"token_id\":{},\"piece\":\"{}\",\"logit\":{:.6}}}",
-        top_id,
-        String::from_utf8_lossy(tokenizer.decode_bytes(top_id as i32)),
-        top_logit
-    );
+        let out_dim = cfg.lm_head_dim();
+        ctx.kv_cache.len = 0;
+        let needed_scratch = cfg.lm_head_dim() * cfg.dec_hidden;
+        if ctx.dec_bufs.bf16_scratch.len() < needed_scratch {
+            ctx.dec_bufs.bf16_scratch.resize(needed_scratch, 0.0);
+        }
+        let first_logits = decoder::decoder_prefill_logits(
+            &ctx.decoder,
+            &cfg,
+            &mut ctx.kv_cache,
+            &mut ctx.rope_cache,
+            &mut ctx.dec_bufs,
+            &prefix_embeds,
+            prefix_embeds.len() / dim,
+        );
+        let first_row = &first_logits
+            [(prefix_embeds.len() / dim - 1) * out_dim..(prefix_embeds.len() / dim) * out_dim];
+        let (top_id, top_logit) = top_token(first_row);
+        println!(
+            "{{\"kind\":\"first_top\",\"token_id\":{},\"piece\":\"{}\",\"logit\":{:.6}}}",
+            top_id,
+            String::from_utf8_lossy(tokenizer.decode_bytes(top_id as i32)),
+            top_logit
+        );
 
-    for ch in ["彌", "尼", "離", "地"] {
-        let toks = tokenizer.encode(ch).expect("char token");
-        if toks.len() == 1 {
-            let (lp, p, rank) = logprob(first_row, toks[0]);
-            println!(
+        for ch in ["彌", "尼", "離", "地"] {
+            let toks = tokenizer.encode(ch).expect("char token");
+            if toks.len() == 1 {
+                let (lp, p, rank) = logprob(first_row, toks[0]);
+                println!(
                 "{{\"kind\":\"first_char\",\"text\":\"{}\",\"token_id\":{},\"logprob\":{:.6},\"prob\":{:.9},\"rank\":{}}}",
                 ch, toks[0], lp, p, rank
             );
-        } else {
-            let (lp, p, rank) = logprob(first_row, toks[0]);
-            println!(
+            } else {
+                let (lp, p, rank) = logprob(first_row, toks[0]);
+                println!(
                 "{{\"kind\":\"first_char\",\"text\":\"{}\",\"tokens\":{:?},\"note\":\"multi_token\",\"first_token_logprob\":{:.6},\"first_token_prob\":{:.9},\"first_token_rank\":{}}}",
                 ch, toks, lp, p, rank
             );
+            }
         }
-    }
     }
 
     if let Some(text) = next_after {
@@ -302,10 +302,12 @@ fn main() {
         let stop_logit = logits[0].max(logits[1]);
         let question_vs_stop = 1.0f32 / (1.0 + (stop_logit - q_logit).exp());
         let terminal_max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let terminal_denom: f32 = logits.iter().map(|value| (*value - terminal_max).exp()).sum();
+        let terminal_denom: f32 = logits
+            .iter()
+            .map(|value| (*value - terminal_max).exp())
+            .sum();
         let question_terminal_probability =
-            ((logits[2] - terminal_max).exp() + (logits[3] - terminal_max).exp())
-                / terminal_denom;
+            ((logits[2] - terminal_max).exp() + (logits[3] - terminal_max).exp()) / terminal_denom;
         println!(
             "{{\"kind\":\"next_after\",\"eos_logit\":{:.6},\"im_end_logit\":{:.6},\"fullwidth_question_logit\":{:.6},\"ascii_question_logit\":{:.6},\"full_stop_logit\":{:.6},\"comma_logit\":{:.6},\"question_vs_stop_probability\":{:.9},\"question_terminal_probability\":{:.9}}}",
             logits[0], logits[1], logits[2], logits[3], logits[4], logits[5], question_vs_stop, question_terminal_probability

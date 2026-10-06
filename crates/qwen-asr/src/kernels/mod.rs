@@ -108,7 +108,6 @@ pub fn set_profile(enabled: bool) {
     PROFILE_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
-
 #[derive(Debug, Clone)]
 pub struct ProfileCounterSnapshot {
     pub name: &'static str,
@@ -1148,7 +1147,6 @@ pub fn linear_bf16(
     linear(y, x, &w_f32, b, seq_len, in_dim, out_dim);
 }
 
-
 /// Fused gate_up matvec + SwiGLU for single-token decode.
 /// Computes: `ffn_out[j] = silu(gate[j]) * up[j]` where gate/up come from interleaved gate_up_fused matvec.
 /// Keeps gate_up output in L1 cache for the SwiGLU operation.
@@ -1325,7 +1323,12 @@ pub fn kleidiai_packed_rhs_size(in_dim: usize, out_dim: usize) -> usize {
 #[cfg(feature = "kleidiai")]
 #[allow(clippy::too_many_arguments)]
 pub fn linear_nobias_int8_kleidiai(
-    y: &mut [f32], x: &[f32], rhs_packed: &[i8], seq_len: usize, in_dim: usize, out_dim: usize,
+    y: &mut [f32],
+    x: &[f32],
+    rhs_packed: &[i8],
+    seq_len: usize,
+    in_dim: usize,
+    out_dim: usize,
 ) {
     linear_int8_kleidiai_shared(&mut [(y, rhs_packed, out_dim)], x, seq_len, in_dim);
 }
@@ -1333,7 +1336,10 @@ pub fn linear_nobias_int8_kleidiai(
 /// Quantize/pack one activation matrix and reuse it for independent projections.
 #[cfg(feature = "kleidiai")]
 pub fn linear_int8_kleidiai_shared(
-    projections: &mut [(&mut [f32], &[i8], usize)], x: &[f32], seq_len: usize, in_dim: usize,
+    projections: &mut [(&mut [f32], &[i8], usize)],
+    x: &[f32],
+    seq_len: usize,
+    in_dim: usize,
 ) {
     use std::ffi::c_void;
 
@@ -1694,7 +1700,10 @@ pub fn linear_nobias_int8_swiglu(
             };
 
             let gate_up_local = unsafe {
-                std::slice::from_raw_parts_mut((gate_buf_ptr as *mut f32).add(2 * start), 2 * n_rows)
+                std::slice::from_raw_parts_mut(
+                    (gate_buf_ptr as *mut f32).add(2 * start),
+                    2 * n_rows,
+                )
             };
             unsafe {
                 neon::matvec_int8(
@@ -1749,7 +1758,6 @@ pub fn linear_nobias_int8_addto(
     int8_matvec_threaded(y, x, w_int8, w_scales, Some(bias), in_dim, out_dim);
 }
 
-
 // ========================================================================
 // 2D Convolution (im2col + BLAS sgemm)
 // ========================================================================
@@ -1792,7 +1800,6 @@ fn im2col(
         }
     }
 }
-
 
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_with_cols(
@@ -2749,7 +2756,6 @@ pub fn sinusoidal_pe(pe: &mut [f32], n_pos: usize, d_model: usize) {
     }
 }
 
-
 pub fn apply_rope_neox(
     x: &mut [f32],
     cos_vals: &[f32],
@@ -3029,18 +3035,63 @@ pub fn matvec_int8_selected_logits(
     in_dim: usize,
     rows: &[usize],
 ) -> Vec<f32> {
+    let mut output = vec![0.0; rows.len()];
+    matvec_int8_selected_logits_into(x, w_int8, w_scales, in_dim, rows, &mut output);
+    output
+}
+
+pub fn matvec_int8_selected_logits_into(
+    x: &[f32],
+    w_int8: &[i8],
+    w_scales: &[f32],
+    in_dim: usize,
+    rows: &[usize],
+    output: &mut [f32],
+) {
+    debug_assert!(output.len() >= rows.len());
     let (x_int8, x_scale) = quantize_f32_to_int8_reused(x);
-    rows.iter()
-        .map(|&row| {
-            let weights = &w_int8[row * in_dim..(row + 1) * in_dim];
-            let dot = x_int8
-                .iter()
-                .zip(weights)
-                .map(|(&a, &b)| (a as i32) * (b as i32))
-                .sum::<i32>();
-            dot as f32 * x_scale * w_scales[row]
-        })
-        .collect()
+    for (&row, value) in rows.iter().zip(output.iter_mut()) {
+        let weights = &w_int8[row * in_dim..(row + 1) * in_dim];
+        let dot = x_int8
+            .iter()
+            .zip(weights)
+            .map(|(&a, &b)| (a as i32) * (b as i32))
+            .sum::<i32>();
+        *value = dot as f32 * x_scale * w_scales[row];
+    }
+}
+
+/// Compute selected BF16 lm-head logits without projecting the full vocabulary.
+pub fn matvec_bf16_selected_logits(
+    x: &[f32],
+    w_bf16: *const u16,
+    in_dim: usize,
+    rows: &[usize],
+) -> Vec<f32> {
+    let mut output = vec![0.0; rows.len()];
+    matvec_bf16_selected_logits_into(x, w_bf16, in_dim, rows, &mut output);
+    output
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn matvec_bf16_selected_logits_into(
+    x: &[f32],
+    w_bf16: *const u16,
+    in_dim: usize,
+    rows: &[usize],
+    output: &mut [f32],
+) {
+    debug_assert!(output.len() >= rows.len());
+    for (&row, value) in rows.iter().zip(output.iter_mut()) {
+        let weights = unsafe { std::slice::from_raw_parts(w_bf16.add(row * in_dim), in_dim) };
+        *value = x
+            .iter()
+            .zip(weights.iter())
+            .fold(0.0f32, |acc, (&input, &weight)| {
+                let weight = f32::from_bits((weight as u32) << 16);
+                weight.mul_add(input, acc)
+            });
+    }
 }
 
 pub fn argmax_matvec_bf16(x: &[f32], w_bf16: *const u16, in_dim: usize, out_dim: usize) -> usize {

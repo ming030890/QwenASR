@@ -709,6 +709,7 @@ version = "0.7.1"
 dependencies = [
  "jni",
  "libc",
+ "serde_json",
  "silero_vad_rust",
  "zhconv",
 ]
@@ -721,7 +722,10 @@ dependencies = [
  "ctrlc",
  "libc",
  "qwen-asr",
+ "serde",
+ "serde_json",
  "ureq",
+ "zhconv",
 ]
 
 [[package]]

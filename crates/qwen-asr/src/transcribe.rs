@@ -17,7 +17,6 @@ const SUFFIX_BASE: &[i32] = &[151670, 151645, 198, 151644, 77091, 198];
 // Streaming robustness constants (matching C reference)
 const STREAM_DEGEN_MAX_PERIOD: usize = 6;
 const STREAM_DEGEN_MIN_REPEATS: usize = 4;
-const STREAM_STALE_CHUNKS: i32 = 4;
 const STREAM_RESET_INTERVAL_CHUNKS: i32 = 45;
 const STREAM_RESET_CARRY_TOKENS: usize = 24;
 const STREAM_MAX_ENC_WINDOWS: usize = 4;
@@ -349,7 +348,7 @@ fn transcribe_segment(
     while n_generated < max_tokens {
         n_generated += 1;
 
-        if token == TOKEN_ENDOFTEXT || token == TOKEN_IM_END {
+        if token == TOKEN_ENDOFTEXT || token == TOKEN_IM_END || token == TOKEN_PIPE {
             break;
         }
 
@@ -357,7 +356,15 @@ fn transcribe_segment(
             past_asr_text = true;
             saw_asr_text = true;
         } else if past_asr_text {
-            let piece_bytes = tokenizer.decode_bytes(token);
+            let converted_str: Option<&str> = if let Some(ref adapter) = ctx.adapter {
+                adapter.convert_token(token, &ctx.dec_bufs.x[..dim])
+            } else {
+                None
+            };
+            let piece_bytes: &[u8] = match converted_str {
+                Some(s) => s.as_bytes(),
+                None => tokenizer.decode_bytes(token),
+            };
             text_bytes.extend_from_slice(piece_bytes);
             n_text_tokens += 1;
 
@@ -366,7 +373,12 @@ fn transcribe_segment(
                     ctx.perf_first_visible_token_ms = elapsed_ms(inference_t0);
                 }
                 if let Some(ref cb) = ctx.token_cb {
-                    cb(&ctx.convert_chinese(&piece));
+                    let text_to_emit = if ctx.adapter.is_some() {
+                        piece
+                    } else {
+                        ctx.convert_chinese(&piece)
+                    };
+                    cb(&text_to_emit);
                 }
             }
 
@@ -632,14 +644,23 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 
         if let Some(ref cb) = ctx.token_cb {
             if ctx.past_text_conditioning {
-                cb(&ctx.convert_chinese(&seg_text));
+                let to_emit = if ctx.adapter.is_some() {
+                    seg_text.clone()
+                } else {
+                    ctx.convert_chinese(&seg_text)
+                };
+                cb(&to_emit);
             }
         }
 
         result.push_str(&seg_text);
     }
 
-    Some(ctx.convert_chinese(&result))
+    if ctx.adapter.is_some() {
+        Some(result)
+    } else {
+        Some(ctx.convert_chinese(&result))
+    }
 }
 
 /// Convenience wrapper: load a WAV file and transcribe it.
@@ -663,446 +684,12 @@ pub fn transcribe_stdin(ctx: &mut QwenCtx) -> Option<String> {
 /// Trades throughput for lower latency compared to offline mode. If no
 /// `token_cb` is set, falls back to a single offline decode of the full audio.
 pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
-    let inference_t0 = get_time_ms();
-    let cfg = ctx.config.clone();
-    let dim = cfg.dec_hidden;
-    let chunk_samples = (ctx.stream_chunk_sec * SAMPLE_RATE as f32) as usize;
-    let rollback = ctx.stream_rollback;
-    let unfixed_chunks = ctx.stream_unfixed_chunks;
-    let max_new_tokens = if ctx.stream_max_new_tokens > 0 {
-        ctx.stream_max_new_tokens
-    } else {
-        32
-    };
-
     ctx.reset_perf();
     ctx.perf_audio_ms = 1000.0 * samples.len() as f64 / SAMPLE_RATE as f64;
-
-    // If no token callback, fall back to offline decode
-    if ctx.token_cb.is_none() {
-        if kernels::verbose() >= 2 {
-            eprintln!("Streaming: no token callback, using direct final refinement");
-        }
-        let audio_samples = if ctx.skip_silence {
-            audio::compact_silence(samples)
-        } else {
-            samples.to_vec()
-        };
-        let tokenizer = load_tokenizer(&ctx.model_dir)?;
-        ctx.prepare_prompt_tokens(&tokenizer);
-        let (text, _) = transcribe_segment(ctx, &audio_samples, &tokenizer, None, inference_t0)?;
-        return Some(ctx.convert_chinese(&text));
-    }
-
-    let audio_samples = if ctx.skip_silence {
-        audio::compact_silence_fast(samples)
-    } else {
-        samples.to_vec()
-    };
-
-    let tokenizer = load_tokenizer(&ctx.model_dir)?;
-    if !ctx.prepare_prompt_tokens(&tokenizer) {
-        return None;
-    }
-
-    let enc_window_frames = cfg.enc_n_window_infer.clamp(100, 800);
-    let enc_window_samples = enc_window_frames * HOP_LENGTH;
-
-    let mut raw_tokens: Vec<i32> = Vec::new();
-    let mut stable_text_tokens: Vec<i32> = Vec::new();
-    let mut result_bytes: Vec<u8> = Vec::new();
-    let mut tmp_embed = vec![0.0f32; dim];
-
-    let mut chunk_idx = 0i32;
-    let mut audio_cursor = 0usize;
-
-    // Encoder window cache
-    struct EncWindow {
-        seq_len: usize,
-        enc_output: Vec<f32>,
-        row_keys: Vec<PrefillRowKey>,
-    }
-    let mut enc_cache: Vec<EncWindow> = Vec::new();
-    let mut enc_cached_seq_total = 0usize;
-
-    // Previous prefill row keys for LCP reuse
-    let mut prev_prefill_keys: Vec<PrefillRowKey> = Vec::new();
-
-    // Streaming robustness state
-    let mut stale_count = 0i32;
-    let mut prev_tail_snapshot: Vec<i32> = Vec::new();
-    let mut enc_cache_base_windows = 0usize;
-
-    while audio_cursor < audio_samples.len() {
-        let chunk_t0 = get_time_ms();
-        audio_cursor = (audio_cursor + chunk_samples).min(audio_samples.len());
-        let is_final = audio_cursor >= audio_samples.len();
-
-        // Encoder
-        let t0 = get_time_ms();
-        let mut chunk_mel_ms = 0.0f64;
-        let mut chunk_enc_only_ms = 0.0f64;
-        let full_end = (audio_cursor / enc_window_samples) * enc_window_samples;
-
-        // Cache completed windows (base offset accounts for windows cleared on re-anchor)
-        while (enc_cache_base_windows + enc_cache.len()) * enc_window_samples < full_end {
-            let ws = (enc_cache_base_windows + enc_cache.len()) * enc_window_samples;
-            let mel_t = get_time_ms();
-            let (mel, mel_frames) =
-                audio::mel_spectrogram(&audio_samples[ws..ws + enc_window_samples])?;
-            chunk_mel_ms += elapsed_ms(mel_t);
-            let enc_t = get_time_ms();
-            let (win_enc, win_seq) =
-                ctx.encoder
-                    .forward(&cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))?;
-            chunk_enc_only_ms += elapsed_ms(enc_t);
-            let row_keys = prefill_embed_keys(&win_enc, win_seq, dim);
-            enc_cached_seq_total += win_seq;
-            enc_cache.push(EncWindow {
-                seq_len: win_seq,
-                enc_output: win_enc,
-                row_keys,
-            });
-        }
-
-        // Encode partial tail
-        let mut partial_seq = 0;
-        let mut partial_enc: Vec<f32> = Vec::new();
-        let mut partial_keys: Vec<PrefillRowKey> = Vec::new();
-        if is_final && full_end < audio_cursor {
-            let _partial_samples = audio_cursor - full_end;
-            let mel_t = get_time_ms();
-            if let Some((mel, mel_frames)) =
-                audio::mel_spectrogram(&audio_samples[full_end..audio_cursor])
-            {
-                chunk_mel_ms += elapsed_ms(mel_t);
-                let enc_t = get_time_ms();
-                if let Some((enc, seq)) =
-                    ctx.encoder
-                        .forward(&cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))
-                {
-                    chunk_enc_only_ms += elapsed_ms(enc_t);
-                    partial_seq = seq;
-                    partial_keys = prefill_embed_keys(&enc, seq, dim);
-                    partial_enc = enc;
-                }
-            }
-        }
-
-        let enc_seq_len = enc_cached_seq_total + partial_seq;
-        if enc_seq_len == 0 {
-            chunk_idx += 1;
-            continue;
-        }
-
-        let enc_ms = elapsed_ms(t0);
-        ctx.perf_encode_ms += enc_ms;
-        ctx.perf_mel_ms += chunk_mel_ms;
-        ctx.perf_encoder_ms += chunk_enc_only_ms;
-
-        if !is_final && chunk_idx < unfixed_chunks {
-            prev_prefill_keys.clear();
-            ctx.perf_total_ms += elapsed_ms(chunk_t0);
-            chunk_idx += 1;
-            continue;
-        }
-
-        // Prefix rollback
-        let n_prefix_tokens = if ctx.past_text_conditioning
-            && chunk_idx >= unfixed_chunks
-            && !raw_tokens.is_empty()
-        {
-            (raw_tokens.len() as i32 - rollback).max(0) as usize
-        } else {
-            0
-        };
-
-        // Build input embeddings
-        let n_prompt_tokens = ctx.prompt_tokens.as_ref().map_or(0, |t| t.len());
-        let n_force_prompt_tokens = ctx.force_prompt_tokens.as_ref().map_or(0, |t| t.len());
-        let prefix_len = PREFIX_HEAD.len() + n_prompt_tokens + PREFIX_TAIL.len();
-        let suffix_len = SUFFIX_BASE.len() + n_force_prompt_tokens;
-        let total_seq = prefix_len + enc_seq_len + suffix_len + n_prefix_tokens;
-
-        let mut input_embeds = vec![0.0f32; total_seq * dim];
-        let mut prefill_keys = vec![PrefillRowKey { a: 0, b: 0 }; total_seq];
-        let mut off = 0;
-
-        for &tok in PREFIX_HEAD {
-            unsafe {
-                tok_embed_to_f32(
-                    &ctx.decoder,
-                    &mut input_embeds[off * dim..(off + 1) * dim],
-                    tok,
-                    dim,
-                )
-            };
-            prefill_keys[off] = prefill_token_key(tok);
-            off += 1;
-        }
-        if let Some(ref ptoks) = ctx.prompt_tokens {
-            for &tok in ptoks {
-                unsafe {
-                    tok_embed_to_f32(
-                        &ctx.decoder,
-                        &mut input_embeds[off * dim..(off + 1) * dim],
-                        tok,
-                        dim,
-                    )
-                };
-                prefill_keys[off] = prefill_token_key(tok);
-                off += 1;
-            }
-        }
-        for &tok in PREFIX_TAIL {
-            unsafe {
-                tok_embed_to_f32(
-                    &ctx.decoder,
-                    &mut input_embeds[off * dim..(off + 1) * dim],
-                    tok,
-                    dim,
-                )
-            };
-            prefill_keys[off] = prefill_token_key(tok);
-            off += 1;
-        }
-
-        let mut enc_key_off = 0;
-        for w in &enc_cache {
-            prefill_keys[prefix_len + enc_key_off..prefix_len + enc_key_off + w.seq_len]
-                .copy_from_slice(&w.row_keys);
-            enc_key_off += w.seq_len;
-        }
-        if partial_seq > 0 {
-            prefill_keys[prefix_len + enc_key_off..prefix_len + enc_key_off + partial_seq]
-                .copy_from_slice(&partial_keys);
-        }
-
-        let mut enc_embed_off = 0;
-        for w in &enc_cache {
-            let n = w.seq_len * dim;
-            input_embeds
-                [(prefix_len + enc_embed_off) * dim..(prefix_len + enc_embed_off) * dim + n]
-                .copy_from_slice(&w.enc_output);
-            enc_embed_off += w.seq_len;
-        }
-        if partial_seq > 0 {
-            let n = partial_seq * dim;
-            input_embeds
-                [(prefix_len + enc_embed_off) * dim..(prefix_len + enc_embed_off) * dim + n]
-                .copy_from_slice(&partial_enc);
-        }
-
-        let suffix_off = prefix_len + enc_seq_len;
-        for (i, &tok) in SUFFIX_BASE.iter().enumerate() {
-            unsafe {
-                tok_embed_to_f32(
-                    &ctx.decoder,
-                    &mut input_embeds[(suffix_off + i) * dim..(suffix_off + i + 1) * dim],
-                    tok,
-                    dim,
-                )
-            };
-            prefill_keys[suffix_off + i] = prefill_token_key(tok);
-        }
-        if let Some(ref ftoks) = ctx.force_prompt_tokens {
-            for (i, &tok) in ftoks.iter().enumerate() {
-                unsafe {
-                    tok_embed_to_f32(
-                        &ctx.decoder,
-                        &mut input_embeds[(suffix_off + SUFFIX_BASE.len() + i) * dim
-                            ..(suffix_off + SUFFIX_BASE.len() + i + 1) * dim],
-                        tok,
-                        dim,
-                    )
-                };
-                prefill_keys[suffix_off + SUFFIX_BASE.len() + i] = prefill_token_key(tok);
-            }
-        }
-
-        let text_off = suffix_off + suffix_len;
-        for i in 0..n_prefix_tokens {
-            unsafe {
-                tok_embed_to_f32(
-                    &ctx.decoder,
-                    &mut input_embeds[(text_off + i) * dim..(text_off + i + 1) * dim],
-                    raw_tokens[i],
-                    dim,
-                )
-            };
-            prefill_keys[text_off + i] = prefill_token_key(raw_tokens[i]);
-        }
-
-        // Decoder prefill with LCP reuse
-        let t0 = get_time_ms();
-        let prefill_len = total_seq - 1;
-
-        let reused_prefill = prefill_lcp_len(&prev_prefill_keys, &prefill_keys, prefill_len);
-
-        ctx.kv_cache.len = reused_prefill;
-        let delta_prefill = prefill_len - reused_prefill;
-        if delta_prefill > 0 {
-            decoder::decoder_prefill(
-                &ctx.decoder,
-                &cfg,
-                &mut ctx.kv_cache,
-                &mut ctx.rope_cache,
-                &mut ctx.dec_bufs,
-                &input_embeds[reused_prefill * dim..],
-                delta_prefill,
-            );
-        }
-
-        // Save for next chunk
-        prev_prefill_keys.clear();
-        prev_prefill_keys.extend_from_slice(&prefill_keys[..prefill_len]);
-
-        let prefill_ms = elapsed_ms(t0);
-        ctx.perf_decode_ms += prefill_ms;
-        ctx.perf_prefill_ms += prefill_ms;
-
-        let last_embed = &input_embeds[prefill_len * dim..(prefill_len + 1) * dim];
-        let mut token = decoder::decoder_forward(
-            &ctx.decoder,
-            &cfg,
-            &mut ctx.kv_cache,
-            &mut ctx.rope_cache,
-            &mut ctx.dec_bufs,
-            last_embed,
-        );
-
-        // Autoregressive decode
-        let t0 = get_time_ms();
-        let mut chunk_tokens: Vec<i32> = Vec::new();
-        let mut n_generated = 0;
-
-        while n_generated < max_new_tokens {
-            n_generated += 1;
-            if token == TOKEN_ENDOFTEXT || token == TOKEN_IM_END {
-                break;
-            }
-            chunk_tokens.push(token);
-            unsafe {
-                tok_embed_to_f32(&ctx.decoder, &mut tmp_embed, token, dim);
-            }
-            token = decoder::decoder_forward(
-                &ctx.decoder,
-                &cfg,
-                &mut ctx.kv_cache,
-                &mut ctx.rope_cache,
-                &mut ctx.dec_bufs,
-                &tmp_embed,
-            );
-        }
-
-        let decode_ms = elapsed_ms(t0);
-        ctx.perf_decode_ms += decode_ms;
-        ctx.perf_decode_loop_ms += decode_ms;
-
-        // Update raw token history
-        raw_tokens.truncate(n_prefix_tokens);
-        raw_tokens.extend_from_slice(&chunk_tokens);
-
-        // Streaming degeneracy detection
-        if raw_tokens == prev_tail_snapshot {
-            stale_count += 1;
-        } else {
-            stale_count = 0;
-            prev_tail_snapshot = raw_tokens.clone();
-        }
-        let (best_reps, _) = stream_tail_repeat_blocks(&raw_tokens, STREAM_DEGEN_MAX_PERIOD);
-        let is_degen = stale_count >= STREAM_STALE_CHUNKS || best_reps >= STREAM_DEGEN_MIN_REPEATS;
-
-        if is_degen {
-            if kernels::verbose() >= 2 {
-                eprintln!(
-                    "[stream degen] reset at chunk {} (stale={}, reps={})",
-                    chunk_idx, stale_count, best_reps
-                );
-            }
-            let carry = stable_text_tokens.len().min(STREAM_RESET_CARRY_TOKENS);
-            let carry_start = stable_text_tokens.len() - carry;
-            raw_tokens.clear();
-            if carry > 0 {
-                raw_tokens.push(TOKEN_ASR_TEXT);
-                raw_tokens.extend_from_slice(&stable_text_tokens[carry_start..]);
-            }
-            prev_prefill_keys.clear();
-            stale_count = 0;
-            prev_tail_snapshot.clear();
-        }
-
-        // Periodic re-anchor: reset context every STREAM_RESET_INTERVAL_CHUNKS chunks
-        if chunk_idx > 0 && chunk_idx % STREAM_RESET_INTERVAL_CHUNKS == 0 {
-            if kernels::verbose() >= 2 {
-                eprintln!("[stream reanchor] at chunk {}", chunk_idx);
-            }
-            let carry = stable_text_tokens.len().min(STREAM_RESET_CARRY_TOKENS);
-            let carry_start = stable_text_tokens.len() - carry;
-            raw_tokens.clear();
-            if carry > 0 {
-                raw_tokens.push(TOKEN_ASR_TEXT);
-                raw_tokens.extend_from_slice(&stable_text_tokens[carry_start..]);
-            }
-            prev_prefill_keys.clear();
-            stale_count = 0;
-            prev_tail_snapshot.clear();
-            enc_cache_base_windows += enc_cache.len();
-            enc_cache.clear();
-            enc_cached_seq_total = 0;
-        }
-
-        // Parse text region
-        let text_start = if n_force_prompt_tokens == 0 {
-            raw_tokens
-                .iter()
-                .position(|&t| t == TOKEN_ASR_TEXT)
-                .map(|p| p + 1)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let n_text_tokens = raw_tokens.len().saturating_sub(text_start);
-
-        // Fixed frontier
-        let candidate_len = if is_final {
-            n_text_tokens
-        } else if chunk_idx >= unfixed_chunks {
-            (n_text_tokens as i32 - rollback).max(0) as usize
-        } else {
-            0
-        };
-
-        // Monotonic commit
-        let candidate_tokens = &raw_tokens[text_start..];
-        let _lcp = stable_text_tokens
-            .iter()
-            .zip(candidate_tokens.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
-
-        let emit_from = stable_text_tokens.len();
-        let emit_to = candidate_len.max(emit_from);
-
-        for i in emit_from..emit_to {
-            if i < candidate_tokens.len() {
-                if i >= stable_text_tokens.len() {
-                    stable_text_tokens.push(candidate_tokens[i]);
-                }
-                let piece_bytes = tokenizer.decode_bytes(candidate_tokens[i]);
-                if let Some(ref cb) = ctx.token_cb {
-                    cb(&ctx.convert_chinese(&String::from_utf8_lossy(piece_bytes)));
-                }
-                ctx.perf_text_tokens += 1;
-                result_bytes.extend_from_slice(piece_bytes);
-            }
-        }
-
-        ctx.perf_total_ms += elapsed_ms(chunk_t0);
-        chunk_idx += 1;
-    }
-
-    Some(ctx.convert_chinese(String::from_utf8_lossy(&result_bytes).trim()))
+    let mut state = StreamState::new();
+    let _ = stream_push_audio(ctx, samples, &mut state, true)?;
+    let text = state.text();
+    Some(ctx.convert_chinese(text.trim()))
 } // ========================================================================
   // Incremental Streaming API
   // ========================================================================
@@ -1127,8 +714,11 @@ pub struct StreamState {
 
     // Decoder token history
     raw_tokens: Vec<i32>,
+    raw_converted: Vec<Option<String>>,
     stable_text_tokens: Vec<i32>,
     result_bytes: Vec<u8>,
+    pending_utf8: Vec<u8>,
+    hypothesis_text: String,
 
     // Prefill LCP reuse
     prev_prefill_keys: Vec<PrefillRowKey>,
@@ -1166,8 +756,11 @@ impl StreamState {
             enc_cached_seq_total: 0,
             enc_cache_base_windows: 0,
             raw_tokens: Vec::new(),
+            raw_converted: Vec::new(),
             stable_text_tokens: Vec::new(),
             result_bytes: Vec::new(),
+            pending_utf8: Vec::new(),
+            hypothesis_text: String::new(),
             prev_prefill_keys: Vec::new(),
             prev_tail_snapshot: Vec::new(),
             stale_count: 0,
@@ -1188,8 +781,11 @@ impl StreamState {
         self.enc_cached_seq_total = 0;
         self.enc_cache_base_windows = 0;
         self.raw_tokens.clear();
+        self.raw_converted.clear();
         self.stable_text_tokens.clear();
         self.result_bytes.clear();
+        self.pending_utf8.clear();
+        self.hypothesis_text.clear();
         self.prev_prefill_keys.clear();
         self.prev_tail_snapshot.clear();
         self.stale_count = 0;
@@ -1205,6 +801,11 @@ impl StreamState {
     /// Get the current stable transcription result.
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.result_bytes).into_owned()
+    }
+
+    /// Get the latest full hypothesis, including uncommitted rollback tokens.
+    pub fn hypothesis(&self) -> &str {
+        &self.hypothesis_text
     }
 
     /// Get how many samples have been processed so far.
@@ -1256,6 +857,56 @@ pub fn stream_push_audio(
         return Some(String::new());
     }
     if available == 0 {
+        if finalize {
+            let n_force_prompt_tokens = ctx.force_prompt_tokens.as_ref().map_or(0, |t| t.len());
+            let text_start = if n_force_prompt_tokens == 0 {
+                state
+                    .raw_tokens
+                    .iter()
+                    .position(|&t| t == TOKEN_ASR_TEXT)
+                    .map(|p| p + 1)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let candidate_tokens = &state.raw_tokens[text_start..];
+            let candidate_converted = if text_start < state.raw_converted.len() {
+                &state.raw_converted[text_start..]
+            } else {
+                &[]
+            };
+            let emit_from = state.stable_text_tokens.len();
+            let emit_to = candidate_tokens.len();
+            let mut delta_bytes: Vec<u8> = Vec::new();
+            for i in emit_from..emit_to {
+                state.stable_text_tokens.push(candidate_tokens[i]);
+                let piece_str = if let Some(Some(ref s)) = candidate_converted.get(i) {
+                    Some(s.as_str())
+                } else if let Some(ref adapter) = ctx.adapter {
+                    adapter.convert_token_static(candidate_tokens[i])
+                } else {
+                    None
+                };
+                let piece_bytes = match piece_str {
+                    Some(s) => s.as_bytes(),
+                    None => tokenizer.decode_bytes(candidate_tokens[i]),
+                };
+                if let Some(ref cb) = ctx.token_cb {
+                    if let Some(piece) = push_utf8_piece(&mut state.pending_utf8, piece_bytes) {
+                        let text_to_emit = if ctx.adapter.is_some() {
+                            piece
+                        } else {
+                            ctx.convert_chinese(&piece)
+                        };
+                        cb(&text_to_emit);
+                    }
+                }
+                ctx.perf_text_tokens += 1;
+                state.result_bytes.extend_from_slice(piece_bytes);
+                delta_bytes.extend_from_slice(piece_bytes);
+            }
+            return Some(String::from_utf8_lossy(&delta_bytes).into_owned());
+        }
         return Some(String::new());
     }
 
@@ -1272,7 +923,12 @@ pub fn stream_push_audio(
         }
 
         let chunk_t0 = get_time_ms();
-        state.audio_cursor = (state.audio_cursor + chunk_samples).min(samples.len());
+        let step = if ctx.stream_adaptive_drain && remaining >= chunk_samples * 2 {
+            remaining
+        } else {
+            chunk_samples
+        };
+        state.audio_cursor = (state.audio_cursor + step).min(samples.len());
         let is_final = finalize && state.audio_cursor >= samples.len();
 
         // ---- Encoder: only encode new windows ----
@@ -1302,14 +958,7 @@ pub fn stream_push_audio(
             });
         }
 
-        // Encode partial tail — with lazy re-encoding for LCP optimization.
-        // Only re-encode when enough new audio has accumulated (every 2 chunks),
-        // on the first chunk, or when finalizing. On skip chunks, the reused
-        // encoder output gives near-perfect LCP matching, cutting prefill cost.
-        let enc_update_threshold = chunk_samples * 2;
-        let partial_age = state.audio_cursor.saturating_sub(state.last_partial_cursor);
-        let need_encode =
-            state.last_partial_cursor == 0 || partial_age >= enc_update_threshold || is_final;
+        let need_encode = true;
 
         let partial_seq;
         let partial_enc;
@@ -1370,7 +1019,10 @@ pub fn stream_push_audio(
             && state.chunk_idx >= unfixed_chunks
             && !state.raw_tokens.is_empty()
         {
-            (state.raw_tokens.len() as i32 - rollback).max(0) as usize
+            // Only condition on tokens that have actually been committed to stable_text_tokens.
+            // Tentative uncommitted tokens must NOT be fed as fixed prefix prompt conditioning,
+            // as that prevents the decoder from revising tentative tokens at utterance onset.
+            state.stable_text_tokens.len().min(state.raw_tokens.len())
         } else {
             0
         };
@@ -1541,14 +1193,24 @@ pub fn stream_push_audio(
         // ---- Autoregressive decode ----
         let t0 = get_time_ms();
         let mut chunk_tokens: Vec<i32> = Vec::new();
+        let mut chunk_converted: Vec<Option<String>> = Vec::new();
         let mut n_generated = 0;
 
         while n_generated < max_new_tokens {
             n_generated += 1;
-            if token == TOKEN_ENDOFTEXT || token == TOKEN_IM_END {
+            if token == TOKEN_ENDOFTEXT || token == TOKEN_IM_END || token == TOKEN_PIPE {
                 break;
             }
             chunk_tokens.push(token);
+            let conv = if let Some(ref adapter) = ctx.adapter {
+                adapter
+                    .convert_token(token, &ctx.dec_bufs.x[..dim])
+                    .map(|s| s.to_string())
+            } else {
+                None
+            };
+            chunk_converted.push(conv);
+
             unsafe {
                 tok_embed_to_f32(&ctx.decoder, &mut tmp_embed, token, dim);
             }
@@ -1566,168 +1228,225 @@ pub fn stream_push_audio(
         ctx.perf_decode_ms += decode_ms;
         ctx.perf_decode_loop_ms += decode_ms;
 
-        // ---- Detect speech end (decoder produced EOT on silence) ----
-        // When chunk_tokens is empty, the decoder saw silence/end-of-speech.
-        // Commit ALL remaining rollback-buffered tokens BEFORE truncation,
-        // since truncate will remove them.
-        let speech_ended = chunk_tokens.is_empty()
-            && !state.raw_tokens.is_empty()
-            && state.chunk_idx >= unfixed_chunks;
-
-        if speech_ended {
-            // Emit remaining rollback tokens from current raw_tokens (before truncation)
-            let text_start = if n_force_prompt_tokens == 0 {
-                state
-                    .raw_tokens
-                    .iter()
-                    .position(|&t| t == TOKEN_ASR_TEXT)
-                    .map(|p| p + 1)
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            let candidate_tokens = &state.raw_tokens[text_start..];
-            let n_text = candidate_tokens.len();
-            let emit_from = state.stable_text_tokens.len();
-            for i in emit_from..n_text {
-                if i < candidate_tokens.len() {
-                    if i >= state.stable_text_tokens.len() {
-                        state.stable_text_tokens.push(candidate_tokens[i]);
-                    }
-                    let piece_bytes = tokenizer.decode_bytes(candidate_tokens[i]);
-                    if let Some(ref cb) = ctx.token_cb {
-                        cb(&String::from_utf8_lossy(piece_bytes));
-                    }
-                    ctx.perf_text_tokens += 1;
-                    state.result_bytes.extend_from_slice(piece_bytes);
-                    delta_bytes.extend_from_slice(piece_bytes);
-                }
-            }
-        }
-
         // ---- Update raw token history ----
         state.raw_tokens.truncate(n_prefix_tokens);
+        state.raw_converted.truncate(n_prefix_tokens);
         state.raw_tokens.extend_from_slice(&chunk_tokens);
+        state.raw_converted.extend(chunk_converted);
 
-        // ---- Streaming degeneracy detection ----
-        if !speech_ended {
-            if state.raw_tokens == state.prev_tail_snapshot {
-                state.stale_count += 1;
-            } else {
-                state.stale_count = 0;
-                state.prev_tail_snapshot = state.raw_tokens.clone();
+        // ---- Streaming degeneracy detection (repetition loops only) ----
+        let (best_reps, _) = stream_tail_repeat_blocks(&state.raw_tokens, STREAM_DEGEN_MAX_PERIOD);
+        let is_degen = best_reps >= STREAM_DEGEN_MIN_REPEATS;
+
+        if is_degen {
+            if kernels::verbose() >= 2 {
+                eprintln!(
+                    "[stream degen] reset at chunk {} (stale={}, reps={})",
+                    state.chunk_idx, state.stale_count, best_reps
+                );
             }
-            let (best_reps, _) =
-                stream_tail_repeat_blocks(&state.raw_tokens, STREAM_DEGEN_MAX_PERIOD);
-            let is_degen =
-                state.stale_count >= STREAM_STALE_CHUNKS || best_reps >= STREAM_DEGEN_MIN_REPEATS;
-
-            if is_degen {
-                if kernels::verbose() >= 2 {
-                    eprintln!(
-                        "[stream degen] reset at chunk {} (stale={}, reps={})",
-                        state.chunk_idx, state.stale_count, best_reps
-                    );
-                }
-                let carry = state
-                    .stable_text_tokens
-                    .len()
-                    .min(STREAM_RESET_CARRY_TOKENS);
-                let carry_start = state.stable_text_tokens.len() - carry;
-                state.raw_tokens.clear();
-                if carry > 0 {
-                    state.raw_tokens.push(TOKEN_ASR_TEXT);
-                    state
-                        .raw_tokens
-                        .extend_from_slice(&state.stable_text_tokens[carry_start..]);
-                }
-                state.prev_prefill_keys.clear();
-                state.stale_count = 0;
-                state.prev_tail_snapshot.clear();
-                if state.enc_cache.len() >= STREAM_MAX_ENC_WINDOWS {
-                    state.enc_cache_base_windows += state.enc_cache.len();
-                    state.enc_cache.clear();
-                    state.enc_cached_seq_total = 0;
-                }
-            }
-
-            // Periodic re-anchor: reset context every STREAM_RESET_INTERVAL_CHUNKS chunks
-            if state.chunk_idx > 0 && state.chunk_idx % STREAM_RESET_INTERVAL_CHUNKS == 0 {
-                if kernels::verbose() >= 2 {
-                    eprintln!("[stream reanchor] at chunk {}", state.chunk_idx);
-                }
-                let carry = state
-                    .stable_text_tokens
-                    .len()
-                    .min(STREAM_RESET_CARRY_TOKENS);
-                let carry_start = state.stable_text_tokens.len() - carry;
-                state.raw_tokens.clear();
-                if carry > 0 {
-                    state.raw_tokens.push(TOKEN_ASR_TEXT);
-                    state
-                        .raw_tokens
-                        .extend_from_slice(&state.stable_text_tokens[carry_start..]);
-                }
-                state.prev_prefill_keys.clear();
-                state.stale_count = 0;
-                state.prev_tail_snapshot.clear();
-                if state.enc_cache.len() >= STREAM_MAX_ENC_WINDOWS {
-                    state.enc_cache_base_windows += state.enc_cache.len();
-                    state.enc_cache.clear();
-                    state.enc_cached_seq_total = 0;
-                }
-            }
-        }
-
-        // ---- Parse text region and emit stable tokens (non-speech-ended case) ----
-        if !speech_ended {
-            let text_start = if n_force_prompt_tokens == 0 {
+            let carry = state
+                .stable_text_tokens
+                .len()
+                .min(STREAM_RESET_CARRY_TOKENS);
+            let carry_start = state.stable_text_tokens.len() - carry;
+            state.raw_tokens.clear();
+            state.raw_converted.clear();
+            if carry > 0 {
+                state.raw_tokens.push(TOKEN_ASR_TEXT);
+                state.raw_converted.push(None);
                 state
                     .raw_tokens
-                    .iter()
-                    .position(|&t| t == TOKEN_ASR_TEXT)
-                    .map(|p| p + 1)
-                    .unwrap_or(0)
+                    .extend_from_slice(&state.stable_text_tokens[carry_start..]);
+                for &t in &state.stable_text_tokens[carry_start..] {
+                    state.raw_converted.push(
+                        ctx.adapter
+                            .as_ref()
+                            .and_then(|a| a.convert_token_static(t).map(|s| s.to_string())),
+                    );
+                }
+            }
+            state.prev_prefill_keys.clear();
+            state.stale_count = 0;
+            state.prev_tail_snapshot.clear();
+            if state.enc_cache.len() >= STREAM_MAX_ENC_WINDOWS {
+                state.enc_cache_base_windows += state.enc_cache.len();
+                state.enc_cache.clear();
+                state.enc_cached_seq_total = 0;
+            }
+        }
+
+        // Periodic re-anchor: reset context every STREAM_RESET_INTERVAL_CHUNKS chunks
+        if state.chunk_idx > 0 && state.chunk_idx % STREAM_RESET_INTERVAL_CHUNKS == 0 {
+            if kernels::verbose() >= 2 {
+                eprintln!("[stream reanchor] at chunk {}", state.chunk_idx);
+            }
+            let carry = state
+                .stable_text_tokens
+                .len()
+                .min(STREAM_RESET_CARRY_TOKENS);
+            let carry_start = state.stable_text_tokens.len() - carry;
+            state.raw_tokens.clear();
+            state.raw_converted.clear();
+            if carry > 0 {
+                state.raw_tokens.push(TOKEN_ASR_TEXT);
+                state.raw_converted.push(None);
+                state
+                    .raw_tokens
+                    .extend_from_slice(&state.stable_text_tokens[carry_start..]);
+                for &t in &state.stable_text_tokens[carry_start..] {
+                    state.raw_converted.push(
+                        ctx.adapter
+                            .as_ref()
+                            .and_then(|a| a.convert_token_static(t).map(|s| s.to_string())),
+                    );
+                }
+            }
+            state.prev_prefill_keys.clear();
+            state.stale_count = 0;
+            state.prev_tail_snapshot.clear();
+            if state.enc_cache.len() >= STREAM_MAX_ENC_WINDOWS {
+                state.enc_cache_base_windows += state.enc_cache.len();
+                state.enc_cache.clear();
+                state.enc_cached_seq_total = 0;
+            }
+        }
+
+        // ---- Parse text region and emit stable tokens ----
+        let text_start = if n_force_prompt_tokens == 0 {
+            state
+                .raw_tokens
+                .iter()
+                .position(|&t| t == TOKEN_ASR_TEXT)
+                .map(|p| p + 1)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let n_text_tokens = state.raw_tokens.len().saturating_sub(text_start);
+
+        let candidate_tokens = &state.raw_tokens[text_start..];
+        let candidate_converted = if text_start < state.raw_converted.len() {
+            &state.raw_converted[text_start..]
+        } else {
+            &[]
+        };
+
+        let mut hypothesis_bytes = Vec::new();
+        for (i, &token) in candidate_tokens.iter().enumerate() {
+            let piece_str = if let Some(Some(ref s)) = candidate_converted.get(i) {
+                Some(s.as_str())
+            } else if let Some(ref adapter) = ctx.adapter {
+                adapter.convert_token_static(token)
             } else {
-                0
+                None
             };
-            let n_text_tokens = state.raw_tokens.len().saturating_sub(text_start);
+            match piece_str {
+                Some(s) => hypothesis_bytes.extend_from_slice(s.as_bytes()),
+                None => hypothesis_bytes.extend_from_slice(tokenizer.decode_bytes(token)),
+            }
+        }
+        let hypothesis = match std::str::from_utf8(&hypothesis_bytes) {
+            Ok(text) => text.to_string(),
+            Err(error) if error.error_len().is_none() => {
+                String::from_utf8_lossy(&hypothesis_bytes[..error.valid_up_to()]).into_owned()
+            }
+            Err(_) => String::from_utf8_lossy(&hypothesis_bytes).into_owned(),
+        };
+        let hypothesis = if ctx.adapter.is_some() {
+            hypothesis
+        } else {
+            ctx.convert_chinese(&hypothesis)
+        };
 
-            let candidate_len = if is_final {
-                n_text_tokens
-            } else if state.chunk_idx >= unfixed_chunks {
-                (n_text_tokens as i32 - rollback).max(0) as usize
+        // Local Agreement: calculate longest common prefix with previous chunk's hypothesis
+        let lcp_len = candidate_tokens
+            .iter()
+            .zip(state.prev_tail_snapshot.iter())
+            .take_while(|(&a, &b)| a == b)
+            .count();
+
+        let mut candidate_len = if is_final {
+            n_text_tokens
+        } else if state.chunk_idx >= unfixed_chunks {
+            if state.stable_text_tokens.is_empty() {
+                // Utterance onset protection:
+                // At the start of an utterance, require Local Agreement consensus (lcp_len >= 1)
+                // before committing the first tokens, avoiding premature commitment to noise/hallucinations.
+                // If chunks diverge, wait until at least chunk_idx >= 3 before falling back to rollback.
+                if lcp_len >= 1 {
+                    lcp_len.min(n_text_tokens)
+                } else if state.chunk_idx >= 3 {
+                    (n_text_tokens as i32 - (rollback + 1)).max(0) as usize
+                } else {
+                    0
+                }
             } else {
-                0
-            };
+                let rb_len = (n_text_tokens as i32 - rollback).max(0) as usize;
+                rb_len.max(lcp_len).min(n_text_tokens)
+            }
+        } else {
+            0
+        };
 
-            let candidate_tokens = &state.raw_tokens[text_start..];
-            let emit_from = state.stable_text_tokens.len();
-            let emit_to = candidate_len.max(emit_from);
-
-            for i in emit_from..emit_to {
-                if i < candidate_tokens.len() {
-                    if i >= state.stable_text_tokens.len() {
-                        state.stable_text_tokens.push(candidate_tokens[i]);
+        // Ensure candidate_len does not split a multi-byte UTF-8 character
+        if !is_final && candidate_len > 0 {
+            while candidate_len > 0 {
+                let mut test_bytes = Vec::new();
+                for &tok in &candidate_tokens[..candidate_len] {
+                    test_bytes.extend_from_slice(tokenizer.decode_bytes(tok));
+                }
+                match std::str::from_utf8(&test_bytes) {
+                    Ok(_) => break,
+                    Err(e) if e.error_len().is_none() => {
+                        candidate_len -= 1;
                     }
-                    let piece_bytes = tokenizer.decode_bytes(candidate_tokens[i]);
-                    if let Some(ref cb) = ctx.token_cb {
-                        cb(&String::from_utf8_lossy(piece_bytes));
-                    }
-                    ctx.perf_text_tokens += 1;
-                    state.result_bytes.extend_from_slice(piece_bytes);
-                    delta_bytes.extend_from_slice(piece_bytes);
+                    Err(_) => break,
                 }
             }
         }
+
+        let emit_from = state.stable_text_tokens.len();
+        let emit_to = candidate_len.max(emit_from);
+
+        for i in emit_from..emit_to {
+            if i < candidate_tokens.len() {
+                if i >= state.stable_text_tokens.len() {
+                    state.stable_text_tokens.push(candidate_tokens[i]);
+                }
+                let piece_str: Option<&str> = if let Some(Some(ref s)) = candidate_converted.get(i) {
+                    Some(s.as_str())
+                } else if let Some(ref adapter) = ctx.adapter {
+                    adapter.convert_token_static(candidate_tokens[i])
+                } else {
+                    None
+                };
+                let piece_bytes = match piece_str {
+                    Some(s) => s.as_bytes(),
+                    None => tokenizer.decode_bytes(candidate_tokens[i]),
+                };
+                if let Some(ref cb) = ctx.token_cb {
+                    if let Some(piece) = push_utf8_piece(&mut state.pending_utf8, piece_bytes) {
+                        let text_to_emit = if ctx.adapter.is_some() {
+                            piece
+                        } else {
+                            ctx.convert_chinese(&piece)
+                        };
+                        cb(&text_to_emit);
+                    }
+                }
+                ctx.perf_text_tokens += 1;
+                state.result_bytes.extend_from_slice(piece_bytes);
+                delta_bytes.extend_from_slice(piece_bytes);
+            }
+        }
+
+        state.prev_tail_snapshot.clear();
+        state.prev_tail_snapshot.extend_from_slice(candidate_tokens);
+        state.hypothesis_text = hypothesis;
 
         ctx.perf_total_ms += elapsed_ms(chunk_t0);
         state.chunk_idx += 1;
-
-        // Stop processing after speech ends — no point encoding more silence
-        if speech_ended {
-            break;
-        }
     } // end while loop
 
     Some(String::from_utf8_lossy(&delta_bytes).into_owned())
