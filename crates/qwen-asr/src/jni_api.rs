@@ -16,6 +16,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 const MAX_QUEUED_SAMPLES: u64 = (SAMPLE_RATE * 90) as u64;
+const INFERENCE_BACKLOG_SAMPLES: u64 = (SAMPLE_RATE / 5) as u64;
 
 enum VadMsg {
     Audio(Vec<f32>),
@@ -110,10 +111,12 @@ fn start_asr_worker(
                     }
 
                     let engine = unsafe { &mut *(engine_addr as *mut crate::c_api::QwenAsrEngine) };
+                    let has_audio_backlog =
+                        queued_samples.load(Ordering::Relaxed) >= INFERENCE_BACKLOG_SAMPLES;
                     let vm = java_vm.clone();
                     let lis = listener.clone();
 
-                    let events = vad_session.push_audio(&mut engine.ctx, &samples_f32, |delta| {
+                    let on_delta = |delta: &str| {
                         if !delta.is_empty() {
                             if let Ok(mut env) = vm.attach_current_thread() {
                                 if let Ok(j_delta) = env.new_string(delta) {
@@ -126,7 +129,12 @@ fn start_asr_worker(
                                 }
                             }
                         }
-                    });
+                    };
+                    let events = if has_audio_backlog {
+                        vad_session.push_audio_backlogged(&mut engine.ctx, &samples_f32, on_delta)
+                    } else {
+                        vad_session.push_audio(&mut engine.ctx, &samples_f32, on_delta)
+                    };
 
                     let mut utterance_ended = false;
                     for event in events {
@@ -530,6 +538,7 @@ mod tests {
         let cfg = VadStreamConfig::default();
         assert_eq!(VAD_FRAME_SIZE, 512);
         assert_eq!(VAD_FRAME_SIZE * 1000 / SAMPLE_RATE, 32);
+        assert_eq!(INFERENCE_BACKLOG_SAMPLES * 1000 / SAMPLE_RATE as u64, 200);
         assert_eq!(cfg.threshold, 0.50);
         assert_eq!(cfg.neg_threshold, 0.35);
         assert_eq!(cfg.min_silence_ms, 800);

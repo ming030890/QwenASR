@@ -129,6 +129,30 @@ impl VadStreamSession {
         &mut self,
         ctx: &mut QwenCtx,
         pcm: &[f32],
+        on_delta: F,
+    ) -> Vec<VadStreamEvent> {
+        self.push_audio_impl(ctx, pcm, false, on_delta)
+    }
+
+    /// Push audio while the ASR worker still has newer audio queued.
+    ///
+    /// VAD and endpointing continue frame-by-frame, but replaceable intermediate
+    /// inference is deferred until the worker reaches the newest queued chunk.
+    #[cfg(feature = "android")]
+    pub(crate) fn push_audio_backlogged<F: FnMut(&str)>(
+        &mut self,
+        ctx: &mut QwenCtx,
+        pcm: &[f32],
+        on_delta: F,
+    ) -> Vec<VadStreamEvent> {
+        self.push_audio_impl(ctx, pcm, true, on_delta)
+    }
+
+    fn push_audio_impl<F: FnMut(&str)>(
+        &mut self,
+        ctx: &mut QwenCtx,
+        pcm: &[f32],
+        defer_intermediate: bool,
         mut on_delta: F,
     ) -> Vec<VadStreamEvent> {
         let mut events = Vec::new();
@@ -189,7 +213,7 @@ impl VadStreamSession {
                         // Check if we already have a full chunk
                         let chunk_samples =
                             (self.config.stream_chunk_sec * SAMPLE_RATE as usize as f32) as usize;
-                        if self.utterance_audio.len() >= chunk_samples {
+                        if !defer_intermediate && self.utterance_audio.len() >= chunk_samples {
                             if let Some(delta) = transcribe::stream_push_audio(
                                 ctx,
                                 &self.utterance_audio,
@@ -304,7 +328,7 @@ impl VadStreamSession {
                             .utterance_audio
                             .len()
                             .saturating_sub(self.stream_state.audio_cursor());
-                        if available >= chunk_samples {
+                        if !defer_intermediate && available >= chunk_samples {
                             if let Some(delta) = transcribe::stream_push_audio(
                                 ctx,
                                 &self.utterance_audio,
@@ -460,7 +484,6 @@ pub fn simulate_vad_stream(
     let t_start = std::time::Instant::now();
     let mut speech_onset_wall_time: Option<std::time::Instant> = None;
     let mut last_speech_audio_ms = 0.0;
-
     let chunk_size = VAD_FRAME_SIZE;
     for chunk in samples.chunks(chunk_size) {
         let events = session.push_audio(ctx, chunk, |_| {});

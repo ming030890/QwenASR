@@ -34,6 +34,7 @@ Each completed or evaluated experiment has its own markdown file in the `android
 | **K8** | Quantize and offline-pack every encoder linear matrix; convolution extension failed transcript gate. | Accept linear / reject convolution | [k8-full-encoder-linear-int8-pixel10.md](android-speed-results/k8-full-encoder-linear-int8-pixel10.md) |
 | **K9** | Apply the complete offline I8MM-packed format to the fine-tuned 0.6B mobile model. | Accept full linear INT8 | [k9-full-linear-int8-06b-pixel10.md](android-speed-results/k9-full-linear-int8-06b-pixel10.md) |
 | **ST1** | Reuse invariant prompt KV across streaming utterances; prime-core pinning screened separately. | Accept prefix cache / reject affinity | [st1-streaming-prefix-cache-pixel10.md](android-speed-results/st1-streaming-prefix-cache-pixel10.md) |
+| **ST2** | Defer replaceable intermediate inference when at least 200 ms of newer audio is queued. | Accept | [st2-skip-backlogged-intermediate-inference.md](android-speed-results/st2-skip-backlogged-intermediate-inference.md) |
 
 ---
 
