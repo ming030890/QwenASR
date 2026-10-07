@@ -219,13 +219,16 @@ impl QwenCtx {
     /// Set an optional text prompt to guide transcription. Pass an empty string to clear.
     #[allow(clippy::result_unit_err)]
     pub fn set_prompt(&mut self, prompt: &str) -> Result<(), ()> {
-        if prompt.is_empty() {
-            self.prompt = None;
+        let next_prompt = if prompt.is_empty() {
+            None
         } else {
-            self.prompt = Some(prompt.to_string());
+            Some(prompt.to_string())
+        };
+        if self.prompt != next_prompt {
+            self.prompt = next_prompt;
+            self.prompt_tokens_ready = false;
+            self.static_prefix_kv_cache = None;
         }
-        self.prompt_tokens_ready = false;
-        self.static_prefix_kv_cache = None;
         Ok(())
     }
 

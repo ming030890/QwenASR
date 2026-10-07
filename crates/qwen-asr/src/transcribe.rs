@@ -1147,7 +1147,26 @@ pub fn stream_push_audio(
         let t0 = get_time_ms();
         let prefill_len = total_seq - 1;
 
-        let reused_prefill = prefill_lcp_len(&state.prev_prefill_keys, &prefill_keys, prefill_len);
+        let mut prefix_tokens = Vec::with_capacity(prefix_len);
+        prefix_tokens.extend_from_slice(PREFIX_HEAD);
+        if let Some(ref tokens) = ctx.prompt_tokens {
+            prefix_tokens.extend_from_slice(tokens);
+        }
+        prefix_tokens.extend_from_slice(PREFIX_TAIL);
+
+        let lcp_reused = prefill_lcp_len(&state.prev_prefill_keys, &prefill_keys, prefill_len);
+        let reused_prefill = if lcp_reused > 0 {
+            lcp_reused
+        } else if let Some(cache) = ctx
+            .static_prefix_kv_cache
+            .as_ref()
+            .filter(|cache| cache.tokens == prefix_tokens)
+        {
+            ctx.kv_cache.restore_prefix(prefix_len, &cache.k, &cache.v);
+            prefix_len
+        } else {
+            0
+        };
 
         ctx.kv_cache.len = reused_prefill;
         let delta_prefill = prefill_len - reused_prefill;
@@ -1161,6 +1180,17 @@ pub fn stream_push_audio(
                 &input_embeds[reused_prefill * dim..],
                 delta_prefill,
             );
+        }
+
+        if ctx.static_prefix_kv_cache.as_ref().map(|cache| &cache.tokens)
+            != Some(&prefix_tokens)
+        {
+            let (k, v) = ctx.kv_cache.snapshot_prefix(prefix_len);
+            ctx.static_prefix_kv_cache = Some(StaticPrefixKvCache {
+                tokens: prefix_tokens,
+                k,
+                v,
+            });
         }
 
         let last_embed = &input_embeds[prefill_len * dim..(prefill_len + 1) * dim];
