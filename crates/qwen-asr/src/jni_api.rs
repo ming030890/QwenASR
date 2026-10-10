@@ -99,10 +99,16 @@ fn start_asr_worker(
         let mut vad_session = VadStreamSession::new(VadStreamConfig::default());
         let mut all_audio_samples: Vec<i16> = Vec::new();
         let mut last_hypothesis = String::new();
+        let mut decoder_preloaded = false;
 
         while let Ok(msg) = rx.recv() {
             match msg {
                 VadMsg::Audio(samples_f32) => {
+                    let engine = unsafe { &mut *(engine_addr as *mut crate::c_api::QwenAsrEngine) };
+                    if !decoder_preloaded {
+                        engine.ctx.preload_decoder();
+                        decoder_preloaded = true;
+                    }
                     queued_samples.fetch_sub(samples_f32.len() as u64, Ordering::Relaxed);
                     if save_audio_dir.is_some() {
                         for &s in &samples_f32 {
@@ -110,7 +116,6 @@ fn start_asr_worker(
                         }
                     }
 
-                    let engine = unsafe { &mut *(engine_addr as *mut crate::c_api::QwenAsrEngine) };
                     let has_audio_backlog =
                         queued_samples.load(Ordering::Relaxed) >= INFERENCE_BACKLOG_SAMPLES;
                     let vm = java_vm.clone();
@@ -391,6 +396,32 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeFree(
     }
 }
 
+/// Preload Shard 1 (Audio Encoder: 320 MB) into RAM using MADV_WILLNEED.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativePreloadEncoder(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    if handle != 0 {
+        let engine = &mut *(handle as *mut crate::c_api::QwenAsrEngine);
+        engine.ctx.preload_encoder();
+    }
+}
+
+/// Preload Shards 2..N (LLM Decoder: 1.64 GB) into RAM using MADV_WILLNEED.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativePreloadDecoder(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    if handle != 0 {
+        let engine = &mut *(handle as *mut crate::c_api::QwenAsrEngine);
+        engine.ctx.preload_decoder();
+    }
+}
+
 /// Start a native VAD + ASR session. The listener must implement:
 /// fun onTranscriptDelta(textDelta: String)
 /// fun onHypothesisChanged(text: String)
@@ -407,6 +438,10 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeStartVadSession(
     if handle == 0 || listener.is_null() {
         return 0;
     }
+
+    // Immediately trigger eager readahead of Shard 1 (Encoder: 320 MB)
+    let engine = &mut *(handle as *mut crate::c_api::QwenAsrEngine);
+    engine.ctx.preload_encoder();
 
     let save_dir_opt: Option<String> = if !save_audio_dir.is_null() {
         match env.get_string(&save_audio_dir) {

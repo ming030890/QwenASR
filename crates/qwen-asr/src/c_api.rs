@@ -186,6 +186,22 @@ pub unsafe extern "C" fn qwen_asr_free(engine: *mut QwenAsrEngine) {
     }
 }
 
+/// Advise kernel to preload Shard 1 (Encoder: 320 MB) into RAM.
+#[no_mangle]
+pub unsafe extern "C" fn qwen_asr_preload_encoder(engine: *mut QwenAsrEngine) {
+    if !engine.is_null() {
+        (*engine).ctx.preload_encoder();
+    }
+}
+
+/// Advise kernel to preload Shards 2..N (Decoder: 1.64 GB) into RAM.
+#[no_mangle]
+pub unsafe extern "C" fn qwen_asr_preload_decoder(engine: *mut QwenAsrEngine) {
+    if !engine.is_null() {
+        (*engine).ctx.preload_decoder();
+    }
+}
+
 // ========================================================================
 // Streaming API
 // ========================================================================

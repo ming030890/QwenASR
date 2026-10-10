@@ -331,4 +331,12 @@ impl QwenCtx {
         self.perf_first_visible_token_ms = 0.0;
         self.perf_decode_loop_ms = 0.0;
     }
+
+    pub fn preload_encoder(&self) {
+        self._safetensors.preload_encoder();
+    }
+
+    pub fn preload_decoder(&self) {
+        self._safetensors.preload_decoder();
+    }
 }

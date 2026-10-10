@@ -356,6 +356,26 @@ impl MultiSafetensors {
         Some(MultiSafetensors { shards })
     }
 
+    /// Advise kernel to preload Shard 1 (Encoder: 320 MB) into RAM
+    pub fn preload_encoder(&self) {
+        #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
+        if let Some(shard) = self.shards.first() {
+            unsafe {
+                libc::madvise(shard.data as *mut _, shard.file_size, libc::MADV_WILLNEED);
+            }
+        }
+    }
+
+    /// Advise kernel to preload Shards 2..N (Decoder: 1.64 GB) into RAM
+    pub fn preload_decoder(&self) {
+        #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
+        for shard in self.shards.iter().skip(1) {
+            unsafe {
+                libc::madvise(shard.data as *mut _, shard.file_size, libc::MADV_WILLNEED);
+            }
+        }
+    }
+
     /// Find a tensor by name across all shards.
     /// Returns (shard_index, TensorMeta).
     pub fn find(&self, name: &str) -> Option<(usize, &TensorMeta)> {
