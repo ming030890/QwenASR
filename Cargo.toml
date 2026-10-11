@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/qwen-asr", "crates/qwen-asr-cli", "crates/yue-tools"]
-exclude = ["flutter/qwen_asr/rust"]  # Cargokit builds independently
+exclude = ["flutter/qwen_asr/rust", "crates/cantonese-ngram"]  # Independent libraries
 
 [workspace.package]
 version = "0.1.2"

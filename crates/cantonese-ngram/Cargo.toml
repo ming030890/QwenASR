@@ -1,0 +1,28 @@
+[package]
+name = "cantonese-ngram"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Standalone candidate-only Cantonese neural n-gram inference"
+
+[lib]
+name = "cantonese_ngram"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+regex = "1"
+unicode-normalization = "0.1"
+unicode-segmentation = "1"
+jni = { version = "0.21.1", optional = true }
+
+[features]
+android = ["dep:jni"]
+
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
