@@ -1,6 +1,6 @@
 //! Shared context policy for Quick and handwriting. Neural fusion strength is
 //! configured independently for handwriting; Quick ranking is unchanged.
-use crate::{counts::CsrLanguageModel, LanguageModel};
+use crate::{counts::CsrLanguageModel, LanguageModel, NeuralLanguageModel};
 use std::collections::HashMap;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -32,7 +32,7 @@ impl FusionWeights {
 pub struct HybridLanguageModel {
     labels: Vec<String>,
     weights: Option<FusionWeights>,
-    pub neural: Option<LanguageModel>,
+    pub neural: Option<NeuralLanguageModel>,
     pub counts: Option<CsrLanguageModel>,
     class_ids: HashMap<String, usize>,
     neural_to_class: HashMap<usize, usize>,
@@ -44,6 +44,18 @@ impl HybridLanguageModel {
         counts: Option<CsrLanguageModel>,
         labels: &[String],
     ) -> Result<Self, String> {
+        Self::with_neural(neural.map(Into::into), counts, labels)
+    }
+    pub fn with_neural(
+        neural: Option<NeuralLanguageModel>,
+        mut counts: Option<CsrLanguageModel>,
+        labels: &[String],
+    ) -> Result<Self, String> {
+        // New dense exports learn zero/one-token distributions in the same NN.
+        // Counts supplied by older wrappers must never influence this policy.
+        if neural.as_ref().map(|m| m.minimum_context_tokens() == 0).unwrap_or(false) {
+            counts = None;
+        }
         if counts
             .as_ref()
             .map(|c| c.num_classes != labels.len())
@@ -57,7 +69,7 @@ impl HybridLanguageModel {
             .filter_map(|(i, s)| {
                 neural
                     .as_ref()
-                    .and_then(|lm| lm.tokenizer.id(s))
+                    .and_then(|lm| lm.token_id(s))
                     .map(|id| (id, i))
             })
             .collect();
@@ -118,7 +130,7 @@ impl HybridLanguageModel {
             .filter(|(_, token)| crate::displayable(token))
             .map(|(id, token)| crate::TokenPrediction {
                 token: token.clone(),
-                token_id: self.neural.as_ref().and_then(|lm| lm.tokenizer.id(token)),
+                token_id: self.neural.as_ref().and_then(|lm| lm.token_id(token)),
                 score: counts.unigram_score(id)
                     + previous.map(|p| counts.bigram_bonus(p, id)).unwrap_or(0.),
             })
@@ -143,7 +155,7 @@ impl HybridLanguageModel {
             .as_ref()
             .map(|lm| lm.context(left, right))
             .unwrap_or_else(|| self.fallback_tokenizer.context(left, right, 8, 4));
-        if self.neural.is_some() && ids.iter().filter(|&&id| id >= 3).count() >= 2 {
+        if self.neural.as_ref().map(|lm| lm.supports_context(&ids)).unwrap_or(false) {
             return Mode::Neural;
         }
         // A single English/unknown token cannot supply a character bigram.
@@ -219,9 +231,8 @@ impl HybridLanguageModel {
                 .enumerate()
                 .filter_map(|(i, s)| {
                     neural
-                        .tokenizer
-                        .id(s)
-                        .filter(|&id| id >= 3)
+                        .token_id(s)
+                        .filter(|&id| neural.supports_candidate(&ids,id))
                         .map(|id| (i, id))
                 })
                 .collect();

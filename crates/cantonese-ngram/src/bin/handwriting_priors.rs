@@ -1,8 +1,8 @@
 //! JSONL context input -> JSON header + binary class-aligned unweighted priors.
-use cantonese_ngram::{
+use cantonese_engine::{
     counts::CsrLanguageModel,
     hybrid::{FusionWeights, HybridLanguageModel},
-    LanguageModel,
+    NeuralLanguageModel,
 };
 use std::io::{self, BufRead, Write};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -11,9 +11,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .lines()
         .map(|s| s.trim_end().to_owned())
         .collect();
-    let mut lm = HybridLanguageModel::new(
-        Some(LanguageModel::from_bytes(&std::fs::read(&args[1])?).map_err(io::Error::other)?),
-        Some(CsrLanguageModel::parse(&std::fs::read(&args[2])?).map_err(io::Error::other)?),
+    let mut lm = HybridLanguageModel::with_neural(
+        Some(NeuralLanguageModel::from_bytes(&std::fs::read(&args[1])?).map_err(io::Error::other)?),
+        if args[2] == "-" { None } else {
+            Some(CsrLanguageModel::parse(&std::fs::read(&args[2])?).map_err(io::Error::other)?)
+        },
         &labels,
     )
     .map_err(io::Error::other)?;
@@ -38,10 +40,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let right = x["right"].as_str().unwrap_or("");
         let prev = lm.previous_class(left);
         let (mode, priors) = lm.scores(left, right, &labels).map_err(io::Error::other)?;
+        let excluded: Vec<_> = lm.neural.as_ref().map(|neural| {
+            let ids=neural.context(left,right);
+            labels.iter().enumerate().filter_map(|(index,label)| neural.token_id(label)
+                .filter(|&id| id>=3 && !neural.supports_candidate(&ids,id)).map(|_|index)).collect()
+        }).unwrap_or_default();
         writeln!(
             out,
             "{}",
-            serde_json::json!({"mode":format!("{mode:?}"),"previous":prev,"classes":labels.len()})
+            serde_json::json!({"mode":format!("{mode:?}"),"previous":prev,"classes":labels.len(),"neural_excluded_classes":excluded})
         )?;
         for p in priors {
             out.write_all(&p.to_le_bytes())?;

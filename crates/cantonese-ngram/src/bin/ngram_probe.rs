@@ -1,13 +1,13 @@
-use cantonese_ngram::{
+use cantonese_engine::{
     counts::CsrLanguageModel,
     hybrid::HybridLanguageModel,
     quick::{QuickDictionary, QuickEngine},
-    LanguageModel,
+    NeuralLanguageModel,
 };
 use std::io::{self, BufRead};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
-    let mut lm = LanguageModel::from_bytes(&std::fs::read(&args[1])?).map_err(io::Error::other)?;
+    let mut lm = NeuralLanguageModel::from_bytes(&std::fs::read(&args[1])?).map_err(io::Error::other)?;
     let mut quick = if args.len() >= 6 {
         let labels: Vec<_> = std::fs::read_to_string(&args[3])?
             .lines()
@@ -16,12 +16,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(QuickEngine::new(
             QuickDictionary::from_bytes(&std::fs::read(&args[4])?, 3).map_err(io::Error::other)?,
             QuickDictionary::from_bytes(&std::fs::read(&args[5])?, 5).map_err(io::Error::other)?,
-            HybridLanguageModel::new(
+            HybridLanguageModel::with_neural(
                 Some(
-                    LanguageModel::from_bytes(&std::fs::read(&args[1])?)
+                    NeuralLanguageModel::from_bytes(&std::fs::read(&args[1])?)
                         .map_err(io::Error::other)?,
                 ),
-                Some(CsrLanguageModel::parse(&std::fs::read(&args[2])?).map_err(io::Error::other)?),
+                if args[2] == "-" { None } else {
+                    Some(CsrLanguageModel::parse(&std::fs::read(&args[2])?).map_err(io::Error::other)?)
+                },
                 &labels,
             )
             .map_err(io::Error::other)?,
@@ -33,7 +35,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let x: serde_json::Value = serde_json::from_str(&line?)?;
         let left = x["left"].as_str().unwrap_or("");
         let right = x["right"].as_str().unwrap_or("");
-        let ids = lm.context(left, right);
+        let ids = if let Some(raw) = x["context_ids"].as_array() {
+            raw.iter().map(|v| v.as_u64().unwrap() as usize).collect()
+        } else { lm.context(left, right) };
         let result = if let Some(code) = x["code"].as_str() {
             let engine = quick.as_mut().ok_or("Quick assets required")?;
             let mode = format!("{:?}", engine.lm.mode(left, right));
@@ -63,8 +67,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .map(|v| v.as_u64().unwrap() as usize)
                 .collect();
-            let scores = lm.scores(&ids, &targets).map_err(io::Error::other)?;
-            serde_json::json!({"context_ids":ids,"scores":scores})
+            if x["distribution"].as_bool().unwrap_or(false) {
+                let all: Vec<_> = (3..lm.vocabulary_size()).collect();
+                let scores = lm.scores(&ids, &all).map_err(io::Error::other)?;
+                let max = scores.iter().copied().fold(f32::NEG_INFINITY,f32::max);
+                let logsum = max + scores.iter().map(|v| (v-max).exp()).sum::<f32>().ln();
+                let probabilities: Vec<_> = targets.iter().map(|&id| if id>=3 && id<lm.vocabulary_size() { scores[id-3]-logsum } else { -1e4 }).collect();
+                let mut order: Vec<_> = (0..scores.len()).collect();
+                order.sort_unstable_by(|&a,&b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+                let top3: Vec<_> = order.iter().take(3).map(|i| i+3).collect();
+                serde_json::json!({"context_ids":ids,"log_probs":probabilities,"top3":top3})
+            } else {
+                let scores = lm.scores(&ids, &targets).map_err(io::Error::other)?;
+                serde_json::json!({"context_ids":ids,"scores":scores})
+            }
         };
         println!("{result}");
     }

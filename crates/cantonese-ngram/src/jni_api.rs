@@ -2,7 +2,7 @@ use crate::{
     counts::CsrLanguageModel,
     hybrid::HybridLanguageModel,
     quick::{QuickDictionary, QuickEngine},
-    LanguageModel,
+    NeuralLanguageModel,
 };
 use jni::{
     objects::{JByteArray, JClass, JString},
@@ -45,9 +45,9 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_quick_NativeQuic
         let neural = if neural.is_empty() {
             None
         } else {
-            Some(LanguageModel::from_bytes(&neural)?)
+            Some(NeuralLanguageModel::from_bytes(&neural)?)
         };
-        let counts = if counts.is_empty() {
+        let counts = if counts.is_empty() || neural.as_ref().map(|m| m.minimum_context_tokens()==0).unwrap_or(false) {
             None
         } else {
             Some(CsrLanguageModel::parse(&counts)?)
@@ -55,7 +55,7 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_quick_NativeQuic
         Ok(QuickEngine::new(
             QuickDictionary::from_bytes(&three, 3)?,
             QuickDictionary::from_bytes(&five, 5)?,
-            HybridLanguageModel::new(neural, counts, &labels)?,
+            HybridLanguageModel::with_neural(neural, counts, &labels)?,
         ))
     })();
     match result {

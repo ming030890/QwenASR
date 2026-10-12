@@ -3,9 +3,13 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 pub mod counts;
+pub mod hwr;
 pub mod hybrid;
 #[cfg(feature = "android")]
 mod jni_api;
+pub mod memory;
+pub mod neural;
+pub use neural::NeuralLanguageModel;
 pub mod quick;
 pub mod tokenizer;
 
@@ -35,6 +39,8 @@ struct Metadata {
     tensors: Vec<Description>,
     lookup_normalization: String,
     remove_bos: bool,
+    #[serde(default)]
+    neural_short_contexts: bool,
 }
 
 struct Tensor {
@@ -141,6 +147,7 @@ pub(crate) fn top_predictions(
 }
 
 pub struct LanguageModel {
+    pub(crate) neural_short_contexts: bool,
     config: Config,
     tokens: Vec<String>,
     tensors: HashMap<String, Tensor>,
@@ -243,6 +250,7 @@ impl LanguageModel {
         }
         let tokenizer = tokenizer::Tokenizer::new(&meta.tokens);
         let model = Self {
+            neural_short_contexts: meta.neural_short_contexts,
             config: meta.config,
             tokens: meta.tokens,
             tensors,
@@ -411,7 +419,8 @@ impl LanguageModel {
     pub fn context_lengths(&self) -> (usize, usize) {
         (self.config.left, self.config.right)
     }
-    /// Input order must be unigram order. Empty fragment bypasses all neural work.
+    /// Legacy exports preserve empty-fragment order; learned short-context
+    /// exports also rank empty input through the same neural network.
     /// Unsupported characters keep their original slots; no candidates are lost.
     pub fn rank(
         &mut self,
@@ -421,7 +430,7 @@ impl LanguageModel {
     ) -> Result<Vec<usize>, String> {
         let ids = self.context(left, right);
         let mut order: Vec<_> = (0..candidates.len()).collect();
-        if ids.iter().all(|&id| id == 0) {
+        if !self.neural_short_contexts && ids.iter().all(|&id| id == 0) {
             return Ok(order);
         }
         let supported: Vec<_> = candidates
