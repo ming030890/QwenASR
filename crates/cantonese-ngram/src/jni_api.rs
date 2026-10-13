@@ -21,6 +21,26 @@ fn engines() -> &'static Mutex<HashMap<i64, Arc<Mutex<QuickEngine>>>> {
     ENGINES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Reuse the keyboard's bilingual NN; unsupported words get no context bonus.
+pub(crate) fn english_context_scores(handle: i64, left: &str, right: &str, words: &[String]) -> Option<Vec<f32>> {
+    let engine = engines().lock().ok()?.get(&handle)?.clone();
+    let mut engine = engine.lock().ok()?;
+    let neural = engine.lm.neural.as_mut()?;
+    let ids = neural.context(left, right);
+    if !neural.supports_context(&ids) { return None; }
+    let supported: Vec<_> = words.iter().enumerate().filter_map(|(i, word)|
+        neural.token_id(word).filter(|&id| neural.supports_candidate(&ids, id)).map(|id| (i, id))).collect();
+    if supported.len() < 2 { return None; }
+    let logits = neural.scores(&ids, &supported.iter().map(|p| p.1).collect::<Vec<_>>()).ok()?;
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut scores = vec![0.; words.len()];
+    for ((index, _), logit) in supported.into_iter().zip(logits) {
+        // Bounded relative logit signal preserves typo evidence and unknown vocabulary.
+        scores[index] = 2. + (logit - max).clamp(-2., 0.);
+    }
+    Some(scores)
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_quick_NativeQuickEngine_nativeCreate(
     mut env: JNIEnv,

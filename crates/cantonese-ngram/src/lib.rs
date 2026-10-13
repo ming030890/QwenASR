@@ -3,6 +3,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 pub mod counts;
+pub mod english;
 pub mod hwr;
 pub mod hybrid;
 #[cfg(feature = "android")]
