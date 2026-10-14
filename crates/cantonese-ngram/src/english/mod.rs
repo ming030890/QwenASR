@@ -375,6 +375,41 @@ pub fn search(
     touch: &TouchModel,
     ws: &mut Workspace,
 ) -> Prediction {
+    search_with_limits(dict, typed, touch, ws, if typed.len() >= 5 { 2 } else { 1 }, MAX_EDIT_COST)
+}
+
+/// Broader spelling alternatives are selectable even when automatic correction is unsafe.
+/// Keep the pinned conservative search/confidence policy for automatic replacement.
+pub fn suggestions(dict: &Dictionary, typed: &str, touch: &TouchModel, ws: &mut Workspace) -> Prediction {
+    let mut result = search(dict, typed, touch, ws);
+    if typed.len() < 5 || result.known || result.correction.is_some() { return result; }
+    let broad = search_with_limits(dict, typed, touch, ws, 4, 4.5);
+    for candidate in broad.candidates {
+        if !result.candidates.iter().any(|c| c.word == candidate.word) {
+            result.candidates.push(candidate);
+        }
+    }
+    // Several adjacent mistaps can exceed the touch budget even when the
+    // spelling is recoverable. Offer geometry-free recovery for explicit taps.
+    if !touch.points.is_empty() && result.candidates.iter().filter(|c| c.completed_chars == 0).count() < 3 {
+        let recovery = search_with_limits(dict, typed, &TouchModel::default(), ws, 4, 4.5);
+        for candidate in recovery.candidates {
+            if !result.candidates.iter().any(|c| c.word == candidate.word) {
+                result.candidates.push(candidate);
+            }
+        }
+    }
+    result.candidates.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.word.cmp(&b.word)));
+    result.candidates.truncate(K);
+    // Avoid Chinese phrase auto-conversion while a recoverable English word is being typed.
+    result.plausible_prefix |= result.candidates.iter().any(|c| c.completed_chars == 0);
+    result
+}
+
+fn search_with_limits(
+    dict: &Dictionary, typed: &str, touch: &TouchModel, ws: &mut Workspace,
+    max_edits: u8, max_edit_cost: f64,
+) -> Prediction {
     ws.states.clear();
     ws.heap.clear();
     ws.found.clear();
@@ -392,7 +427,6 @@ pub fn search(
         return empty();
     }
     let typed = typed.as_bytes();
-    let max_edits = if typed.len() >= 5 { 2 } else { 1 };
     let mut floor = f64::NEG_INFINITY;
     ws.push(
         dict,
@@ -458,7 +492,7 @@ pub fn search(
                 floor,
             );
         }
-        if s.edits >= max_edits || s.spend >= MAX_EDIT_COST {
+        if s.edits >= max_edits || s.spend >= max_edit_cost {
             continue;
         }
         let surcharge = if s.edits + 1 >= 2 {
@@ -467,7 +501,7 @@ pub fn search(
             0.0
         };
         let edit = |node, pos, base, ws: &mut Workspace| {
-            if s.spend + base <= MAX_EDIT_COST {
+            if s.spend + base <= max_edit_cost {
                 ws.push(
                     dict,
                     State {
@@ -557,13 +591,15 @@ fn choose_correction(candidates: &[Candidate], known: bool, length: usize) -> Op
             !known
                 && length >= 3
                 && c.edits == 1
-                && c.edit_cost <= MEDIUM + EPS
+                && c.edit_cost <= SUB_FAR + EPS
                 && c.score
                     - fixes
                         .get(1)
-                        .map(|next| next.score)
+                        // A two-edit alternative has weaker spelling evidence than a
+                        // one-edit fix; centre taps must not erase that distinction.
+                        .map(|next| next.score - if next.edits > c.edits { SECOND_EDIT_SURCHARGE } else { 0. })
                         .unwrap_or(SOLO_RUNNER_UP_SCORE)
-                    >= (4.0_f64).ln()
+                    >= (if c.edit_cost <= MEDIUM + EPS { 4.0_f64 } else { 8.0_f64 }).ln()
         })
         .map(|c| c.word.clone())
 }
@@ -677,6 +713,36 @@ mod tests {
     }
     fn dict(text: &str) -> Dictionary {
         Dictionary::from_bytes(&pack(text).unwrap()).unwrap()
+    }
+    fn centre_touches(typed: &str) -> TouchModel {
+        let mut touch = TouchModel::default();
+        for (row, letters) in ROWS.iter().enumerate() {
+            for (column, &letter) in letters.iter().enumerate() {
+                touch.centers[(letter - b'a') as usize] = Some(Point {
+                    x: column as f64 + [0., 0.5, 1.5][row], y: row as f64,
+                });
+            }
+        }
+        touch.points = typed.bytes().map(|letter| touch.center(letter)).collect();
+        touch
+    }
+    #[test]
+    fn reported_centre_mistaps_correct_but_multiple_edits_are_selectable_only() {
+        let d = dict(include_str!("../../data/english/en.txt"));
+        let mut ws = Workspace::default();
+        for (typed, expected) in [("engkish", "english"), ("shoukd", "should"),
+            ("chineae", "chinese"), ("candjdates", "candidates"), ("kehboard", "keyboard")] {
+            let result = suggestions(&d, typed, &centre_touches(typed), &mut ws);
+            assert_eq!(result.correction.as_deref(), Some(expected), "{typed}: {result:?}");
+        }
+        let result = suggestions(&d, "ebgkisb", &centre_touches("ebgkisb"), &mut ws);
+        assert!(result.candidates.iter().any(|c| c.word == "english"));
+        assert!(result.correction.is_none());
+        for typed in ["english", "keyboard", "iPhone", "a1b"] {
+            assert!(suggestions(&d, typed, &centre_touches(typed), &mut ws).correction.is_none());
+        }
+        let ambiguous = dict("cat 100\ncar 100\n");
+        assert!(suggestions(&ambiguous, "caf", &centre_touches("caf"), &mut ws).correction.is_none());
     }
     #[test]
     fn operations_and_conservative_gate() {

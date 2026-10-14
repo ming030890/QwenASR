@@ -5,6 +5,21 @@ use std::collections::HashSet;
 pub const MAX_QUICK_CHARACTERS: usize = 6;
 const BEAM_WIDTH: usize = 16;
 
+/// Relative LM evidence for the two input interpretations, not a trained language classifier.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickLanguageEvidence {
+    pub english_probability: f32,
+    pub chinese_probability: f32,
+    pub english_support: f32,
+    pub chinese_support: f32,
+}
+impl QuickLanguageEvidence {
+    pub fn should_commit_chinese(&self) -> bool {
+        self.chinese_probability >= 0.95 && self.chinese_support >= 0.02
+    }
+}
+
 #[derive(Clone)]
 struct Phrase {
     text: String,
@@ -179,6 +194,125 @@ impl QuickEngine {
             Ok(phrases.iter().take(100).map(|p| p.text.clone()).collect())
         }
     }
+
+    pub fn language_evidence(&mut self, code: &str, left: &str, right: &str, chinese: &str)
+        -> Result<Option<QuickLanguageEvidence>, String> {
+        let Some(neural) = self.lm.neural.as_mut() else { return Ok(None); };
+        let ids = neural.context(left, right);
+        if !neural.supports_context(&ids) || code.len() < 6 || chinese.is_empty() { return Ok(None); }
+        let values = neural_log_probabilities(neural, left, right)?;
+        let code = code.to_ascii_lowercase();
+        let mut english_mass = 0.;
+        let mut matched_english = 0.;
+        for (id, &logp) in values.iter().enumerate().skip(3) {
+            let token = neural.token(id).unwrap_or("");
+            if !token.is_empty() && token.bytes().all(|c| c.is_ascii_alphabetic() || c == b'\'') {
+                let probability = logp.exp();
+                english_mass += probability;
+                if let Some(cost) = english_prefix_cost(&code, &token.to_ascii_lowercase()) {
+                    matched_english += probability * (-cost).exp();
+                }
+            }
+        }
+        // Names and out-of-vocabulary English still have support. Absence from a
+        // dictionary/model vocabulary must never mean zero probability of English.
+        let english_support = matched_english.max(english_mass * 0.1).max(1e-6);
+        let mut context = left.to_owned();
+        let mut total = 0.;
+        let mut count = 0;
+        for character in chinese.chars() {
+            if !crate::tokenizer::is_han(character) { return Ok(None); }
+            let probabilities = if count == 0 { values.clone() }
+                else { neural_log_probabilities(neural, &context, right)? };
+            let token = character.to_string();
+            let Some(id) = neural.token_id(&token) else { return Ok(None); };
+            if !probabilities[id].is_finite() { return Ok(None); }
+            total += probabilities[id]; count += 1;
+            context.push(character);
+        }
+        let chinese_support = (total / count as f32).exp();
+        let sum = chinese_support + english_support;
+        Ok(Some(QuickLanguageEvidence {
+            english_probability: english_support / sum, chinese_probability: chinese_support / sum,
+            english_support, chinese_support,
+        }))
+    }
+}
+
+fn neural_log_probabilities(neural: &mut crate::NeuralLanguageModel, left: &str, right: &str) -> Result<Vec<f32>, String> {
+    let ids = neural.context(left, right);
+    let targets: Vec<_> = (3..neural.vocabulary_size()).filter(|&id| neural.supports_candidate(&ids, id)).collect();
+    if targets.is_empty() { return Err("No supported LM hypotheses".into()); }
+    let logits = neural.scores(&ids, &targets)?;
+    if logits.iter().any(|v| !v.is_finite()) { return Err("Nonfinite LM probabilities".into()); }
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let logsum = max + logits.iter().map(|v| (v - max).exp()).sum::<f32>().ln();
+    let mut values = vec![f32::NEG_INFINITY; neural.vocabulary_size()];
+    for (id, score) in targets.into_iter().zip(logits) { values[id] = score - logsum; }
+    Ok(values)
+}
+
+// Banded edit distance against English LM-token prefixes. The LM supplies their
+// probability; spelling only relates the observed keys to possible token spellings.
+fn english_prefix_cost(typed: &str, token: &str) -> Option<f32> {
+    let typed = typed.as_bytes();
+    let token = token.as_bytes();
+    if token.len() + 2 < typed.len() { return None; }
+    let limit = token.len().min(typed.len() + 2);
+    let mut previous: Vec<_> = (0..=limit).map(|n| n.min(3)).collect();
+    for (i, &letter) in typed.iter().enumerate() {
+        let row = i + 1;
+        let mut current = vec![3; limit + 1];
+        current[0] = row.min(3);
+        for column in row.saturating_sub(2).max(1)..=(row + 2).min(limit) {
+            current[column] = (previous[column] + 1).min(current[column - 1] + 1)
+                .min(previous[column - 1] + usize::from(letter != token[column - 1]));
+        }
+        if current.iter().all(|&n| n > 2) { return None; }
+        previous = current;
+    }
+    (typed.len().saturating_sub(2)..=limit).filter(|&end| previous[end] <= 2)
+        .map(|end| previous[end] as f32 * 2. + (token.len() - end) as f32 * 0.15)
+        .min_by(f32::total_cmp)
+}
+
+/// One LM scale for Chinese phrases and English words. Average token log probability
+/// avoids treating a multi-character Chinese phrase as several competing candidates.
+pub fn rank_mixed(lm: &mut HybridLanguageModel, left: &str, right: &str, candidates: &[String]) -> Result<Vec<usize>, String> {
+    if lm.mode(left, right) != Mode::Neural {
+        return lm.rank(left, right, candidates);
+    }
+    let mut cache: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+    let mut scores = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let tokens: Vec<String> = if candidate.is_ascii() {
+            vec![candidate.to_ascii_lowercase()]
+        } else {
+            candidate.chars().map(|c| c.to_string()).collect()
+        };
+        let mut context = left.to_owned();
+        let mut total = 0.;
+        for token in &tokens {
+            if !cache.contains_key(&context) {
+                let neural = lm.neural.as_mut().unwrap();
+                let ids = neural.context(&context, right);
+                let targets: Vec<_> = (3..neural.vocabulary_size()).filter(|&id| neural.supports_candidate(&ids, id)).collect();
+                let logits = neural.scores(&ids, &targets)?;
+                let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let logsum = max + logits.iter().map(|v| (v - max).exp()).sum::<f32>().ln();
+                let mut values = vec![-20.; neural.vocabulary_size()];
+                for (id, score) in targets.into_iter().zip(logits) { values[id] = score - logsum; }
+                cache.insert(context.clone(), values);
+            }
+            let neural = lm.neural.as_ref().unwrap();
+            total += neural.token_id(token).map(|id| cache[&context][id]).unwrap_or(-20.);
+            context.push_str(token);
+        }
+        scores.push(if tokens.is_empty() { f32::NEG_INFINITY } else { total / tokens.len() as f32 });
+    }
+    let mut order: Vec<_> = (0..candidates.len()).collect();
+    order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+    Ok(order)
 }
 
 // Normalize over the full neural vocabulary. Normalizing only over one code's
@@ -225,6 +359,18 @@ fn sequence_scores(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn language_evidence_requires_a_model_and_strong_chinese_support() {
+        assert!(engine().language_evidence("qqqqqq", "", "", "手手手手手手").unwrap().is_none());
+        let strong = QuickLanguageEvidence { english_probability: 0.01, chinese_probability: 0.99,
+            english_support: 0.001, chinese_support: 0.1 };
+        assert!(strong.should_commit_chinese());
+        assert!(!QuickLanguageEvidence { chinese_probability: 0.8, ..strong.clone() }.should_commit_chinese());
+        assert!(!QuickLanguageEvidence { chinese_support: 0.001, ..strong }.should_commit_chinese());
+        assert_eq!(english_prefix_cost("keyboa", "keyboard"), Some(0.3));
+        assert_eq!(english_prefix_cost("engkish", "english"), Some(2.));
+        assert!(english_prefix_cost("tonysunusualname", "keyboard").is_none());
+    }
     #[test]
     fn code_validation_and_truncation() {
         assert_eq!(QuickDictionary::code_index("OF"), Some(26 + 14 * 26 + 5));

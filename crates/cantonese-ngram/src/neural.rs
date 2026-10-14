@@ -11,6 +11,9 @@ impl From<LanguageModel> for NeuralLanguageModel {
     }
 }
 impl NeuralLanguageModel {
+    pub fn token(&self, id: usize) -> Option<&str> {
+        match self { Self::Dense(m) => m.tokens.get(id).map(String::as_str), Self::Memory(m) => m.token(id) }
+    }
     pub fn vocabulary_size(&self) -> usize {
         match self { Self::Dense(m) => m.tokens.len(), Self::Memory(m) => m.vocabulary_size() }
     }

@@ -6,7 +6,7 @@ use crate::{
 };
 use jni::{
     objects::{JByteArray, JClass, JString},
-    sys::{jint, jlong, jobject},
+    sys::{jint, jlong, jobject, jstring},
     JNIEnv,
 };
 use std::collections::HashMap;
@@ -19,6 +19,31 @@ static ENGINES: OnceLock<Mutex<HashMap<i64, Arc<Mutex<QuickEngine>>>>> = OnceLoc
 static NEXT: AtomicI64 = AtomicI64::new(1);
 fn engines() -> &'static Mutex<HashMap<i64, Arc<Mutex<QuickEngine>>>> {
     ENGINES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn mixed_candidate_order(handle: i64, left: &str, right: &str, words: &[String]) -> Option<Vec<usize>> {
+    let engine = engines().lock().ok()?.get(&handle)?.clone();
+    let mut engine = engine.lock().ok()?;
+    crate::quick::rank_mixed(&mut engine.lm, left, right, words).ok()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_quick_NativeQuickEngine_nativeLanguageEvidence(
+    mut env: JNIEnv, _class: JClass, handle: jlong, code: JString, left: JString, right: JString, chinese: JString,
+) -> jstring {
+    let result = (|| -> Result<String, String> {
+        let code: String = env.get_string(&code).map_err(|e| e.to_string())?.into();
+        let left: String = env.get_string(&left).map_err(|e| e.to_string())?.into();
+        let right: String = env.get_string(&right).map_err(|e| e.to_string())?.into();
+        let chinese: String = env.get_string(&chinese).map_err(|e| e.to_string())?.into();
+        let engine = engines().lock().map_err(|_| "Registry poisoned")?.get(&handle).cloned().ok_or("Closed Quick engine")?;
+        let result = engine.lock().map_err(|_| "Quick engine poisoned")?.language_evidence(&code, &left, &right, &chinese)?;
+        serde_json::to_string(&result).map_err(|e| e.to_string())
+    })();
+    match result {
+        Ok(json) => env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut()),
+        Err(error) => { let _ = env.throw_new("java/lang/IllegalStateException", error); std::ptr::null_mut() }
+    }
 }
 
 /// Reuse the keyboard's bilingual NN; unsupported words get no context bonus.

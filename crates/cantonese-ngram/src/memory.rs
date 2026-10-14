@@ -43,6 +43,7 @@ fn log_add(a: f32, b: f32) -> f32 {
 
 impl MemoryLanguageModel {
     pub fn vocabulary_size(&self) -> usize { self.tokens.len() }
+    pub fn token(&self, id: usize) -> Option<&str> { self.tokens.get(id).map(String::as_str) }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         if bytes.len() < 8 || &bytes[..4] != b"CNG2" {
             return Err("Invalid memory model magic".into());
