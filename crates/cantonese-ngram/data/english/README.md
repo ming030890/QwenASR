@@ -24,7 +24,9 @@ maximum frequency, matching upstream Trie.insert.
 
 Personal lexicons, accents, ambiguous T9 keys, and learned edit habits are
 outside this English QWERTY implementation. Search constants and touch costs
-follow upstream. Automatic replacement uses the keyboard's conservative gate.
+follow upstream. Automatic replacement follows WM SuggestionEngine's ASCII
+one-edit/one-final-letter shapes and default 4:1 margin (main retrieved 2026-10-14).
+Two-edit and edited-then-completed suggestions do not compete in this gate.
 Optional context ranking reuses the existing bilingual NN through the Quick
 engine registry, with bounded relative logits and no bonus for unsupported
 vocabulary. It never introduces words outside spelling-search results.

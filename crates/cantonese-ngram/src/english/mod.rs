@@ -581,27 +581,23 @@ fn search_with_limits(
 }
 
 fn choose_correction(candidates: &[Candidate], known: bool, length: usize) -> Option<String> {
-    let fixes: Vec<_> = candidates
-        .iter()
-        .filter(|c| c.completed_chars == 0 && c.edits > 0)
-        .collect();
-    fixes
-        .first()
-        .filter(|c| {
-            !known
-                && length >= 3
-                && c.edits == 1
-                && c.edit_cost <= SUB_FAR + EPS
-                && c.score
-                    - fixes
-                        .get(1)
-                        // A two-edit alternative has weaker spelling evidence than a
-                        // one-edit fix; centre taps must not erase that distinction.
-                        .map(|next| next.score - if next.edits > c.edits { SECOND_EDIT_SURCHARGE } else { 0. })
-                        .unwrap_or(SOLO_RUNNER_UP_SCORE)
-                    >= (if c.edit_cost <= MEDIUM + EPS { 4.0_f64 } else { 8.0_f64 }).ln()
-        })
-        .map(|c| c.word.clone())
+    if known || length < 3 { return None; }
+    // WM SuggestionEngine's ASCII QWERTY correction shapes. Multi-edit and
+    // edited-then-completed words remain selectable, but never gate a fix.
+    let mut fixes: Vec<_> = candidates.iter().take(K).filter_map(|c| {
+        let score = match (c.edits, c.completed_chars) {
+            (1, 0) => c.score,
+            // A missing final letter is an insertion, even though the trie
+            // represents it as a zero-cost clean-prefix completion.
+            (0, 1) => c.score - MEDIUM,
+            _ => return None,
+        };
+        Some((c, score))
+    }).collect();
+    fixes.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.word.cmp(&b.0.word)));
+    let (top, score) = fixes.first()?;
+    let runner = fixes.get(1).map(|c| c.1).unwrap_or(SOLO_RUNNER_UP_SCORE);
+    (score - runner >= 4.0_f64.ln()).then(|| top.word.clone())
 }
 
 pub fn rerank(prediction: &mut Prediction, scores: &[f32], length: usize) {
@@ -743,6 +739,36 @@ mod tests {
         }
         let ambiguous = dict("cat 100\ncar 100\n");
         assert!(suggestions(&ambiguous, "caf", &centre_touches("caf"), &mut ws).correction.is_none());
+    }
+    #[test]
+    fn wm_replacement_shapes_and_default_confidence() {
+        let candidate = |word: &str, score, edits, completed_chars| Candidate {
+            word: word.into(), score, edit_cost: SUB_FAR, edits, completed_chars,
+        };
+        // Two edits neither trigger replacement nor block a one-edit fix.
+        let two = candidate("hello", 12., 2, 0);
+        let one = candidate("world", 5., 1, 0);
+        assert_eq!(choose_correction(&[two.clone(), one.clone()], false, 5).as_deref(), Some("world"));
+        assert!(choose_correction(&[two], false, 5).is_none());
+        // Edited completions and longer clean completions are suggestions only.
+        for c in [candidate("worlds", 12., 1, 1), candidate("worlds", 12., 0, 2)] {
+            assert!(choose_correction(&[c.clone()], false, 5).is_none());
+            assert_eq!(choose_correction(&[c, one.clone()], false, 5).as_deref(), Some("world"));
+        }
+        let tail = candidate("keyboard", 5., 0, 1);
+        assert_eq!(choose_correction(&[tail.clone()], false, 7).as_deref(), Some("keyboard"));
+        // Charge the tail insertion before ranking and comparing confidence.
+        assert!(choose_correction(&[tail, candidate("keyboards", 3.5, 1, 0)], false, 7).is_none());
+        assert!(choose_correction(&[one.clone(), candidate("words", 4., 1, 0)], false, 5).is_none());
+        assert_eq!(choose_correction(&[one.clone(), candidate("words", 3.5, 1, 0)], false, 5).as_deref(), Some("world"));
+        assert!(choose_correction(&[one], true, 5).is_none());
+    }
+    #[test]
+    fn closer_one_edit_runner_must_not_hide_behind_a_discounted_two_edit_candidate() {
+        let d = dict(include_str!("../../data/english/en.txt"));
+        let result = search(&d, "tyoing", &TouchModel::default(), &mut Workspace::default());
+        assert!(result.candidates.iter().any(|c| c.word == "typing" && c.edits == 1));
+        assert!(result.correction.is_none(), "Ambiguous typing/tying must not silently select tying: {result:?}");
     }
     #[test]
     fn operations_and_conservative_gate() {
