@@ -36,6 +36,8 @@ struct Edge {
 pub struct Dictionary {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
+    // Runtime-only admissible suffix-length bounds; no dictionary format change.
+    suffix_lengths: Vec<(u8,u8)>,
 }
 
 impl Dictionary {
@@ -117,7 +119,18 @@ impl Dictionary {
         if seen.iter().any(|v| !v) {
             return Err("Unreachable English node".into());
         }
-        Ok(Self { nodes, edges })
+        let mut suffix_lengths=vec![(u8::MAX,0);n];
+        for i in (0..n).rev() {
+            if nodes[i].frequency>0 {suffix_lengths[i]=(0,0);}
+            for edge in &edges[nodes[i].first as usize..(nodes[i].first+nodes[i].count) as usize] {
+                let (minimum,maximum)=suffix_lengths[edge.child as usize];
+                if minimum!=u8::MAX {
+                    suffix_lengths[i].0=suffix_lengths[i].0.min(minimum+1);
+                    suffix_lengths[i].1=suffix_lengths[i].1.max(maximum+1);
+                }
+            }
+        }
+        Ok(Self { nodes, edges, suffix_lengths })
     }
     fn children(&self, node: u32) -> &[Edge] {
         let n = self.nodes[node as usize];
@@ -150,6 +163,7 @@ impl Dictionary {
     pub fn memory_bytes(&self) -> usize {
         self.nodes.capacity() * std::mem::size_of::<Node>()
             + self.edges.capacity() * std::mem::size_of::<Edge>()
+            + self.suffix_lengths.capacity() * std::mem::size_of::<(u8,u8)>()
     }
 }
 

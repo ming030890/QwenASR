@@ -17,6 +17,13 @@ impl NeuralLanguageModel {
     pub fn tokenize(&self,text:&str)->Vec<usize> {
         match self { Self::Dense(m)=>m.tokenizer.tokenize(text),Self::Memory(m)=>m.tokenize(text) }
     }
+    pub fn tokenize_with_units(&self,text:&str)->(Vec<usize>,usize) {
+        match self {
+            Self::Dense(m)=>m.tokenizer.tokenize_with_units(text),
+            // Legacy memory tokenization has no byte expansion.
+            Self::Memory(m)=>{let tokens=m.tokenize(text);let units=tokens.len();(tokens,units)}
+        }
+    }
     pub fn token(&self, id: usize) -> Option<&str> {
         match self { Self::Dense(m) => m.tokens.get(id).map(String::as_str), Self::Memory(m) => m.token(id) }
     }
@@ -104,6 +111,10 @@ impl NeuralLanguageModel {
 pub struct SequenceEvidence {
     pub log_probability: f32,
     pub mean_log_probability: f32,
+    /// Sequence log probability per word/Han/grapheme before byte fallback.
+    /// Keep the encoded-token mean above for existing calibrated callers.
+    pub unit_log_probability: f32,
+    pub logical_units: usize,
     pub tokens: usize,
     pub supported: bool,
 }
@@ -116,7 +127,7 @@ pub fn score_sequences(model:&mut NeuralLanguageModel,left:&str,right:&str,candi
     let mut cache=std::collections::HashMap::<Vec<usize>,Vec<f32>>::new();
     let mut result=Vec::with_capacity(candidates.len());
     for text in candidates {
-        let tokens=model.tokenize(text);
+        let (tokens,logical_units)=model.tokenize_with_units(text);
         let mut context=initial.clone();let mut total=0.;let mut supported=!tokens.is_empty() && tokens.len()<=64;
         if supported {
             for &token in &tokens {
@@ -140,7 +151,9 @@ pub fn score_sequences(model:&mut NeuralLanguageModel,left:&str,right:&str,candi
         // Finite sentinel plus an explicit support bit; never mistake an
         // unsupported candidate's sentinel for a learned LM probability.
         result.push(SequenceEvidence {log_probability:if supported {total} else {-1e4},
-            mean_log_probability:if supported {total/tokens.len() as f32} else {-1e4},tokens:tokens.len(),supported});
+            mean_log_probability:if supported {total/tokens.len() as f32} else {-1e4},
+            unit_log_probability:if supported {total/logical_units.max(1) as f32} else {-1e4},
+            logical_units,tokens:tokens.len(),supported});
     }
     Ok(result)
 }

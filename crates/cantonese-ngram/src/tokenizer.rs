@@ -45,9 +45,15 @@ impl Tokenizer {
     }
     pub fn has_byte_fallback(&self)->bool {self.bytes.is_some()}
     pub fn tokenize(&self, text: &str) -> Vec<usize> {
+        self.tokenize_with_units(text).0
+    }
+    /// Count words/Han/graphemes before expanding unknown units into UTF-8 bytes.
+    /// Byte fallback must not turn a single unknown English word into many words.
+    pub fn tokenize_with_units(&self, text: &str) -> (Vec<usize>, usize) {
         let s = normalize(text);
         let ends: Vec<usize> = s.grapheme_indices(true).map(|(a, g)| a + g.len()).collect();
         let mut ids = Vec::new();
+        let mut units = 0;
         let mut a = 0;
         while a < s.len() {
             let c = s[a..].chars().next().unwrap();
@@ -68,13 +74,14 @@ impl Tokenizer {
             };
             // Preserve whole graphemes, including variation selectors/ZWJ emoji.
             let end = ends[ends.partition_point(|&e| e < raw_end)];
+            units += 1;
             if let Some(id)=self.id(&s[a..end]) {ids.push(id)}
             else if let Some(bytes)=&self.bytes {
                 ids.extend(s[a..end].to_lowercase().as_bytes().iter().map(|&b|bytes[b as usize]));
             } else {ids.push(2)}
             a = end;
         }
-        ids
+        (ids, units)
     }
     fn boundaries(&self, text: &str) -> Vec<usize> {
         let protected: Vec<_> = self.url.find_iter(text).map(|m| m.range()).collect();
@@ -131,6 +138,14 @@ mod tests {
         let ids=t.tokenize("我 HELLO newname");
         assert_eq!(&ids[..2],&[3,4]);assert!(!ids.contains(&2));
         assert_eq!(ids.len(),2+"newname".len());
+        assert_eq!(t.tokenize_with_units("我 HELLO newname").1, 3);
+        for text in ["newname", "𠵱", "👩‍💻", "我\u{fe00}"] {
+            let (ids, units) = t.tokenize_with_units(text);
+            assert_eq!(units, 1, "{text}");
+            assert!(ids.len() > 1, "{text}");
+        }
+        assert_eq!(t.tokenize_with_units("newname 我").1, 2);
+        assert_eq!(t.tokenize_with_units(" \n\t").1, 0);
     }
     fn tok() -> Tokenizer {
         Tokenizer::new(

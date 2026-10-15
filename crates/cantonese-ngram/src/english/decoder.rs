@@ -142,9 +142,17 @@ fn walk(dict: &Dictionary, typed: &[u8], touch: &TouchModel, started: Instant,
     let mut heap = BinaryHeap::new();
     let mut best = HashMap::<(u32, usize), f64>::new();
     let push = |p: Path, paths: &mut Vec<Path>, heap: &mut BinaryHeap<HeapEntry>, best: &mut HashMap<(u32, usize), f64>| {
-        if p.cost > 12. || best.get(&(p.node, p.pos)).is_some_and(|&old| old <= p.cost) { return; }
+        let (minimum,maximum)=dict.suffix_lengths[p.node as usize];
+        if minimum==u8::MAX {return;}
+        let remaining=typed.len()-p.pos;
+        // Extra observed keys require deletions (1.2 each); extra target
+        // characters cost at least the cheaper completion insertion (0.9).
+        // This never overestimates the cost of a valid remaining path.
+        let lower=if remaining>maximum as usize {(remaining-maximum as usize) as f64*1.2}
+            else if remaining<(minimum as usize) {(minimum as usize-remaining) as f64*0.9}else{0.};
+        if p.cost>12. || p.cost+lower > 12.+1e-9 || best.get(&(p.node, p.pos)).is_some_and(|&old| old <= p.cost) { return; }
         best.insert((p.node, p.pos), p.cost);
-        let bound = prior(dict.nodes[p.node as usize].maximum) - p.cost;
+        let bound = prior(dict.nodes[p.node as usize].maximum) - p.cost - lower;
         let id = paths.len(); paths.push(p); heap.push(HeapEntry { bound, id });
     };
     push(Path { node: 0, pos: 0, cost: 0., edits: 0, tail: 0 }, &mut paths, &mut heap, &mut best);
@@ -197,6 +205,39 @@ fn walk(dict: &Dictionary, typed: &[u8], touch: &TouchModel, started: Instant,
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn exhaustive_cost(typed:&[u8],word:&[u8],touch:&TouchModel)->f64 {
+        let n=typed.len();let m=word.len();let mut d=vec![vec![f64::INFINITY;m+1];n+1];d[0][0]=0.;
+        for i in 0..=n {for j in 0..=m {
+            let cost=d[i][j];
+            if i<n {d[i+1][j]=d[i+1][j].min(cost+1.2);}
+            if j<m {d[i][j+1]=d[i][j+1].min(cost+if i==n {0.9}else{1.4});}
+            if i<n && j<m {
+                let edit=if typed[i]==word[j] {touch.match_cost(i,typed[i])}
+                    else if word[j].is_ascii_lowercase() {0.45+touch.substitution(i,typed[i],word[j])*0.5}else{1.4};
+                d[i+1][j+1]=d[i+1][j+1].min(cost+edit);
+            }
+            if i+1<n && j+1<m && typed[i]!=typed[i+1] && typed[i]==word[j+1] && typed[i+1]==word[j] {
+                d[i+2][j+2]=d[i+2][j+2].min(cost+1.1);
+            }
+        }}
+        d[n][m]
+    }
+    #[test] fn length_bound_preserves_exhaustive_weighted_edit_results() {
+        let words=["a","an","at","cat","chat","cart","hello","world","keyboard"];
+        let d=Dictionary::from_bytes(&pack(&words.iter().map(|w|format!("{w} 1000\n")).collect::<String>()).unwrap()).unwrap();
+        let touch=TouchModel::default();
+        for typed in ["a","ct","caat","chta","gwllo","wprld","keyboar","qwerty"] {
+            let mut visited=0;let mut exhausted=false;
+            let found=walk(&d,typed.as_bytes(),&touch,Instant::now(),&mut visited,&mut exhausted);
+            assert!(!exhausted);
+            for word in words {
+                let cost=exhaustive_cost(typed.as_bytes(),word.as_bytes(),&touch);
+                let actual=found.iter().find(|h|h.text==word);
+                if cost<=12. {assert!((actual.unwrap_or_else(||panic!("{typed} -> {word} missing")).spatial_score+cost).abs()<1e-8,"{typed} -> {word}");}
+                else {assert!(actual.is_none());}
+            }
+        }
+    }
     fn dict() -> Dictionary { Dictionary::from_bytes(&pack("hello 1000\nworld 900\nkeyboard 800\nin 600\nthe 4000\nedits 500\n").unwrap()).unwrap() }
     #[test] fn multiple_errors_and_spacing_keep_literal_and_original_span() {
         let d = dict(); let mut decoder = Decoder::default();

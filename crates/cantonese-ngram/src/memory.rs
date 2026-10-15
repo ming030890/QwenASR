@@ -144,6 +144,7 @@ impl MemoryLanguageModel {
                 .insert(
                     descriptor.name,
                     Tensor {
+                        q16: Vec::new(),
                         shape: descriptor.shape,
                         q,
                         scale,

@@ -1,5 +1,5 @@
 //! Small standalone, CPU-only candidate scorer and next-token predictor. No ASR/ONNX runtime dependency.
-//! Weights are symmetric row-INT8, activations and reductions are float32.
+//! Weights are symmetric row-INT8/INT16, activations and reductions are float32.
 use serde::Deserialize;
 use std::collections::HashMap;
 pub mod counts;
@@ -48,6 +48,7 @@ struct Metadata {
 struct Tensor {
     shape: Vec<usize>,
     q: Vec<i8>,
+    q16: Vec<i16>,
     scale: Vec<f32>,
     values: Vec<f32>,
 }
@@ -55,12 +56,29 @@ impl Tensor {
     fn linear(&self, x: &[f32], bias: &Self) -> Vec<f32> {
         let columns = self.shape[1];
         assert_eq!(columns, x.len());
-        self.q
-            .chunks_exact(columns)
-            .enumerate()
-            .map(|(i, q)| dot(q, x) * self.scale[i] + bias.values[i])
-            .collect()
+        (0..self.shape[0]).map(|i| {
+            let score = if self.q16.is_empty() { dot(&self.q[i*columns..(i+1)*columns],x) }
+                else { dot16(&self.q16[i*columns..(i+1)*columns],x) };
+            score*self.scale[i]+bias.values[i]
+        }).collect()
     }
+}
+fn dot16(q: &[i16], x: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let mut a=vdupq_n_f32(0.);let mut b=vdupq_n_f32(0.);let n=q.len()/8*8;
+        for i in (0..n).step_by(8) {
+            let w=vld1q_s16(q.as_ptr().add(i));
+            a=vfmaq_f32(a,vcvtq_f32_s32(vmovl_s16(vget_low_s16(w))),vld1q_f32(x.as_ptr().add(i)));
+            b=vfmaq_f32(b,vcvtq_f32_s32(vmovl_s16(vget_high_s16(w))),vld1q_f32(x.as_ptr().add(i+4)));
+        }
+        let mut total=vaddvq_f32(vaddq_f32(a,b));
+        for i in n..q.len() {total+=q[i] as f32*x[i];}
+        total
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {q.iter().zip(x).map(|(&a,&b)|a as f32*b).sum()}
 }
 fn dot(q: &[i8], x: &[f32]) -> f32 {
     #[cfg(target_arch = "aarch64")]
@@ -204,10 +222,11 @@ impl LanguageModel {
                 .iter()
                 .try_fold(1usize, |n, &s| n.checked_mul(s))
                 .ok_or("Tensor overflow")?;
-            let (q, scale, values, length) = match d.kind.as_str() {
-                "row_i8" if d.shape.len() == 2 => {
+            let (q, q16, scale, values, length) = match d.kind.as_str() {
+                "row_i8" | "row_i16" if d.shape.len() == 2 => {
                     let scales = d.shape[0].checked_mul(4).ok_or("Scale overflow")?;
-                    let length = scales.checked_add(size).ok_or("Tensor overflow")?;
+                    let width=if d.kind=="row_i16" {2}else{1};
+                    let length = scales.checked_add(size.checked_mul(width).ok_or("Tensor overflow")?).ok_or("Tensor overflow")?;
                     let raw = bytes
                         .get(offset..offset.checked_add(length).ok_or("Tensor overflow")?)
                         .ok_or("Truncated weights")?;
@@ -216,7 +235,8 @@ impl LanguageModel {
                         return Err("Invalid quantization scales".into());
                     }
                     (
-                        raw[scales..].iter().map(|&b| b as i8).collect(),
+                        if width==1 {raw[scales..].iter().map(|&b|b as i8).collect()}else{Vec::new()},
+                        if width==2 {raw[scales..].chunks_exact(2).map(|b|i16::from_le_bytes([b[0],b[1]])).collect()}else{Vec::new()},
                         scale,
                         Vec::new(),
                         length,
@@ -227,7 +247,7 @@ impl LanguageModel {
                     let raw = bytes
                         .get(offset..offset.checked_add(length).ok_or("Tensor overflow")?)
                         .ok_or("Truncated weights")?;
-                    (Vec::new(), Vec::new(), floats(raw)?, length)
+                    (Vec::new(), Vec::new(), Vec::new(), floats(raw)?, length)
                 }
                 _ => return Err("Unsupported tensor encoding".into()),
             };
@@ -238,6 +258,7 @@ impl LanguageModel {
                     Tensor {
                         shape: d.shape,
                         q,
+                        q16,
                         scale,
                         values,
                     },
@@ -304,7 +325,7 @@ impl LanguageModel {
                 .get(&name)
                 .ok_or_else(|| format!("Missing {name}"))?;
             if t.shape != shape
-                || (shape.len() == 2 && t.q.is_empty())
+                || (shape.len() == 2 && t.q.is_empty() && t.q16.is_empty())
                 || (shape.len() == 1 && t.values.is_empty())
             {
                 return Err(format!("Invalid shape/encoding for {name}"));
@@ -326,9 +347,10 @@ impl LanguageModel {
             if id == 0 || id == 1 {
                 continue;
             }
-            let row = &embedding.q[id * c.embedding..(id + 1) * c.embedding];
             for j in 0..c.embedding {
-                x[position * c.embedding + j] = row[j] as f32 * embedding.scale[id];
+                let value=if embedding.q16.is_empty() {embedding.q[id*c.embedding+j] as f32}
+                    else {embedding.q16[id*c.embedding+j] as f32};
+                x[position * c.embedding + j] = value * embedding.scale[id];
             }
         }
         let t = &self.tensors;
@@ -371,7 +393,8 @@ impl LanguageModel {
                     return Err("Invalid candidate ID".into());
                 }
                 Ok(
-                    dot(&t.q[id * d..(id + 1) * d], &self.cached_projection) * t.scale[id]
+                    (if t.q16.is_empty() {dot(&t.q[id*d..(id+1)*d],&self.cached_projection)}
+                     else {dot16(&t.q16[id*d..(id+1)*d],&self.cached_projection)}) * t.scale[id]
                         + self.tensors["bias"].values[id],
                 )
             })
@@ -463,6 +486,16 @@ impl LanguageModel {
 #[cfg(test)]
 mod prediction_tests {
     use super::*;
+    #[test]
+    fn int16_dot_matches_scalar_for_signed_values_and_simd_tails() {
+        for size in [0,1,7,8,9,17,128] {
+            let q:Vec<i16>=(0..size).map(|i|if i%2==0 {32767-(i as i16)*17}else{-32768+(i as i16)*19}).collect();
+            let x:Vec<f32>=(0..size).map(|i|(i as f32-13.)/31.).collect();
+            let expected:f32=q.iter().zip(&x).map(|(&a,&b)|a as f32*b).sum();
+            let actual=dot16(&q,&x);
+            assert!((actual-expected).abs()<=1e-4*(1.+expected.abs()),"{size}: {actual} != {expected}");
+        }
+    }
     #[test]
     fn top_k_is_sorted_bounded_and_keeps_punctuation() {
         let rows = || {

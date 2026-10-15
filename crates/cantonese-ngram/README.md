@@ -61,6 +61,22 @@ only dictionary candidates, and the last context projection is cached. Handwriti
 its recognition labels and normalizes over neural-supported labels. Each engine owns its
 model instance; sharing this crate does not imply sharing resident tensors across JNI libraries.
 
+Experimental CNG1 exports can also use `row_i16` matrices with FP32 row scales.
+The parser and ARM64 NEON path support both precisions; unsupported kinds and
+truncated payloads are rejected. Exporting INT16 requires a matching fresh native
+library and does not select a new production model. Sequence evidence additionally
+exposes `logicalUnits` and `unitLogProbability`: English words, Han characters
+and grapheme clusters count before UTF-8 byte fallback. The existing encoded-token
+mean remains unchanged for previously calibrated callers.
+
+The experimental English decoder uses admissible minimum/maximum terminal-suffix
+length bounds to prioritize its trie search. These two runtime bytes per node do
+not alter the dictionary format, edit costs, candidate widths or 8 ms budget.
+Literal input remains reserved. Exhaustive weighted-edit tests verify the bound;
+`dataset/keyboard-lm/audit_search_v35.py` separately measures frozen development
+and recorded-touch retrieval. Candidate recall does not establish correction
+precision, and these changes do not enable an unqualified replacement policy.
+
 Android Kotlin handles composition and UI. Rust handles dictionary lookup, tokenization,
 context policy and ranking. Quick loading/inference runs on a worker and stale results are
 rejected. The Quick JNI handle registry keeps in-flight calls alive during destruction.

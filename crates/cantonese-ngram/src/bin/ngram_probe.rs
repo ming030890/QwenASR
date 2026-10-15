@@ -33,12 +33,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     for line in io::stdin().lock().lines() {
         let x: serde_json::Value = serde_json::from_str(&line?)?;
+        let started = std::time::Instant::now();
         let left = x["left"].as_str().unwrap_or("");
         let right = x["right"].as_str().unwrap_or("");
         let ids = if let Some(raw) = x["context_ids"].as_array() {
             raw.iter().map(|v| v.as_u64().unwrap() as usize).collect()
         } else { lm.context(left, right) };
-        let result = if let Some(code) = x["code"].as_str() {
+        let mut result = if let Some(code) = x["code"].as_str() {
             let engine = quick.as_mut().ok_or("Quick assets required")?;
             let mode = format!("{:?}", engine.lm.mode(left, right));
             let c = engine
@@ -86,6 +87,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 serde_json::json!({"context_ids":ids,"scores":scores})
             }
         };
+        if x["timing"].as_bool().unwrap_or(false) {
+            result["elapsedMicros"] = serde_json::json!(started.elapsed().as_micros() as u64);
+        }
         println!("{result}");
     }
     Ok(())

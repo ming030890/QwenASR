@@ -1,4 +1,4 @@
-//! Freeze actual native generator outputs, independently of the model under test.
+// Freeze actual native generator outputs, independently of the model under test.
 use cantonese_engine::{english::{decoder::Decoder,Dictionary,TouchModel,Point},phrases::PhraseLexicon,quick::QuickDictionary};
 use std::{io::{self,BufRead},time::Instant};
 fn main()->Result<(),Box<dyn std::error::Error>> {
@@ -18,8 +18,17 @@ fn main()->Result<(),Box<dyn std::error::Error>> {
   } else {
    let mut touch=TouchModel::default();
    if let Some(samples)=x["touch"].as_array() {
-    for (r,row) in ["qwertyuiop","asdfghjkl","zxcvbnm"].iter().enumerate() {
-     for (c,b) in row.bytes().enumerate(){touch.centers[(b-b'a')as usize]=Some(Point{x:c as f64+[0.,0.5,1.5][r],y:r as f64});}
+    if let Some(centers)=x["centers"].as_array() {
+     if centers.len()!=26{return Err("centers must contain 26 alphabetic coordinates".into());}
+     for (i,p) in centers.iter().enumerate() {
+      let (cx,cy)=(p[0].as_f64().ok_or("Invalid center x")?,p[1].as_f64().ok_or("Invalid center y")?);
+      if !cx.is_finite() || !cy.is_finite(){return Err("Nonfinite center".into());}
+      touch.centers[i]=Some(Point{x:cx,y:cy});
+     }
+    } else {
+     for (r,row) in ["qwertyuiop","asdfghjkl","zxcvbnm"].iter().enumerate() {
+      for (c,b) in row.bytes().enumerate(){touch.centers[(b-b'a')as usize]=Some(Point{x:c as f64+[0.,0.5,1.5][r],y:r as f64});}
+     }
     }
     for p in samples {touch.points.push(match(p[0].as_f64(),p[1].as_f64()){(Some(x),Some(y))=>Some(Point{x,y}),_=>None});}
    }
