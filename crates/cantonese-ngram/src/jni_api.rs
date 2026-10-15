@@ -66,6 +66,14 @@ pub(crate) fn english_context_scores(handle: i64, left: &str, right: &str, words
     Some(scores)
 }
 
+pub(crate) fn sequence_evidence(handle:i64,left:&str,right:&str,words:&[String])
+    ->Option<Vec<crate::neural::SequenceEvidence>> {
+    let engine=engines().lock().ok()?.get(&handle)?.clone();
+    let mut engine=engine.lock().ok()?;
+    let model=engine.lm.neural.as_mut()?;
+    crate::neural::score_sequences(model,left,right,words).ok()
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_quick_NativeQuickEngine_nativeCreate(
     mut env: JNIEnv,

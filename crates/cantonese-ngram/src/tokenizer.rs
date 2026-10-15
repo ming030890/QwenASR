@@ -7,6 +7,7 @@ pub struct Tokenizer {
     ids: HashMap<String, usize>,
     english: Regex,
     url: Regex,
+    bytes: Option<Vec<usize>>,
 }
 
 pub fn normalize(text: &str) -> String {
@@ -26,6 +27,8 @@ pub fn is_han(c: char) -> bool {
 
 impl Tokenizer {
     pub fn new(tokens: &[String]) -> Self {
+        let lookup:HashMap<_,_>=tokens.iter().enumerate().map(|(i,t)|(t.clone(),i)).collect();
+        let bytes=(0..256).map(|b|lookup.get(&format!("[byte:{b:02x}]")).copied()).collect::<Option<Vec<_>>>();
         Self {
             ids: tokens
                 .iter()
@@ -34,11 +37,13 @@ impl Tokenizer {
                 .collect(),
             english: Regex::new(r"^[0-9]+\.[0-9]+|^[A-Za-z0-9]+(?:['\-][A-Za-z0-9]+)*").unwrap(),
             url: Regex::new(r"(?i)https?://[^\s<>]+|www\.[^\s<>]+").unwrap(),
+            bytes,
         }
     }
     pub fn id(&self, word: &str) -> Option<usize> {
         self.ids.get(&normalize(word).to_lowercase()).copied()
     }
+    pub fn has_byte_fallback(&self)->bool {self.bytes.is_some()}
     pub fn tokenize(&self, text: &str) -> Vec<usize> {
         let s = normalize(text);
         let ends: Vec<usize> = s.grapheme_indices(true).map(|(a, g)| a + g.len()).collect();
@@ -63,7 +68,10 @@ impl Tokenizer {
             };
             // Preserve whole graphemes, including variation selectors/ZWJ emoji.
             let end = ends[ends.partition_point(|&e| e < raw_end)];
-            ids.push(self.id(&s[a..end]).unwrap_or(2));
+            if let Some(id)=self.id(&s[a..end]) {ids.push(id)}
+            else if let Some(bytes)=&self.bytes {
+                ids.extend(s[a..end].to_lowercase().as_bytes().iter().map(|&b|bytes[b as usize]));
+            } else {ids.push(2)}
             a = end;
         }
         ids
@@ -115,6 +123,15 @@ impl Tokenizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opt_in_byte_vocabulary_keeps_unseen_words_representable() {
+        let mut vocabulary=vec!["[PAD]".into(),"[BOS]".into(),"[UNK]".into(),"我".into(),"hello".into()];
+        vocabulary.extend((0..256).map(|i|format!("[byte:{i:02x}]")));
+        let t=Tokenizer::new(&vocabulary);
+        let ids=t.tokenize("我 HELLO newname");
+        assert_eq!(&ids[..2],&[3,4]);assert!(!ids.contains(&2));
+        assert_eq!(ids.len(),2+"newname".len());
+    }
     fn tok() -> Tokenizer {
         Tokenizer::new(
             &[

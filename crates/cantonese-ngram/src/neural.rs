@@ -11,6 +11,12 @@ impl From<LanguageModel> for NeuralLanguageModel {
     }
 }
 impl NeuralLanguageModel {
+    pub fn has_byte_fallback(&self)->bool {
+        match self {Self::Dense(m)=>m.tokenizer.has_byte_fallback(),Self::Memory(_)=>false}
+    }
+    pub fn tokenize(&self,text:&str)->Vec<usize> {
+        match self { Self::Dense(m)=>m.tokenizer.tokenize(text),Self::Memory(m)=>m.tokenize(text) }
+    }
     pub fn token(&self, id: usize) -> Option<&str> {
         match self { Self::Dense(m) => m.tokens.get(id).map(String::as_str), Self::Memory(m) => m.token(id) }
     }
@@ -88,4 +94,53 @@ impl NeuralLanguageModel {
             Self::Memory(m) => m.rank(left, right, candidates),
         }
     }
+}
+
+/// Exact full-vocabulary-normalized sequence evidence, independent of candidate
+/// pool composition. Mean scores are supplied alongside sums and token counts;
+/// the decision layer must calibrate English words versus Han/byte sequences.
+#[derive(serde::Serialize, Debug)]
+#[serde(rename_all="camelCase")]
+pub struct SequenceEvidence {
+    pub log_probability: f32,
+    pub mean_log_probability: f32,
+    pub tokens: usize,
+    pub supported: bool,
+}
+pub fn score_sequences(model:&mut NeuralLanguageModel,left:&str,right:&str,candidates:&[String])
+    ->Result<Vec<SequenceEvidence>,String> {
+    if candidates.len()>128 {return Err("Too many sequence candidates".into());}
+    let (nleft,nright)=model.context_lengths();
+    let initial=model.context(left,right);
+    let all:Vec<_>=(3..model.vocabulary_size()).collect();
+    let mut cache=std::collections::HashMap::<Vec<usize>,Vec<f32>>::new();
+    let mut result=Vec::with_capacity(candidates.len());
+    for text in candidates {
+        let tokens=model.tokenize(text);
+        let mut context=initial.clone();let mut total=0.;let mut supported=!tokens.is_empty() && tokens.len()<=64;
+        if supported {
+            for &token in &tokens {
+                if token<3 || !model.supports_candidate(&context,token) {supported=false;break;}
+                if !cache.contains_key(&context) {
+                    // Bound temporary probability tables independently of how
+                    // many unseen-word byte sequences a caller supplies.
+                    if cache.len()>=16 {cache.clear();}
+                    let scores=model.scores(&context,&all)?;
+                    let max=scores.iter().copied().fold(f32::NEG_INFINITY,f32::max);
+                    let z=max+scores.iter().map(|v|(v-max).exp()).sum::<f32>().ln();
+                    cache.insert(context.clone(),scores.iter().map(|v|v-z).collect());
+                }
+                total+=cache[&context][token-3];
+                if nleft>0 {
+                    context[..nleft].rotate_left(1);context[nleft-1]=token;
+                }
+                debug_assert_eq!(context.len(),nleft+nright);
+            }
+        }
+        // Finite sentinel plus an explicit support bit; never mistake an
+        // unsupported candidate's sentinel for a learned LM probability.
+        result.push(SequenceEvidence {log_probability:if supported {total} else {-1e4},
+            mean_log_probability:if supported {total/tokens.len() as f32} else {-1e4},tokens:tokens.len(),supported});
+    }
+    Ok(result)
 }

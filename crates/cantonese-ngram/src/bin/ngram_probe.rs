@@ -45,6 +45,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .candidates(x["version"].as_u64().unwrap_or(3) as u32, code, left, right)
                 .map_err(io::Error::other)?;
             serde_json::json!({"context_ids":ids,"mode":mode,"candidates":c})
+        } else if let Some(candidates)=x["sequences"].as_array() {
+            let candidates:Vec<String>=candidates.iter().map(|s|s.as_str().unwrap().to_owned()).collect();
+            let evidence=cantonese_engine::neural::score_sequences(&mut lm,left,right,&candidates).map_err(io::Error::other)?;
+            serde_json::json!({"context_ids":ids,"evidence":evidence})
         } else if let Some(limit) = x["limit"].as_u64() {
             let (mode, predictions) = if let Some(engine) = quick.as_mut() {
                 let (mode, predictions) = engine

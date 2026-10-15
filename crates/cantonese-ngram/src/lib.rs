@@ -10,6 +10,7 @@ pub mod hybrid;
 mod jni_api;
 pub mod memory;
 pub mod neural;
+pub mod phrases;
 pub use neural::NeuralLanguageModel;
 pub mod quick;
 pub mod tokenizer;

@@ -279,6 +279,12 @@ fn english_prefix_cost(typed: &str, token: &str) -> Option<f32> {
 /// One LM scale for Chinese phrases and English words. Average token log probability
 /// avoids treating a multi-character Chinese phrase as several competing candidates.
 pub fn rank_mixed(lm: &mut HybridLanguageModel, left: &str, right: &str, candidates: &[String]) -> Result<Vec<usize>, String> {
+    if let Some(model)=lm.neural.as_mut().filter(|m|m.has_byte_fallback()) {
+        let scores=crate::neural::score_sequences(model,left,right,candidates)?;
+        let mut order:Vec<_>=(0..scores.len()).collect();
+        order.sort_by(|&a,&b|scores[b].mean_log_probability.total_cmp(&scores[a].mean_log_probability).then(a.cmp(&b)));
+        return Ok(order);
+    }
     if lm.mode(left, right) != Mode::Neural {
         return lm.rank(left, right, candidates);
     }

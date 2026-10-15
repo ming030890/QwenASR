@@ -2,6 +2,7 @@
 //! Reference: 74bf16e27ff72403bcd55eb942894d2158e9bd2b (MIT, Wasi Master).
 //! See data/english/LICENSE. No runtime word-list parsing or ASR dependency.
 use serde::Serialize;
+pub mod decoder;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 

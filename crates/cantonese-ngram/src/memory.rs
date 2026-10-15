@@ -202,6 +202,7 @@ impl MemoryLanguageModel {
     pub fn context(&self, left: &str, right: &str) -> Vec<usize> {
         self.tokenizer.context(left, right, 8, 4)
     }
+    pub fn tokenize(&self,text:&str)->Vec<usize> { self.tokenizer.tokenize(text) }
 
     pub fn token_id(&self, token: &str) -> Option<usize> {
         self.tokenizer.id(token)
