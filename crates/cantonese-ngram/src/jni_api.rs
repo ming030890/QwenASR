@@ -74,6 +74,13 @@ pub(crate) fn sequence_evidence(handle:i64,left:&str,right:&str,words:&[String])
     crate::neural::score_sequences(model,left,right,words).ok()
 }
 
+pub(crate) fn known_sequences(handle:i64,words:&[String])->Option<Vec<bool>> {
+    let engine=engines().lock().ok()?.get(&handle)?.clone();
+    let engine=engine.lock().ok()?;
+    let model=engine.lm.neural.as_ref()?;
+    Some(words.iter().map(|text| !text.trim().is_empty() && text.split_whitespace().all(|word| model.token_id(word).is_some())).collect())
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_quick_NativeQuickEngine_nativeCreate(
     mut env: JNIEnv,

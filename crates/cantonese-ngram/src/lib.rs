@@ -43,6 +43,8 @@ struct Metadata {
     remove_bos: bool,
     #[serde(default)]
     neural_short_contexts: bool,
+    #[serde(default)]
+    spelling_cng_hex: Option<String>,
 }
 
 struct Tensor {
@@ -174,9 +176,13 @@ pub struct LanguageModel {
     pub tokenizer: tokenizer::Tokenizer,
     cached_ids: Vec<usize>,
     cached_projection: Vec<f32>,
+    spelling: Option<Box<NeuralLanguageModel>>,
 }
 impl LanguageModel {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        Self::from_bytes_inner(bytes,true)
+    }
+    fn from_bytes_inner(bytes: &[u8],allow_spelling:bool) -> Result<Self,String> {
         if bytes.len() < 8 || &bytes[..4] != b"CNG1" {
             return Err("Invalid n-gram model magic".into());
         }
@@ -271,6 +277,19 @@ impl LanguageModel {
         if offset != bytes.len() {
             return Err("Trailing model bytes".into());
         }
+        let spelling=if let Some(hex)=meta.spelling_cng_hex {
+            if !allow_spelling || hex.len()>600_000 || hex.len()%2!=0 || !hex.is_ascii() {return Err("Invalid spelling head".into());}
+            let mut payload=Vec::with_capacity(hex.len()/2);
+            for pair in hex.as_bytes().chunks_exact(2) {
+                let text=std::str::from_utf8(pair).map_err(|_|"Invalid spelling hex")?;
+                payload.push(u8::from_str_radix(text,16).map_err(|_|"Invalid spelling hex")?);
+            }
+            let child=Self::from_bytes_inner(&payload,false)?;
+            if child.config.vocab_size!=259 || child.config.right!=0 || child.config.left>32 || child.config.hidden>256 || child.config.embedding>32 || child.config.residual_blocks>2 {
+                return Err("Unsupported spelling head dimensions".into());
+            }
+            Some(Box::new(NeuralLanguageModel::Dense(child)))
+        } else {None};
         let tokenizer = tokenizer::Tokenizer::new(&meta.tokens);
         let model = Self {
             neural_short_contexts: meta.neural_short_contexts,
@@ -280,6 +299,7 @@ impl LanguageModel {
             tokenizer,
             cached_ids: Vec::new(),
             cached_projection: Vec::new(),
+            spelling,
         };
         model.validate_shapes()?;
         Ok(model)
@@ -386,6 +406,7 @@ impl LanguageModel {
         self.projected(ids)?;
         let t = &self.tensors["embedding.weight"];
         let d = self.config.embedding;
+        let bias=&self.tensors["bias"].values;
         candidate_ids
             .iter()
             .map(|&id| {
@@ -395,7 +416,7 @@ impl LanguageModel {
                 Ok(
                     (if t.q16.is_empty() {dot(&t.q[id*d..(id+1)*d],&self.cached_projection)}
                      else {dot16(&t.q16[id*d..(id+1)*d],&self.cached_projection)}) * t.scale[id]
-                        + self.tensors["bias"].values[id],
+                        + bias[id],
                 )
             })
             .collect()

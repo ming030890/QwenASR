@@ -3,6 +3,7 @@
 //! See data/english/LICENSE. No runtime word-list parsing or ASR dependency.
 use serde::Serialize;
 pub mod decoder;
+pub mod spelling;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 
