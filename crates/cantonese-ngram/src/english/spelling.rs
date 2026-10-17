@@ -76,17 +76,34 @@ fn decode_impl(dict:&Dictionary,typed:&str,touch:&TouchModel,previous:&str,sessi
 
 fn prior(f:u32)->f64 {(1.+f as f64).ln()*0.55}
 fn frequency(dict:&Dictionary,text:&str)->u32 {dict.find(text.as_bytes()).map_or(0,|i|dict.nodes[i as usize].frequency)}
+fn key_pos(c:u8)->Option<(f64,f64)> {
+    const ROWS:[&[u8];3]=[b"qwertyuiop",b"asdfghjkl",b"zxcvbnm"];
+    const OFFSETS:[f64;3]=[0.0,0.5,1.0];
+    for (r,row) in ROWS.iter().enumerate() {
+        if let Some(col)=row.iter().position(|&k|k==c) {
+            return Some((col as f64+OFFSETS[r],r as f64));
+        }
+    }
+    None
+}
+
 fn robust_substitution(touch:&TouchModel,pos:usize,actual:u8,label:u8)->f64 {
     // A discrete neighboring-key mistake remains possible at the center of the
     // observed key. Touch offsets refine this channel instead of double-charging
     // the full key separation, which saturated all alternatives equally.
     let base=0.45+0.5*if adjacent(actual,label) {CHEAP}else{SUB_FAR};
+    let initial=if pos==0 && actual!=label {0.35}else{0.};
     if let (Some(point),Some(a),Some(b))=(touch.points.get(pos).copied().flatten(),touch.center(actual),touch.center(label)) {
         let actual_likelihood=-((point.x-a.x).powi(2)+(point.y-a.y).powi(2))/0.5;
         let target_likelihood=-((point.x-b.x).powi(2)+(point.y-b.y).powi(2))/0.5;
         let nominal=((a.x-b.x).powi(2)+(a.y-b.y).powi(2))/0.5;
-        (base+0.5*(actual_likelihood-target_likelihood-nominal)).clamp(0.,base+0.5)
-    } else {base}
+        (base+initial+0.5*(actual_likelihood-target_likelihood-nominal)).clamp(0.,base+initial+0.5)
+    } else {
+        if let (Some(p1),Some(p2))=(key_pos(actual),key_pos(label)) {
+            let dist=((p1.0-p2.0).powi(2)+(p1.1-p2.1).powi(2)).sqrt();
+            if dist<=1.15 {base+initial} else {base+initial+0.45*(dist-1.0)}
+        } else {base+initial}
+    }
 }
 struct Search<'a> {
     dict:&'a Dictionary,input:&'a [u8],radius:u8,matches:&'a [f64],substitutions:&'a [[f64;26]],started:Instant,
@@ -103,14 +120,15 @@ impl Search<'_> {
             let cost=if equal {self.matches[j-1]}else if letter.is_ascii_lowercase() {self.substitutions[j-1][(letter-b'a') as usize]}else{1.4};
             row[j]=previous[j-1].add(u8::from(!equal),cost).best(previous[j].add(1,1.4)).best(row[j-1].add(1,1.2));
             if j>=2 && letter==self.input[j-2] && previous_letter==self.input[j-1] {
-                if let Some(old)=previous2 {row[j]=row[j].best(old[j-2].add(1,1.1));}
+                if let Some(old)=previous2 {row[j]=row[j].best(old[j-2].add(1,0.55));}
             }
             minimum=minimum.min(row[j].edits);
         }
         if minimum>self.radius {return;}
         let f=self.dict.nodes[node as usize].frequency;
         if f>0 && row[n].edits<=self.radius {
-            self.found.push(Hypothesis{text:self.dict.word(node),spatial_score:-row[n].cost,lexical_score:prior(f),
+            let surcharge=if row[n].edits>1 {(row[n].edits-1) as f64*0.35}else{0.};
+            self.found.push(Hypothesis{text:self.dict.word(node),spatial_score:-(row[n].cost+surcharge),lexical_score:prior(f),
                 edits:row[n].edits,completion:0,replace_before:n,literal:false});
         }
         for edge in self.dict.children(node) {self.walk(edge.child,edge.label,letter,&row,Some(previous));if *self.exhausted {return;}}
