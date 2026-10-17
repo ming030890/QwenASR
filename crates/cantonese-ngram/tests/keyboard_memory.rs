@@ -207,3 +207,37 @@ fn new_vocabulary_candidates_keep_count_priors_when_context_has_no_memory_key() 
         vec![2, 1, 0]
     );
 }
+
+#[test]
+fn test_real_assets_tam_jai() {
+    let q3_path = "/Users/tony/Documents/keyboard/cantonese-voice-keyboard/app/src/main/assets/quick/quick3.bin";
+    let q5_path = "/Users/tony/Documents/keyboard/cantonese-voice-keyboard/app/src/main/assets/quick/quick5.bin";
+    let cng_path = "/Users/tony/Documents/keyboard/cantonese-voice-keyboard/app/src/main/assets/typing/model.cng";
+    let (Ok(q3_bytes), Ok(q5_bytes), Ok(cng_bytes)) = (
+        std::fs::read(q3_path),
+        std::fs::read(q5_path),
+        std::fs::read(cng_path),
+    ) else {
+        return;
+    };
+    let neural = NeuralLanguageModel::from_bytes(&cng_bytes).unwrap();
+    let lm = HybridLanguageModel::with_neural(Some(neural), None, &[]).unwrap();
+    let mut engine = QuickEngine::new(
+        QuickDictionary::from_bytes(&q3_bytes, 3).unwrap(),
+        QuickDictionary::from_bytes(&q5_bytes, 5).unwrap(),
+        lm,
+    );
+    let q_candidates = engine.candidates(3, "yjodfdve", "", "").unwrap();
+    let tam_jai_pos = q_candidates.iter().position(|c| c == "譚仔米線");
+    assert!(tam_jai_pos.is_some() && tam_jai_pos.unwrap() < 4);
+
+    let mut pool = q_candidates.clone();
+    pool.push("yjodfdve".to_string());
+    let order = cantonese_engine::quick::rank_mixed(&mut engine.lm, "", "", &pool).unwrap();
+    let reranked: Vec<_> = order.iter().map(|&i| &pool[i]).collect();
+    let reranked_tam_pos = reranked.iter().position(|c| *c == "譚仔米線").unwrap();
+    let reranked_en_pos = reranked.iter().position(|c| *c == "yjodfdve").unwrap();
+    assert!(reranked_tam_pos < reranked_en_pos);
+    assert_eq!(reranked.last().unwrap().as_str(), "yjodfdve");
+}
+

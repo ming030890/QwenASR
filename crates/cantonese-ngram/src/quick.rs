@@ -3,7 +3,7 @@ use crate::hybrid::{HybridLanguageModel, Mode};
 use std::collections::HashSet;
 
 pub const MAX_QUICK_CHARACTERS: usize = 6;
-const BEAM_WIDTH: usize = 16;
+const BEAM_WIDTH: usize = 32;
 
 /// Relative LM evidence for the two input interpretations, not a trained language classifier.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -83,6 +83,7 @@ pub struct QuickEngine {
     five: QuickDictionary,
     pub lm: HybridLanguageModel,
     cache: Option<PhraseCache>,
+    distribution_cache: Option<(Vec<usize>, Vec<f32>)>,
 }
 impl QuickEngine {
     pub fn new(three: QuickDictionary, five: QuickDictionary, lm: HybridLanguageModel) -> Self {
@@ -91,6 +92,7 @@ impl QuickEngine {
             five,
             lm,
             cache: None,
+            distribution_cache: None,
         }
     }
     pub fn candidates(
@@ -149,16 +151,24 @@ impl QuickEngine {
                 if source.is_empty() {
                     continue;
                 }
+                // ARM mobile optimization: dictionary candidates are ordered by frequency.
+                // Keeping top BEAM_WIDTH candidates avoids scoring hundreds of obscure characters.
+                let source_slice = if source.len() > BEAM_WIDTH { &source[..BEAM_WIDTH] } else { source };
                 for prefix in &cache.positions[start] {
                     if prefix.characters == MAX_QUICK_CHARACTERS {
                         continue;
                     }
                     let context = format!("{left}{}", prefix.text);
-                    let scores = sequence_scores(&mut self.lm, &context, right, source)?;
-                    for (text, score) in source.iter().zip(scores) {
+                    let scores = sequence_scores(&mut self.lm, &mut self.distribution_cache, &context, right, source_slice)?;
+                    for (text, score) in source_slice.iter().zip(scores) {
+                        let boost = if prefix.characters > 0 && score > -5.0 {
+                            (score + 5.0) * 0.5
+                        } else {
+                            0.0
+                        };
                         paths.push(Phrase {
                             text: format!("{}{text}", prefix.text),
-                            score: prefix.score + score,
+                            score: prefix.score + score + boost,
                             characters: prefix.characters + 1,
                         });
                     }
@@ -282,11 +292,28 @@ pub fn rank_mixed(lm: &mut HybridLanguageModel, left: &str, right: &str, candida
     if let Some(model)=lm.neural.as_mut().filter(|m|m.has_byte_fallback()) {
         let scores=crate::neural::score_sequences(model,left,right,candidates)?;
         let mut order:Vec<_>=(0..scores.len()).collect();
-        order.sort_by(|&a,&b|scores[b].mean_log_probability.total_cmp(&scores[a].mean_log_probability).then(a.cmp(&b)));
+        order.sort_by(|&a,&b| {
+            let a_han = candidates[a].chars().any(crate::tokenizer::is_han);
+            let b_han = candidates[b].chars().any(crate::tokenizer::is_han);
+            if a_han != b_han {
+                return b_han.cmp(&a_han);
+            }
+            scores[b].unit_log_probability.total_cmp(&scores[a].unit_log_probability).then(a.cmp(&b))
+        });
         return Ok(order);
     }
     if lm.mode(left, right) != Mode::Neural {
-        return lm.rank(left, right, candidates);
+        let mut order = lm.rank(left, right, candidates)?;
+        order.sort_by(|&a, &b| {
+            let a_han = candidates[a].chars().any(crate::tokenizer::is_han);
+            let b_han = candidates[b].chars().any(crate::tokenizer::is_han);
+            if a_han != b_han {
+                b_han.cmp(&a_han)
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        return Ok(order);
     }
     let mut cache: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
     let mut scores = Vec::with_capacity(candidates.len());
@@ -317,7 +344,14 @@ pub fn rank_mixed(lm: &mut HybridLanguageModel, left: &str, right: &str, candida
         scores.push(if tokens.is_empty() { f32::NEG_INFINITY } else { total / tokens.len() as f32 });
     }
     let mut order: Vec<_> = (0..candidates.len()).collect();
-    order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+    order.sort_by(|&a, &b| {
+        let a_han = candidates[a].chars().any(crate::tokenizer::is_han);
+        let b_han = candidates[b].chars().any(crate::tokenizer::is_han);
+        if a_han != b_han {
+            return b_han.cmp(&a_han);
+        }
+        scores[b].total_cmp(&scores[a]).then(a.cmp(&b))
+    });
     Ok(order)
 }
 
@@ -325,6 +359,7 @@ pub fn rank_mixed(lm: &mut HybridLanguageModel, left: &str, right: &str, candida
 // matches would give a one-letter root with one match an unfair probability of 1.
 fn sequence_scores(
     lm: &mut HybridLanguageModel,
+    distribution_cache: &mut Option<(Vec<usize>, Vec<f32>)>,
     left: &str,
     right: &str,
     source: &[String],
@@ -332,16 +367,22 @@ fn sequence_scores(
     if lm.mode(left, right) == Mode::Neural {
         let neural = lm.neural.as_mut().unwrap();
         let ids = neural.context(left, right);
-        let targets: Vec<_> = (3..neural.vocabulary_size())
-            .filter(|&id| neural.supports_candidate(&ids, id))
-            .collect();
-        let logits = neural.scores(&ids, &targets)?;
-        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let logsum = max + logits.iter().map(|v| (v - max).exp()).sum::<f32>().ln();
-        let mut values = vec![f32::NEG_INFINITY; neural.vocabulary_size()];
-        for (id, score) in targets.into_iter().zip(logits) {
-            values[id] = score - logsum;
+        let hit = distribution_cache.as_ref().map(|(cached_ids, _)| cached_ids == &ids).unwrap_or(false);
+        if !hit {
+            let targets: Vec<_> = (3..neural.vocabulary_size())
+                .filter(|&id| neural.supports_candidate(&ids, id))
+                .collect();
+            let logits = neural.scores(&ids, &targets)?;
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let logsum = max + logits.iter().map(|v| (v - max).exp()).sum::<f32>().ln();
+            let mut values = vec![f32::NEG_INFINITY; neural.vocabulary_size()];
+            for (id, score) in targets.into_iter().zip(logits) {
+                values[id] = score - logsum;
+            }
+            *distribution_cache = Some((ids.clone(), values));
         }
+        let values = &distribution_cache.as_ref().unwrap().1;
+        let neural = lm.neural.as_ref().unwrap();
         return Ok(source
             .iter()
             .enumerate()
