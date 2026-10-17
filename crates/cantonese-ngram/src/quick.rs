@@ -3,7 +3,28 @@ use crate::hybrid::{HybridLanguageModel, Mode};
 use std::collections::HashSet;
 
 pub const MAX_QUICK_CHARACTERS: usize = 6;
-const BEAM_WIDTH: usize = 32;
+/// Maximum relative log-probability deficit allowed for a candidate compared to the best
+/// candidate of the same character count before being pruned as very low probability.
+/// 8.0 log points corresponds to relative probability ~ e^-8 ≈ 0.033%.
+const CHAR_COUNT_PRUNE_DELTA: f32 = 8.0;
+
+/// Maximum relative log-probability deficit allowed for any candidate compared to the
+/// global best candidate across all character counts at this position.
+/// 12.0 log points corresponds to relative probability ~ e^-12 ≈ 0.0006%.
+const GLOBAL_PRUNE_DELTA: f32 = 12.0;
+
+/// Prune prior prefixes before expansion if their score is more than this delta behind
+/// the best prefix at the start position. Prevents running expensive LM evaluations on dead beams.
+const PREFIX_PRUNE_DELTA: f32 = 8.0;
+
+/// Minimum step transition score. Tokens with log-probability below this threshold
+/// (such as unsupported byte fallback or sentinel values <= -20.0) are discarded.
+const MIN_STEP_TRANSITION_SCORE: f32 = -15.0;
+
+/// Maximum beam caps per character count to bound worst-case memory and branching.
+const MAX_UNIGRAM_BEAM: usize = 20;
+const MAX_PHRASE_BEAM: usize = 12;
+const MAX_SEGMENT_CANDIDATES: usize = 32;
 
 /// Relative LM evidence for the two input interpretations, not a trained language classifier.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -146,21 +167,36 @@ impl QuickEngine {
         for end in cache.positions.len()..=code.len() {
             let mut paths = Vec::new();
             for size in 1..=2.min(end) {
+                // In Quick, when the user has typed only 2 letters, it represents a single
+                // 2-letter character code. Expanding size=1 (two 1-letter root keys) wastes
+                // ~20 neural forward passes to find 2-character root phrases that are never
+                // displayed ahead of the 2-letter character candidates.
+                if end == 2 && size == 1 && code.len() <= 2 {
+                    continue;
+                }
                 let start = end - size;
                 let source = dictionary.candidates(&code[start..end]);
                 if source.is_empty() {
                     continue;
                 }
                 // ARM mobile optimization: dictionary candidates are ordered by frequency.
-                // Keeping top BEAM_WIDTH candidates avoids scoring hundreds of obscure characters.
-                let source_slice = if source.len() > BEAM_WIDTH { &source[..BEAM_WIDTH] } else { source };
+                let source_slice = if source.len() > MAX_SEGMENT_CANDIDATES { &source[..MAX_SEGMENT_CANDIDATES] } else { source };
+                let best_prefix_score = cache.positions[start].first().map(|p| p.score).unwrap_or(0.0);
                 for prefix in &cache.positions[start] {
                     if prefix.characters == MAX_QUICK_CHARACTERS {
+                        continue;
+                    }
+                    // Prune prefixes that have very low probability compared to best at this position
+                    if prefix.characters > 0 && prefix.score < best_prefix_score - PREFIX_PRUNE_DELTA {
                         continue;
                     }
                     let context = format!("{left}{}", prefix.text);
                     let scores = sequence_scores(&mut self.lm, &mut self.distribution_cache, &context, right, source_slice)?;
                     for (text, score) in source_slice.iter().zip(scores) {
+                        // Skip impossible / unsupported transitions with negligible probability
+                        if !score.is_finite() || (prefix.characters > 0 && score < MIN_STEP_TRANSITION_SCORE) {
+                            continue;
+                        }
                         let boost = if prefix.characters > 0 && score > -5.0 {
                             (score + 5.0) * 0.5
                         } else {
@@ -175,10 +211,29 @@ impl QuickEngine {
                 }
             }
             paths.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+            // Intelligent probability pruning:
+            // 1. Find best score overall and per character-count.
+            let best_score = paths.first().map(|p| p.score).unwrap_or(0.0);
+            let mut best_by_chars = [f32::NEG_INFINITY; MAX_QUICK_CHARACTERS + 1];
+            for p in &paths {
+                if p.score > best_by_chars[p.characters] {
+                    best_by_chars[p.characters] = p.score;
+                }
+            }
+
             let mut counts = [0; MAX_QUICK_CHARACTERS + 1];
             let mut seen = HashSet::new();
             paths.retain(|p| {
-                if counts[p.characters] >= BEAM_WIDTH || !seen.insert(p.text.clone()) {
+                // Prune beams when they become very low probability:
+                // - worse than best score for this character count by more than CHAR_COUNT_PRUNE_DELTA
+                // - or worse than overall best score by more than GLOBAL_PRUNE_DELTA
+                let char_best = best_by_chars[p.characters];
+                if p.score < char_best - CHAR_COUNT_PRUNE_DELTA || p.score < best_score - GLOBAL_PRUNE_DELTA {
+                    return false;
+                }
+                let cap = if p.characters <= 1 { MAX_UNIGRAM_BEAM } else { MAX_PHRASE_BEAM };
+                if counts[p.characters] >= cap || !seen.insert(p.text.clone()) {
                     return false;
                 }
                 counts[p.characters] += 1;
