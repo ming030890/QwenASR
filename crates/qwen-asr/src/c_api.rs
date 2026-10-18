@@ -13,6 +13,8 @@ use crate::transcribe;
 /// Opaque handle to the ASR engine.
 pub struct QwenAsrEngine {
     pub(crate) ctx: QwenCtx,
+    #[cfg(feature = "android")]
+    pub(crate) capture_resources: Option<crate::jni_api::ResourceProbe>,
 }
 
 /// Load model from a directory path. Returns null on failure.
@@ -40,7 +42,7 @@ pub unsafe extern "C" fn qwen_asr_load_model(
     kernels::set_threads(threads);
 
     match QwenCtx::load(dir) {
-        Some(ctx) => Box::into_raw(Box::new(QwenAsrEngine { ctx })),
+        Some(ctx) => Box::into_raw(Box::new(QwenAsrEngine { ctx, #[cfg(feature = "android")] capture_resources: None })),
         None => std::ptr::null_mut(),
     }
 }

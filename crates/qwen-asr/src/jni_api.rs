@@ -16,7 +16,11 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-// Opt in with: adb shell setprop debug.qwen_asr.latency 1
+// The Android app supplies its build flag; the shared optimized Rust library
+// cannot use debug_assertions to distinguish debug and release APKs.
+static DEBUG_APP: AtomicBool = AtomicBool::new(false);
+
+// Opt in on a debug APK with: adb shell setprop debug.qwen_asr.latency 1
 #[cfg(target_os = "android")]
 fn debug_property(name: &str) -> String {
     unsafe extern "C" {
@@ -39,26 +43,88 @@ fn debug_property(_name: &str) -> String {
     String::new()
 }
 
-fn latency_enabled() -> bool {
-    debug_property("debug.qwen_asr.latency") == "1"
+fn diagnostics_enabled(debug_app: bool, opt_in: &str) -> bool {
+    debug_app && opt_in == "1"
 }
 
-#[cfg(target_os = "android")]
-fn thread_usage() -> (f64, i64, i64) {
-    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-    unsafe {
-        libc::getrusage(1 /* Linux/Bionic RUSAGE_THREAD */, &mut usage);
-    }
-    let ms = |time: libc::timeval| time.tv_sec as f64 * 1000.0 + time.tv_usec as f64 / 1000.0;
-    (
-        ms(usage.ru_utime) + ms(usage.ru_stime),
-        usage.ru_minflt,
-        usage.ru_majflt,
-    )
+fn latency_enabled() -> bool {
+    let debug_app = DEBUG_APP.load(Ordering::Relaxed);
+    debug_app && diagnostics_enabled(debug_app, &debug_property("debug.qwen_asr.latency"))
 }
-#[cfg(not(target_os = "android"))]
-fn thread_usage() -> (f64, i64, i64) {
-    (0.0, 0, 0)
+
+// Thread scopes attribute work to that thread. Process scope includes every app
+// thread and overlaps those scopes: never add the two kinds of counters together.
+#[derive(Clone, Copy)]
+struct Usage { cpu_ms: f64, minor: i64, major: i64 }
+
+fn resource_usage(process: bool) -> Option<Usage> {
+    #[cfg(target_os = "android")]
+    {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        let who = if process { libc::RUSAGE_SELF } else { 1 /* Bionic RUSAGE_THREAD */ };
+        if unsafe { libc::getrusage(who, &mut usage) } != 0 { return None; }
+        let ms = |t: libc::timeval| t.tv_sec as f64 * 1000.0 + t.tv_usec as f64 / 1000.0;
+        Some(Usage { cpu_ms: ms(usage.ru_utime) + ms(usage.ru_stime),
+            minor: usage.ru_minflt, major: usage.ru_majflt })
+    }
+    #[cfg(not(target_os = "android"))]
+    { let _ = process; None }
+}
+
+fn storage_read_bytes() -> Option<u64> {
+    std::fs::read_to_string("/proc/self/io").ok()?.lines()
+        .find_map(|line| line.strip_prefix("read_bytes:")?.trim().parse().ok())
+}
+
+thread_local! { static TRACE_SESSION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+
+pub(crate) struct ResourceProbe {
+    stage: &'static str,
+    session_id: u64,
+    process: bool,
+    start: Instant,
+    usage: Option<Usage>,
+    read_bytes: Option<u64>,
+}
+
+impl ResourceProbe {
+    pub(crate) fn start(enabled: bool, stage: &'static str) -> Option<Self> {
+        if !enabled { return None; }
+        Self::with_scope(true, stage, TRACE_SESSION.with(|id| id.get()), false)
+    }
+
+    fn with_scope(enabled: bool, stage: &'static str, session_id: u64, process: bool) -> Option<Self> {
+        if !enabled { return None; }
+        Some(Self { stage, session_id, process, start: Instant::now(),
+            usage: resource_usage(process),
+            read_bytes: if process { storage_read_bytes() } else { None } })
+    }
+}
+
+impl Drop for ResourceProbe {
+    fn drop(&mut self) {
+        let end = resource_usage(self.process);
+        let reads = if self.process { storage_read_bytes() } else { None };
+        let counters = match (self.usage, end) {
+            (Some(a), Some(b)) => format!("valid=true cpu_ms={:.2} minor_faults={} major_faults={}",
+                b.cpu_ms-a.cpu_ms, b.minor-a.minor, b.major-a.major),
+            _ => "valid=false".to_owned(),
+        };
+        let io = match (self.read_bytes, reads) {
+            (Some(a), Some(b)) => format!(" read_bytes={}", b.saturating_sub(a)),
+            _ => String::new(),
+        };
+        latency_log(&format!("event=resources session_id={} stage={} scope={} wall_ms={:.2} {}{}",
+            self.session_id, self.stage, if self.process { "process" } else { "thread" },
+            self.start.elapsed().as_secs_f64()*1000.0, counters, io));
+    }
+}
+
+fn log_prefetch(stage: &str, session_id: u64, stats: crate::safetensors::PrefetchStats) {
+    latency_log(&format!("event=prefetch_advice stage={} session_id={} bytes={} populate_ok={} populate_failed={} fallback_ok={} fallback_failed={} first_errno={} pages={} resident_before={} resident_after={} mincore_failed={}",
+        stage, session_id, stats.bytes, stats.populate_ok, stats.populate_failed,
+        stats.fallback_ok, stats.fallback_failed, stats.first_errno, stats.pages,
+        stats.resident_before, stats.resident_after, stats.mincore_failed));
 }
 
 fn log_kernel_deltas(before: &[crate::kernels::ProfileCounterSnapshot]) {
@@ -76,6 +142,7 @@ fn log_kernel_deltas(before: &[crate::kernels::ProfileCounterSnapshot]) {
 }
 
 pub(crate) fn latency_log(message: &str) {
+    if !DEBUG_APP.load(Ordering::Relaxed) { return; }
     #[cfg(target_os = "android")]
     {
         #[link(name = "log")]
@@ -106,7 +173,7 @@ fn phase_times(ctx: &crate::context::QwenCtx) -> [f64; 4] {
 }
 
 const MAX_QUEUED_SAMPLES: u64 = (SAMPLE_RATE * 90) as u64;
-const INFERENCE_BACKLOG_SAMPLES: u64 = (SAMPLE_RATE / 5) as u64;
+const INFERENCE_BACKLOG_SAMPLES: u64 = (SAMPLE_RATE as u64 * 800) / 1000;
 
 enum VadMsg {
     Audio {
@@ -128,6 +195,8 @@ struct VadAsrSession {
     closed: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
     _save_audio_dir: Option<String>,
+    _resources: Option<ResourceProbe>,
+    _capture_resources: Option<ResourceProbe>,
 }
 
 fn write_wav_file(path: &str, samples: &[i16], sample_rate: u32) -> std::io::Result<()> {
@@ -197,32 +266,21 @@ fn start_asr_worker(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let trace = latency_enabled();
+        TRACE_SESSION.with(|id| id.set(session_id));
+        let _worker_resources = ResourceProbe::start(trace, "worker_total");
         let session_at = Instant::now();
         // set_threads() runs on the model-loading coroutine, not this JNI worker.
         // Single-thread kernels bypass parallel_for(), so explicitly apply the same
         // existing inference CPU policy here as the CLI and pool workers use.
         #[cfg(feature = "kleidiai")]
-        crate::kernels::set_kleidiai_matvec_enabled(
-            debug_property("debug.qwen_asr.matmul_m1") != "0",
-        );
-        let pin_worker = debug_property("debug.qwen_asr.worker_pin") != "0";
-        // Diagnostic override; production uses the thread count passed at model load.
-        if trace {
-            if let Ok(threads) = debug_property("debug.qwen_asr.threads").parse::<usize>() {
-                if (1..=4).contains(&threads) {
-                    crate::kernels::set_threads(threads);
-                }
-            }
-        }
-        if pin_worker {
-            crate::affinity::ensure_current_thread_pinned();
-        }
+        crate::kernels::set_kleidiai_matvec_enabled(true);
+        crate::affinity::ensure_current_thread_pinned();
         if trace {
             crate::kernels::set_profile(true);
             latency_log(&format!(
                 "event=worker_policy session_id={} pin={} threads={} status={}",
                 session_id,
-                pin_worker,
+                true,
                 crate::kernels::get_num_threads(),
                 std::fs::read_to_string("/proc/thread-self/status")
                     .unwrap_or_default()
@@ -232,34 +290,29 @@ fn start_asr_worker(
                     .trim()
             ));
         }
-        let defer_stopped = debug_property("debug.qwen_asr.defer_stop") != "0";
         {
             let engine = unsafe { &mut *(engine_addr as *mut crate::c_api::QwenAsrEngine) };
             engine.ctx.stream_latency_trace = trace;
+            engine.ctx.stream_stop = Some(closed.clone());
         }
         let mut processed_samples = 0usize;
         let mut max_queue_ms = 0.0f64;
-        let mut vad_config = VadStreamConfig::default();
-        if let Ok(chunk_ms) = debug_property("debug.qwen_asr.chunk_ms").parse::<f32>() {
-            if chunk_ms >= 200.0 && chunk_ms <= 1200.0 {
-                vad_config.stream_chunk_sec = chunk_ms / 1000.0;
-            }
-        }
-        let active_backlog_ms: u64 = debug_property("debug.qwen_asr.backlog_ms")
-            .parse::<u64>()
-            .unwrap_or(800);
-        let active_backlog_samples = (SAMPLE_RATE as u64 * active_backlog_ms) / 1000;
+        let vad_config = VadStreamConfig::default();
+        let init_resources = ResourceProbe::start(trace, "vad_init");
         let mut vad_session = VadStreamSession::new(vad_config);
+        drop(init_resources);
         let mut all_audio_samples: Vec<i16> = Vec::new();
+        let weights = unsafe { &*(engine_addr as *const crate::c_api::QwenAsrEngine) }.ctx._safetensors.clone();
         let prefetch_handle = thread::Builder::new()
             .name(format!("qwen-prefetch-{}", session_id))
             .spawn(move || {
-                let engine = unsafe { &*(engine_addr as *const crate::c_api::QwenAsrEngine) };
+                TRACE_SESSION.with(|id| id.set(session_id));
+                let _resources = ResourceProbe::start(trace, "decoder_preload");
                 let preload_at = Instant::now();
-                if debug_property("debug.qwen_asr.bounded_prefetch") == "0" {
-                    engine.ctx._safetensors.preload_decoder_legacy();
+                if trace {
+                    log_prefetch("decoder", session_id, weights.preload_decoder_profiled());
                 } else {
-                    engine.ctx.preload_decoder();
+                    weights.preload_decoder();
                 }
                 if trace {
                     latency_log(&format!(
@@ -289,7 +342,7 @@ fn start_asr_worker(
                     let queue_ms = enqueued_at.elapsed().as_secs_f64() * 1000.0;
                     max_queue_ms = max_queue_ms.max(queue_ms);
                     let call_at = Instant::now();
-                    let usage_before = if trace { thread_usage() } else { (0.0, 0, 0) };
+                    let usage_before = if trace { resource_usage(false) } else { None };
                     let kernels_before = if trace {
                         crate::kernels::profile_snapshot()
                     } else {
@@ -307,8 +360,8 @@ fn start_asr_worker(
                     // do not run a replaceable preview immediately before finalizing
                     // the same utterance again. finish() owns the one final decode.
                     let is_stopped = closed.load(Ordering::Acquire);
-                    let has_audio_backlog = (defer_stopped && is_stopped)
-                        || queued_samples.load(Ordering::Relaxed) >= active_backlog_samples;
+                    let has_audio_backlog = is_stopped
+                        || queued_samples.load(Ordering::Relaxed) >= INFERENCE_BACKLOG_SAMPLES;
                     let vm = java_vm.clone();
                     let lis = listener.clone();
 
@@ -353,14 +406,13 @@ fn start_asr_worker(
                         }
                     }
                     if trace && (call_at.elapsed().as_millis() >= 10 || pass_executed) {
-                        let usage_after = thread_usage();
-                        latency_log(&format!(
-                            "event=thread_work session_id={} cpu_ms={:.2} minor_faults={} major_faults={}",
-                            session_id,
-                            usage_after.0 - usage_before.0,
-                            usage_after.1 - usage_before.1,
-                            usage_after.2 - usage_before.2
-                        ));
+                        if let (Some(before), Some(after)) = (usage_before, resource_usage(false)) {
+                            latency_log(&format!(
+                                "event=thread_work session_id={} cpu_ms={:.2} minor_faults={} major_faults={}",
+                                session_id, after.cpu_ms-before.cpu_ms,
+                                after.minor-before.minor, after.major-before.major
+                            ));
+                        }
                         log_kernel_deltas(&kernels_before);
                         latency_log(&format!("event=process session_id={} pass_id={} audio_start_ms={:.2} audio_end_ms={:.2} wall_ms={:.2} audio_ms={:.2} queue_wait_ms={:.2} backlog_ms={:.2} deferred={} process_ms={:.2} mel_ms={:.2} encoder_ms={:.2} prefill_ms={:.2} decode_ms={:.2}",
                             session_id, pass_id, audio_start_ms, audio_end_ms,
@@ -414,6 +466,7 @@ fn start_asr_worker(
                 VadMsg::Stop { finalize } => {
                     let engine = unsafe { &mut *(engine_addr as *mut crate::c_api::QwenAsrEngine) };
                     let stop_at = Instant::now();
+                    let _resources = ResourceProbe::start(trace, "finalize");
                     if trace {
                         latency_log(&format!(
                             "event=queued_audio_drained session_id={} wall_ms={:.2}",
@@ -505,12 +558,24 @@ fn start_asr_worker(
                 }
             }
         }
+        unsafe { &mut *(engine_addr as *mut crate::c_api::QwenAsrEngine) }.ctx.stream_stop = None;
         if let Some(handle) = prefetch_handle {
             let _ = handle.join();
         }
         let engine = unsafe { &mut *(engine_addr as *mut crate::c_api::QwenAsrEngine) };
         engine.ctx.stream_latency_trace = false;
     })
+}
+
+/// Runtime build gate, independent of the Rust library's optimization profile.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeConfigureDiagnostics(
+    _env: JNIEnv,
+    _class: JClass,
+    debug_app: jboolean,
+) -> jboolean {
+    DEBUG_APP.store(debug_app == JNI_TRUE, Ordering::Relaxed);
+    if latency_enabled() { JNI_TRUE } else { JNI_FALSE }
 }
 
 /// Load model. Returns native handle as jlong (pointer to QwenAsrEngine).
@@ -526,6 +591,23 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeLoadModel(
         Err(_) => return 0,
     };
 
+    // Test-only cache control on this app's model files, before they are mapped.
+    // DONTNEED is advisory: residency/read counters must confirm the outcome.
+    #[cfg(target_os = "android")]
+    if latency_enabled() && debug_property("debug.qwen_asr.cold_cache") == "1" {
+        use std::os::fd::AsRawFd;
+        if let Ok(entries) = fs::read_dir(&dir_str) {
+            for entry in entries.flatten() {
+                if entry.path().extension().is_some_and(|ext| ext == "safetensors") {
+                    if let Ok(file) = fs::File::open(entry.path()) {
+                        let result = libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+                        latency_log(&format!("event=cache_control file={} result={}", entry.file_name().to_string_lossy(), result));
+                    }
+                }
+            }
+        }
+    }
+    let _resources = ResourceProbe::with_scope(latency_enabled(), "model_load", 0, true);
     let dir_c = match CString::new(dir_str) {
         Ok(c) => c,
         Err(_) => return 0,
@@ -713,7 +795,12 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativePreloadEncoder(
 ) {
     if handle != 0 {
         let engine = &mut *(handle as *mut crate::c_api::QwenAsrEngine);
-        engine.ctx.preload_encoder();
+        engine.capture_resources = ResourceProbe::with_scope(latency_enabled(), "capture_total", 0, true);
+        let trace = latency_enabled();
+        let _resources = ResourceProbe::with_scope(trace, "encoder_preload_api", 0, true);
+        if trace {
+            log_prefetch("encoder_api", 0, engine.ctx._safetensors.preload_encoder_profiled());
+        } else { engine.ctx.preload_encoder(); }
     }
 }
 
@@ -747,9 +834,17 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeStartVadSession(
         return 0;
     }
 
+    let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+    let resources = ResourceProbe::with_scope(latency_enabled(), "session_total", session_id, true);
+    if latency_enabled() {
+        latency_log(&format!("event=session_created session_id={}", session_id));
+    }
     // Immediately trigger eager readahead of Shard 1 (Encoder: 320 MB)
     let engine = &mut *(handle as *mut crate::c_api::QwenAsrEngine);
-    engine.ctx.preload_encoder();
+    {
+        let _resources = ResourceProbe::with_scope(latency_enabled(), "encoder_preload", session_id, false);
+        engine.ctx.preload_encoder();
+    }
 
     let save_dir_opt: Option<String> = if !save_audio_dir.is_null() {
         match env.get_string(&save_audio_dir) {
@@ -784,10 +879,8 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeStartVadSession(
     let (tx, rx) = mpsc::channel();
     let queued_samples = Arc::new(AtomicU64::new(0));
     let closed = Arc::new(AtomicBool::new(false));
-    let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-    if latency_enabled() {
-        latency_log(&format!("event=session_created session_id={}", session_id));
-    }
+    let mut capture_resources = engine.capture_resources.take();
+    if let Some(resources) = &mut capture_resources { resources.session_id = session_id; }
     let worker = start_asr_worker(
         session_id,
         handle as usize,
@@ -807,6 +900,8 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeStartVadSession(
         closed,
         worker: Mutex::new(Some(worker)),
         _save_audio_dir: save_dir_opt,
+        _resources: resources,
+        _capture_resources: capture_resources,
     };
     Box::into_raw(Box::new(session)) as jlong
 }
@@ -909,11 +1004,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn diagnostics_require_debug_app_and_explicit_opt_in() {
+        for debug_app in [false, true] {
+            for flag in ["", "0", "1", "true"] {
+                assert_eq!(diagnostics_enabled(debug_app, flag), debug_app && flag == "1");
+            }
+        }
+    }
+
+    #[test]
     fn vad_stream_constants_match_hill_climbing() {
         let cfg = VadStreamConfig::default();
         assert_eq!(VAD_FRAME_SIZE, 512);
         assert_eq!(VAD_FRAME_SIZE * 1000 / SAMPLE_RATE, 32);
-        assert_eq!(INFERENCE_BACKLOG_SAMPLES * 1000 / SAMPLE_RATE as u64, 200);
+        assert_eq!(INFERENCE_BACKLOG_SAMPLES * 1000 / SAMPLE_RATE as u64, 800);
         assert_eq!(cfg.threshold, 0.50);
         assert_eq!(cfg.neg_threshold, 0.35);
         assert_eq!(cfg.min_silence_ms, 800);

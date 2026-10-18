@@ -33,8 +33,9 @@ pub struct QwenCtx {
     pub config: QwenConfig,
     pub encoder: Encoder,
     pub decoder: Decoder,
-    pub _safetensors: MultiSafetensors, // kept alive for mmap'd BF16 pointers
+    pub _safetensors: std::sync::Arc<MultiSafetensors>, // kept alive for mmap'd BF16 pointers
     pub model_dir: String,
+    pub(crate) stream_tokenizer: Option<std::sync::Arc<QwenTokenizer>>,
 
     // KV cache
     pub kv_cache: KvCache,
@@ -65,6 +66,7 @@ pub struct QwenCtx {
     pub skip_silence: bool,
     pub stream_adaptive_drain: bool,
     pub(crate) stream_latency_trace: bool,
+    pub(crate) stream_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 
     // Optional prompt/language
     pub prompt: Option<String>,
@@ -180,8 +182,9 @@ impl QwenCtx {
             config: cfg,
             encoder,
             decoder,
-            _safetensors: ms,
+            _safetensors: std::sync::Arc::new(ms),
             model_dir: model_dir.to_string(),
+            stream_tokenizer: None,
             kv_cache,
             static_prefix_kv_cache: None,
             dec_bufs,
@@ -198,6 +201,7 @@ impl QwenCtx {
             skip_silence: true,
             stream_adaptive_drain: false,
             stream_latency_trace: false,
+            stream_stop: None,
             prompt: None,
             force_language: None,
             chinese_variant: None,

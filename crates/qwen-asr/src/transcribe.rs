@@ -738,7 +738,7 @@ pub struct StreamState {
     chunk_idx: i32,
 
     // Tokenizer (loaded once)
-    tokenizer: Option<QwenTokenizer>,
+    tokenizer: Option<std::sync::Arc<QwenTokenizer>>,
     prompt_prepared: bool,
 }
 
@@ -798,6 +798,12 @@ impl StreamState {
         // Keep tokenizer and prompt_prepared
     }
 
+    /// Discard only an unpublished preview. Completed encoder windows and valid
+    /// prefill KV remain reusable; the final pass must consume this audio again.
+    fn abandon_preview(&mut self, checkpoint_cursor: usize) {
+        self.audio_cursor = checkpoint_cursor;
+    }
+
     /// Get the current stable transcription result.
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.result_bytes).into_owned()
@@ -823,6 +829,12 @@ pub fn stream_push_audio(
     state: &mut StreamState,
     finalize: bool,
 ) -> Option<String> {
+    // Preserve the first visible hypothesis. Once text is already available,
+    // Stop makes an unpublished preview replaceable by the final full-audio pass.
+    let stop = if !finalize && !state.hypothesis_text.is_empty() {
+        ctx.stream_stop.clone()
+    } else { None };
+    let stopped = || stop.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
     let cfg = ctx.config.clone();
     let dim = cfg.dec_hidden;
     let chunk_samples = (ctx.stream_chunk_sec * SAMPLE_RATE as f32) as usize;
@@ -834,9 +846,15 @@ pub fn stream_push_audio(
         32
     };
 
+    #[cfg(feature = "android")]
+    let setup_resources = crate::jni_api::ResourceProbe::start(ctx.stream_latency_trace, "stream_setup");
+
     // Lazy-init tokenizer
     if state.tokenizer.is_none() {
-        state.tokenizer = load_tokenizer(&ctx.model_dir);
+        if ctx.stream_tokenizer.is_none() {
+            ctx.stream_tokenizer = load_tokenizer(&ctx.model_dir).map(std::sync::Arc::new);
+        }
+        state.tokenizer = ctx.stream_tokenizer.clone();
     }
     let tokenizer = state.tokenizer.as_ref()?;
 
@@ -846,6 +864,9 @@ pub fn stream_push_audio(
         }
         state.prompt_prepared = true;
     }
+
+    #[cfg(feature = "android")]
+    drop(setup_resources);
 
     // Check if we have enough audio for at least one chunk (or finalizing)
     let available = samples.len().saturating_sub(state.audio_cursor);
@@ -913,6 +934,7 @@ pub fn stream_push_audio(
 
     // ---- Process full chunks, plus remainder if finalizing ----
     while state.audio_cursor < samples.len() {
+        if stopped() { break; }
         let checkpoint_cursor = state.audio_cursor;
         let remaining = samples.len() - state.audio_cursor;
         if remaining < chunk_samples && !finalize {
@@ -931,6 +953,8 @@ pub fn stream_push_audio(
         let is_final = finalize && state.audio_cursor >= samples.len();
 
         // ---- Encoder: only encode new windows ----
+        #[cfg(feature = "android")]
+        let encode_resources = crate::jni_api::ResourceProbe::start(ctx.stream_latency_trace, "mel_encoder");
         let t0 = get_time_ms();
         let mut chunk_mel_ms = 0.0f64;
         let mut chunk_enc_only_ms = 0.0f64;
@@ -1008,10 +1032,23 @@ pub fn stream_push_audio(
             return Some(String::new());
         }
 
+        #[cfg(feature = "android")]
+        drop(encode_resources);
         let enc_ms = elapsed_ms(t0);
         ctx.perf_encode_ms += enc_ms;
         ctx.perf_mel_ms += chunk_mel_ms;
         ctx.perf_encoder_ms += chunk_enc_only_ms;
+
+        #[cfg(feature = "android")]
+        let prepare_resources = crate::jni_api::ResourceProbe::start(ctx.stream_latency_trace, "prepare_prefill");
+
+        if stopped() {
+            state.abandon_preview(checkpoint_cursor);
+            ctx.perf_total_ms += elapsed_ms(chunk_t0);
+            #[cfg(feature = "android")]
+            if ctx.stream_latency_trace { crate::jni_api::latency_log("event=preview_cancelled stage=after_encoder"); }
+            return Some(String::from_utf8_lossy(&delta_bytes).into_owned());
+        }
 
         // ---- Prefix rollback ----
         let n_prefix_tokens = if ctx.past_text_conditioning
@@ -1142,6 +1179,11 @@ pub fn stream_push_audio(
             prefill_keys[text_off + i] = prefill_token_key(state.raw_tokens[i]);
         }
 
+        #[cfg(feature = "android")]
+        drop(prepare_resources);
+        #[cfg(feature = "android")]
+        let prefill_resources = crate::jni_api::ResourceProbe::start(ctx.stream_latency_trace, "prefill");
+
         // ---- Decoder prefill with LCP reuse ----
         let t0 = get_time_ms();
         let prefill_len = total_seq - 1;
@@ -1214,6 +1256,8 @@ pub fn stream_push_audio(
         let prefill_ms = elapsed_ms(t0);
         ctx.perf_decode_ms += prefill_ms;
         ctx.perf_prefill_ms += prefill_ms;
+        #[cfg(feature = "android")]
+        drop(prefill_resources);
 
         if kernels::verbose() >= 2 {
             eprintln!(
@@ -1221,6 +1265,9 @@ pub fn stream_push_audio(
                 state.chunk_idx, enc_ms, reused_prefill, prefill_len, prefill_ms, delta_prefill
             );
         }
+
+        #[cfg(feature = "android")]
+        let decode_resources = crate::jni_api::ResourceProbe::start(ctx.stream_latency_trace, "decode");
 
         // ---- Autoregressive decode ----
         let t0 = get_time_ms();
@@ -1230,6 +1277,7 @@ pub fn stream_push_audio(
         let mut token_ready_ms = Vec::new();
 
         while n_generated < max_new_tokens {
+            if stopped() { break; }
             if ctx.stream_latency_trace {
                 token_ready_ms.push(elapsed_ms(t0));
             }
@@ -1263,6 +1311,8 @@ pub fn stream_push_audio(
         let decode_ms = elapsed_ms(t0);
         ctx.perf_decode_ms += decode_ms;
         ctx.perf_decode_loop_ms += decode_ms;
+        #[cfg(feature = "android")]
+        drop(decode_resources);
 
         #[cfg(feature = "android")]
         if ctx.stream_latency_trace {
@@ -1277,6 +1327,13 @@ pub fn stream_push_audio(
                 (state.audio_cursor - checkpoint_cursor) as f64 / 16.0,
                 reused_prefill, prefill_len, prefill_ms, decode_ms, times
             ));
+        }
+        if stopped() {
+            state.abandon_preview(checkpoint_cursor);
+            ctx.perf_total_ms += elapsed_ms(chunk_t0);
+            #[cfg(feature = "android")]
+            if ctx.stream_latency_trace { crate::jni_api::latency_log("event=preview_cancelled stage=decode"); }
+            return Some(String::from_utf8_lossy(&delta_bytes).into_owned());
         }
         // ---- Update raw token history ----
         state.raw_tokens.truncate(n_prefix_tokens);
@@ -1506,6 +1563,51 @@ pub fn stream_push_audio(
 #[cfg(test)]
 mod tests {
     use super::push_utf8_piece;
+
+    #[test]
+    fn abandoning_preview_replays_audio_and_preserves_published_text_and_caches() {
+        let mut state = super::StreamState::new();
+        state.audio_cursor = 32000;
+        state.chunk_idx = 3;
+        state.raw_tokens = vec![1, 2];
+        state.stable_text_tokens = vec![1];
+        state.result_bytes = b"published".to_vec();
+        state.hypothesis_text = "published preview".into();
+        state.prev_tail_snapshot = vec![1, 2];
+        state.prev_prefill_keys = vec![super::PrefillRowKey { a: 5, b: 6 }];
+        state.enc_cached_seq_total = 12;
+        state.abandon_preview(16000);
+        assert_eq!(state.audio_cursor, 16000);
+        assert_eq!(state.chunk_idx, 3);
+        assert_eq!(state.raw_tokens, [1, 2]);
+        assert_eq!(state.stable_text_tokens, [1]);
+        assert_eq!(state.text(), "published");
+        assert_eq!(state.hypothesis(), "published preview");
+        assert_eq!(state.prev_tail_snapshot, [1, 2]);
+        assert_eq!(state.prev_prefill_keys.len(), 1);
+        assert_eq!(state.enc_cached_seq_total, 12);
+    }
+
+    #[test]
+    fn streaming_reset_keeps_shared_tokenizer_but_clears_recording_text() {
+        let dir = if cfg!(target_os = "android") { std::path::PathBuf::from("/data/local/tmp") }
+            else { std::env::temp_dir() };
+        let path = dir.join(format!("voice-tokenizer-{}-vocab.json", std::process::id()));
+        std::fs::write(&path, r#"{"hello":0}"#).unwrap();
+        let tokenizer = std::sync::Arc::new(crate::tokenizer::QwenTokenizer::load(path.to_str().unwrap()).unwrap());
+        std::fs::remove_file(path).unwrap();
+        let mut state = super::StreamState::new();
+        state.tokenizer = Some(tokenizer.clone());
+        state.result_bytes.extend_from_slice(b"previous recording");
+        state.raw_tokens.push(0);
+        state.hypothesis_text.push_str("previous recording");
+        state.reset();
+        assert!(std::sync::Arc::ptr_eq(state.tokenizer.as_ref().unwrap(), &tokenizer));
+        assert!(state.result_bytes.is_empty());
+        assert!(state.raw_tokens.is_empty());
+        assert!(state.hypothesis_text.is_empty());
+        assert_eq!(state.tokenizer.as_ref().unwrap().decode(0), "hello");
+    }
 
     #[test]
     fn token_callback_waits_for_complete_utf8() {

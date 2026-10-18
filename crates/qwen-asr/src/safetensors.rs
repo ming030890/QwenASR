@@ -4,6 +4,44 @@ use std::collections::HashMap;
 use std::os::unix::io::RawFd;
 use std::path::Path;
 
+/// Collected only by explicit Android diagnostics, not ordinary prefetch calls.
+#[derive(Default, Debug)]
+pub(crate) struct PrefetchStats {
+    pub bytes: usize,
+    pub populate_ok: usize,
+    pub populate_failed: usize,
+    pub fallback_ok: usize,
+    pub fallback_failed: usize,
+    pub first_errno: i32,
+    pub pages: usize,
+    pub resident_before: usize,
+    pub resident_after: usize,
+    pub mincore_failed: usize,
+}
+
+#[cfg(target_os = "android")]
+unsafe fn resident_pages(data: *mut libc::c_void, length: usize) -> Option<(usize, usize)> {
+    let page = libc::sysconf(libc::_SC_PAGESIZE);
+    if page <= 0 { return None; }
+    let page = page as usize;
+    // Fixed stack storage: no temporary heap allocation while checking residency.
+    let mut bits = [0u8; 256];
+    let mut resident = 0;
+    let mut pages = 0;
+    let mut offset = 0;
+    while offset < length {
+        let bytes = (length-offset).min(page*bits.len());
+        let count = bytes.div_ceil(page);
+        if libc::mincore((data as *mut u8).add(offset) as *mut _, bytes, bits.as_mut_ptr()) != 0 {
+            return None;
+        }
+        resident += bits[..count].iter().filter(|b| **b & 1 != 0).count();
+        pages += count;
+        offset += bytes;
+    }
+    Some((resident, pages))
+}
+
 const MAX_TENSORS: usize = 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -357,34 +395,67 @@ impl MultiSafetensors {
     }
 
 #[inline]
-unsafe fn madvise_prefetch(data: *mut libc::c_void, length: usize) {
+unsafe fn madvise_prefetch(data: *mut libc::c_void, length: usize, stats: &mut Option<PrefetchStats>) {
     #[cfg(target_os = "android")]
     {
         const MADV_POPULATE_READ: libc::c_int = 22;
+        let before = if stats.is_some() { resident_pages(data, length) } else { None };
         let res = libc::madvise(data, length, MADV_POPULATE_READ);
-        if res != 0 {
-            libc::madvise(data, length, libc::MADV_WILLNEED);
+        let errno = if res != 0 { std::io::Error::last_os_error().raw_os_error().unwrap_or(-1) } else { 0 };
+        let fallback = if res != 0 { libc::madvise(data, length, libc::MADV_WILLNEED) } else { 0 };
+        if let Some(stats) = stats {
+            stats.bytes += length;
+            if res == 0 { stats.populate_ok += 1; } else {
+                stats.populate_failed += 1;
+                if stats.first_errno == 0 { stats.first_errno = errno; }
+                if fallback == 0 { stats.fallback_ok += 1; } else { stats.fallback_failed += 1; }
+            }
+            match (before, resident_pages(data, length)) {
+                (Some((a, pages)), Some((b, _))) => {
+                    stats.pages += pages;
+                    stats.resident_before += a;
+                    stats.resident_after += b;
+                }
+                _ => stats.mincore_failed += 1,
+            }
         }
     }
     #[cfg(not(target_os = "android"))]
     {
+        let _ = stats;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         libc::madvise(data, length, libc::MADV_WILLNEED);
     }
 }
 
     /// Advise kernel to preload Shard 1 (Encoder: 320 MB) into RAM
-    pub fn preload_encoder(&self) {
+    pub fn preload_encoder(&self) { self.preload_encoder_impl(&mut None); }
+
+    pub(crate) fn preload_encoder_profiled(&self) -> PrefetchStats {
+        let mut stats = Some(PrefetchStats::default());
+        self.preload_encoder_impl(&mut stats);
+        stats.unwrap()
+    }
+
+    fn preload_encoder_impl(&self, stats: &mut Option<PrefetchStats>) {
         #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
         if let Some(shard) = self.shards.first() {
             unsafe {
-                Self::madvise_prefetch(shard.data as *mut _, shard.file_size);
+                Self::madvise_prefetch(shard.data as *mut _, shard.file_size, stats);
             }
         }
     }
 
     /// Advise kernel to preload Shards 2..N (Decoder: 1.64 GB) into RAM
-    pub fn preload_decoder(&self) {
+    pub fn preload_decoder(&self) { self.preload_decoder_impl(&mut None); }
+
+    pub(crate) fn preload_decoder_profiled(&self) -> PrefetchStats {
+        let mut stats = Some(PrefetchStats::default());
+        self.preload_decoder_impl(&mut stats);
+        stats.unwrap()
+    }
+
+    fn preload_decoder_impl(&self, stats: &mut Option<PrefetchStats>) {
         #[cfg(any(target_os = "android", target_os = "linux"))]
         {
             let packed = self.shards.iter().any(|shard| {
@@ -396,7 +467,7 @@ unsafe fn madvise_prefetch(data: *mut libc::c_void, length: usize) {
             if packed {
                 let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
                 if page <= 0 {
-                    self.preload_decoder_legacy();
+                    self.preload_decoder_legacy_impl(stats);
                     return;
                 }
                 let page = page as usize;
@@ -432,6 +503,7 @@ unsafe fn madvise_prefetch(data: *mut libc::c_void, length: usize) {
                                 Self::madvise_prefetch(
                                     shard.data.add(cursor) as *mut _,
                                     length,
+                                    stats,
                                 );
                             }
                             cursor += batch;
@@ -442,14 +514,14 @@ unsafe fn madvise_prefetch(data: *mut libc::c_void, length: usize) {
                 return;
             }
         }
-        self.preload_decoder_legacy();
+        self.preload_decoder_legacy_impl(stats);
     }
 
-    pub(crate) fn preload_decoder_legacy(&self) {
+    fn preload_decoder_legacy_impl(&self, stats: &mut Option<PrefetchStats>) {
         #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
         for shard in self.shards.iter().skip(1) {
             unsafe {
-                Self::madvise_prefetch(shard.data as *mut _, shard.file_size);
+                Self::madvise_prefetch(shard.data as *mut _, shard.file_size, stats);
             }
         }
     }
@@ -822,5 +894,20 @@ fn skip_json_value(bytes: &[u8], pos: &mut usize) {
                 *pos += 1;
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "android"))]
+mod prefetch_tests {
+    #[test]
+    fn prefetch_reports_failed_advice_and_failed_residency() {
+        let mut stats = Some(super::PrefetchStats::default());
+        unsafe { super::MultiSafetensors::madvise_prefetch(std::ptr::null_mut(), 4096, &mut stats); }
+        let stats = stats.unwrap();
+        assert_eq!(stats.populate_ok, 0);
+        assert_eq!(stats.populate_failed, 1);
+        assert_eq!(stats.fallback_failed, 1);
+        assert_ne!(stats.first_errno, 0);
+        assert_eq!(stats.mincore_failed, 1);
     }
 }

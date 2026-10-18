@@ -204,13 +204,15 @@ impl VadStreamSession {
                             .total_samples_pushed
                             .saturating_sub(VAD_FRAME_SIZE + pad_len);
 
-                        eprintln!(
-                            "DEBUG: Speech onset at sample {} ({:.3}s), pad_samples={}, score={:.3}",
-                            self.total_samples_pushed,
-                            self.total_samples_pushed as f64 / 16000.0,
-                            self.pre_speech_pad.len(),
-                            score
-                        );
+                        if crate::kernels::verbose() >= 2 {
+                            eprintln!(
+                                "DEBUG: Speech onset at sample {} ({:.3}s), pad_samples={}, score={:.3}",
+                                self.total_samples_pushed,
+                                self.total_samples_pushed as f64 / 16000.0,
+                                self.pre_speech_pad.len(),
+                                score
+                            );
+                        }
                         self.utterance_audio.clear();
                         self.utterance_audio.extend(self.pre_speech_pad.drain(..));
                         self.utterance_audio.extend_from_slice(&frame);
