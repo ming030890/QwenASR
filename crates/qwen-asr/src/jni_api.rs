@@ -1,33 +1,131 @@
-use jni::objects::{GlobalRef, JByteBuffer, JClass, JObject, JString, JValue};
-use jni::sys::{jboolean, jfloat, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
-use jni::JNIEnv;
+#[cfg(test)]
+use crate::vad_stream::VAD_FRAME_SIZE;
 /// JNI API for Android integration.
 /// Build with: cargo ndk -t arm64-v8a build --release --features android
 ///
 /// Java class: com.qwenasr.QAsrEngine
 ///
 use crate::vad_stream::{VadStreamConfig, VadStreamEvent, VadStreamSession, SAMPLE_RATE};
-#[cfg(test)]
-use crate::vad_stream::VAD_FRAME_SIZE;
+use jni::objects::{GlobalRef, JByteBuffer, JClass, JObject, JString, JValue};
+use jni::sys::{jboolean, jfloat, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
+use jni::JNIEnv;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
+
+// Opt in with: adb shell setprop debug.qwen_asr.latency 1
+#[cfg(target_os = "android")]
+fn debug_property(name: &str) -> String {
+    unsafe extern "C" {
+        fn __system_property_get(
+            name: *const std::ffi::c_char,
+            value: *mut std::ffi::c_char,
+        ) -> i32;
+    }
+    let name = CString::new(name).expect("static property name");
+    let mut value = [0 as std::ffi::c_char; 92];
+    unsafe {
+        __system_property_get(name.as_ptr(), value.as_mut_ptr());
+        CStr::from_ptr(value.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+#[cfg(not(target_os = "android"))]
+fn debug_property(_name: &str) -> String {
+    String::new()
+}
+
+fn latency_enabled() -> bool {
+    debug_property("debug.qwen_asr.latency") == "1"
+}
+
+#[cfg(target_os = "android")]
+fn thread_usage() -> (f64, i64, i64) {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::getrusage(1 /* Linux/Bionic RUSAGE_THREAD */, &mut usage);
+    }
+    let ms = |time: libc::timeval| time.tv_sec as f64 * 1000.0 + time.tv_usec as f64 / 1000.0;
+    (
+        ms(usage.ru_utime) + ms(usage.ru_stime),
+        usage.ru_minflt,
+        usage.ru_majflt,
+    )
+}
+#[cfg(not(target_os = "android"))]
+fn thread_usage() -> (f64, i64, i64) {
+    (0.0, 0, 0)
+}
+
+fn log_kernel_deltas(before: &[crate::kernels::ProfileCounterSnapshot]) {
+    for (before, after) in before.iter().zip(crate::kernels::profile_snapshot()) {
+        let elapsed = after.total_ms - before.total_ms;
+        if elapsed >= 0.1 {
+            latency_log(&format!(
+                "event=kernel name={} ms={:.2} calls={}",
+                after.name,
+                elapsed,
+                after.calls - before.calls
+            ));
+        }
+    }
+}
+
+pub(crate) fn latency_log(message: &str) {
+    #[cfg(target_os = "android")]
+    {
+        #[link(name = "log")]
+        unsafe extern "C" {
+            fn __android_log_write(
+                priority: i32,
+                tag: *const std::ffi::c_char,
+                text: *const std::ffi::c_char,
+            ) -> i32;
+        }
+        if let Ok(message) = CString::new(message) {
+            unsafe {
+                __android_log_write(4, c"VoiceNative".as_ptr(), message.as_ptr());
+            }
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = message;
+}
+
+fn phase_times(ctx: &crate::context::QwenCtx) -> [f64; 4] {
+    [
+        ctx.perf_mel_ms,
+        ctx.perf_encoder_ms,
+        ctx.perf_prefill_ms,
+        ctx.perf_decode_loop_ms,
+    ]
+}
 
 const MAX_QUEUED_SAMPLES: u64 = (SAMPLE_RATE * 90) as u64;
 const INFERENCE_BACKLOG_SAMPLES: u64 = (SAMPLE_RATE / 5) as u64;
 
 enum VadMsg {
-    Audio(Vec<f32>),
-    Stop { finalize: bool },
+    Audio {
+        samples: Vec<f32>,
+        enqueued_at: Instant,
+    },
+    Stop {
+        finalize: bool,
+    },
 }
 
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
 struct VadAsrSession {
+    session_id: u64,
     engine_addr: usize,
     task_tx: mpsc::Sender<VadMsg>,
     queued_samples: Arc<AtomicU64>,
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
     _save_audio_dir: Option<String>,
 }
@@ -88,27 +186,116 @@ fn notify_complete(java_vm: &jni::JavaVM, listener: &GlobalRef) {
 }
 
 fn start_asr_worker(
+    session_id: u64,
     engine_addr: usize,
     java_vm: Arc<jni::JavaVM>,
     listener: GlobalRef,
     rx: mpsc::Receiver<VadMsg>,
     queued_samples: Arc<AtomicU64>,
     save_audio_dir: Option<String>,
+    closed: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let mut vad_session = VadStreamSession::new(VadStreamConfig::default());
+        let trace = latency_enabled();
+        let session_at = Instant::now();
+        // set_threads() runs on the model-loading coroutine, not this JNI worker.
+        // Single-thread kernels bypass parallel_for(), so explicitly apply the same
+        // existing inference CPU policy here as the CLI and pool workers use.
+        #[cfg(feature = "kleidiai")]
+        crate::kernels::set_kleidiai_matvec_enabled(
+            debug_property("debug.qwen_asr.matmul_m1") != "0",
+        );
+        let pin_worker = debug_property("debug.qwen_asr.worker_pin") != "0";
+        // Diagnostic override; production uses the thread count passed at model load.
+        if trace {
+            if let Ok(threads) = debug_property("debug.qwen_asr.threads").parse::<usize>() {
+                if (1..=4).contains(&threads) {
+                    crate::kernels::set_threads(threads);
+                }
+            }
+        }
+        if pin_worker {
+            crate::affinity::ensure_current_thread_pinned();
+        }
+        if trace {
+            crate::kernels::set_profile(true);
+            latency_log(&format!(
+                "event=worker_policy session_id={} pin={} threads={} status={}",
+                session_id,
+                pin_worker,
+                crate::kernels::get_num_threads(),
+                std::fs::read_to_string("/proc/thread-self/status")
+                    .unwrap_or_default()
+                    .lines()
+                    .find(|line| line.starts_with("Cpus_allowed_list:"))
+                    .unwrap_or("")
+                    .trim()
+            ));
+        }
+        let defer_stopped = debug_property("debug.qwen_asr.defer_stop") != "0";
+        {
+            let engine = unsafe { &mut *(engine_addr as *mut crate::c_api::QwenAsrEngine) };
+            engine.ctx.stream_latency_trace = trace;
+        }
+        let mut processed_samples = 0usize;
+        let mut max_queue_ms = 0.0f64;
+        let mut vad_config = VadStreamConfig::default();
+        if let Ok(chunk_ms) = debug_property("debug.qwen_asr.chunk_ms").parse::<f32>() {
+            if chunk_ms >= 200.0 && chunk_ms <= 1200.0 {
+                vad_config.stream_chunk_sec = chunk_ms / 1000.0;
+            }
+        }
+        let active_backlog_ms: u64 = debug_property("debug.qwen_asr.backlog_ms")
+            .parse::<u64>()
+            .unwrap_or(800);
+        let active_backlog_samples = (SAMPLE_RATE as u64 * active_backlog_ms) / 1000;
+        let mut vad_session = VadStreamSession::new(vad_config);
         let mut all_audio_samples: Vec<i16> = Vec::new();
+        let prefetch_handle = thread::Builder::new()
+            .name(format!("qwen-prefetch-{}", session_id))
+            .spawn(move || {
+                let engine = unsafe { &*(engine_addr as *const crate::c_api::QwenAsrEngine) };
+                let preload_at = Instant::now();
+                if debug_property("debug.qwen_asr.bounded_prefetch") == "0" {
+                    engine.ctx._safetensors.preload_decoder_legacy();
+                } else {
+                    engine.ctx.preload_decoder();
+                }
+                if trace {
+                    latency_log(&format!(
+                        "event=decoder_preload session_id={} ms={:.2}",
+                        session_id,
+                        preload_at.elapsed().as_secs_f64() * 1000.0
+                    ));
+                }
+            })
+            .ok();
         let mut last_hypothesis = String::new();
-        let mut decoder_preloaded = false;
+        let mut pass_id = 0u32;
+        if trace {
+            latency_log(&format!(
+                "event=worker_ready session_id={} wall_ms={:.2}",
+                session_id,
+                session_at.elapsed().as_secs_f64() * 1000.0
+            ));
+        }
 
         while let Ok(msg) = rx.recv() {
             match msg {
-                VadMsg::Audio(samples_f32) => {
+                VadMsg::Audio {
+                    samples: samples_f32,
+                    enqueued_at,
+                } => {
+                    let queue_ms = enqueued_at.elapsed().as_secs_f64() * 1000.0;
+                    max_queue_ms = max_queue_ms.max(queue_ms);
+                    let call_at = Instant::now();
+                    let usage_before = if trace { thread_usage() } else { (0.0, 0, 0) };
+                    let kernels_before = if trace {
+                        crate::kernels::profile_snapshot()
+                    } else {
+                        Vec::new()
+                    };
                     let engine = unsafe { &mut *(engine_addr as *mut crate::c_api::QwenAsrEngine) };
-                    if !decoder_preloaded {
-                        engine.ctx.preload_decoder();
-                        decoder_preloaded = true;
-                    }
                     queued_samples.fetch_sub(samples_f32.len() as u64, Ordering::Relaxed);
                     if save_audio_dir.is_some() {
                         for &s in &samples_f32 {
@@ -116,8 +303,12 @@ fn start_asr_worker(
                         }
                     }
 
-                    let has_audio_backlog =
-                        queued_samples.load(Ordering::Relaxed) >= INFERENCE_BACKLOG_SAMPLES;
+                    // Once Stop is queued, feed every remaining sample into VAD but
+                    // do not run a replaceable preview immediately before finalizing
+                    // the same utterance again. finish() owns the one final decode.
+                    let is_stopped = closed.load(Ordering::Acquire);
+                    let has_audio_backlog = (defer_stopped && is_stopped)
+                        || queued_samples.load(Ordering::Relaxed) >= active_backlog_samples;
                     let vm = java_vm.clone();
                     let lis = listener.clone();
 
@@ -135,12 +326,71 @@ fn start_asr_worker(
                             }
                         }
                     };
+                    let phases_before = phase_times(&engine.ctx);
                     let events = if has_audio_backlog {
                         vad_session.push_audio_backlogged(&mut engine.ctx, &samples_f32, on_delta)
                     } else {
                         vad_session.push_audio(&mut engine.ctx, &samples_f32, on_delta)
                     };
 
+                    processed_samples += samples_f32.len();
+                    let phases_after = phase_times(&engine.ctx);
+                    let mut audio_start_ms = 0.0f64;
+                    let mut audio_end_ms = 0.0f64;
+                    let pass_executed = phases_after != phases_before;
+                    if pass_executed {
+                        pass_id += 1;
+                        let range = vad_session.current_speech_range_ms();
+                        audio_start_ms = range.0;
+                        audio_end_ms = range.1;
+                        if is_stopped && trace {
+                            latency_log(&format!(
+                                "event=preview_end session_id={} pass_id={} wall_ms={:.2}",
+                                session_id,
+                                pass_id,
+                                session_at.elapsed().as_secs_f64() * 1000.0
+                            ));
+                        }
+                    }
+                    if trace && (call_at.elapsed().as_millis() >= 10 || pass_executed) {
+                        let usage_after = thread_usage();
+                        latency_log(&format!(
+                            "event=thread_work session_id={} cpu_ms={:.2} minor_faults={} major_faults={}",
+                            session_id,
+                            usage_after.0 - usage_before.0,
+                            usage_after.1 - usage_before.1,
+                            usage_after.2 - usage_before.2
+                        ));
+                        log_kernel_deltas(&kernels_before);
+                        latency_log(&format!("event=process session_id={} pass_id={} audio_start_ms={:.2} audio_end_ms={:.2} wall_ms={:.2} audio_ms={:.2} queue_wait_ms={:.2} backlog_ms={:.2} deferred={} process_ms={:.2} mel_ms={:.2} encoder_ms={:.2} prefill_ms={:.2} decode_ms={:.2}",
+                            session_id, pass_id, audio_start_ms, audio_end_ms,
+                            session_at.elapsed().as_secs_f64()*1000.0, processed_samples as f64 / 16.0, queue_ms,
+                            queued_samples.load(Ordering::Relaxed) as f64 / 16.0, has_audio_backlog,
+                            call_at.elapsed().as_secs_f64()*1000.0,
+                            phases_after[0]-phases_before[0], phases_after[1]-phases_before[1],
+                            phases_after[2]-phases_before[2], phases_after[3]-phases_before[3]));
+                    }
+                    if trace {
+                        for event in &events {
+                            match event {
+                                VadStreamEvent::SpeechStart { audio_ms } => latency_log(&format!(
+                                    "event=speech_start session_id={} wall_ms={:.2} audio_ms={:.2}",
+                                    session_id,
+                                    session_at.elapsed().as_secs_f64() * 1000.0,
+                                    audio_ms
+                                )),
+                                VadStreamEvent::UtteranceEnd { end_audio_ms, .. } => {
+                                    latency_log(&format!(
+                                        "event=endpoint session_id={} wall_ms={:.2} speech_end_audio_ms={:.2}",
+                                        session_id,
+                                        session_at.elapsed().as_secs_f64() * 1000.0,
+                                        end_audio_ms
+                                    ))
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     let mut utterance_ended = false;
                     for event in events {
                         if let VadStreamEvent::UtteranceEnd { text, .. } = event {
@@ -163,7 +413,41 @@ fn start_asr_worker(
                 }
                 VadMsg::Stop { finalize } => {
                     let engine = unsafe { &mut *(engine_addr as *mut crate::c_api::QwenAsrEngine) };
+                    let stop_at = Instant::now();
+                    if trace {
+                        latency_log(&format!(
+                            "event=queued_audio_drained session_id={} wall_ms={:.2}",
+                            session_id,
+                            session_at.elapsed().as_secs_f64() * 1000.0
+                        ));
+                        latency_log(&format!(
+                            "event=native_stop_received session_id={} finalize={} wall_ms={:.2}",
+                            session_id,
+                            finalize,
+                            session_at.elapsed().as_secs_f64() * 1000.0
+                        ));
+                    }
+                    let kernels_before = if trace {
+                        crate::kernels::profile_snapshot()
+                    } else {
+                        Vec::new()
+                    };
+                    let phases_before = phase_times(&engine.ctx);
+                    let mut audio_start_ms = 0.0f64;
+                    let mut audio_end_ms = 0.0f64;
                     if finalize {
+                        pass_id += 1;
+                        let range = vad_session.current_speech_range_ms();
+                        audio_start_ms = range.0;
+                        audio_end_ms = range.1;
+                        if trace {
+                            latency_log(&format!(
+                                "event=final_inference_start session_id={} pass_id={} wall_ms={:.2}",
+                                session_id,
+                                pass_id,
+                                session_at.elapsed().as_secs_f64() * 1000.0
+                            ));
+                        }
                         let vm = java_vm.clone();
                         let lis = listener.clone();
                         let events = vad_session.finish(&mut engine.ctx, |delta| {
@@ -180,6 +464,14 @@ fn start_asr_worker(
                                 }
                             }
                         });
+                        if trace {
+                            latency_log(&format!(
+                                "event=final_inference_end session_id={} pass_id={} wall_ms={:.2}",
+                                session_id,
+                                pass_id,
+                                session_at.elapsed().as_secs_f64() * 1000.0
+                            ));
+                        }
                         for event in events {
                             if let VadStreamEvent::UtteranceEnd { text, .. } = event {
                                 if text != last_hypothesis {
@@ -190,6 +482,14 @@ fn start_asr_worker(
                             }
                         }
                     }
+                    if trace {
+                        log_kernel_deltas(&kernels_before);
+                        let after = phase_times(&engine.ctx);
+                        latency_log(&format!("event=finish session_id={} pass_id={} audio_start_ms={:.2} audio_end_ms={:.2} wall_ms={:.2} finalize_ms={:.2} max_queue_wait_ms={:.2} mel_ms={:.2} encoder_ms={:.2} prefill_ms={:.2} decode_ms={:.2}",
+                            session_id, pass_id, audio_start_ms, audio_end_ms,
+                            session_at.elapsed().as_secs_f64()*1000.0, stop_at.elapsed().as_secs_f64()*1000.0, max_queue_ms,
+                            after[0]-phases_before[0], after[1]-phases_before[1], after[2]-phases_before[2], after[3]-phases_before[3]));
+                    }
                     if let Some(ref dir) = save_audio_dir {
                         if !all_audio_samples.is_empty() {
                             let wav_path = format!("{}/session_audio.wav", dir);
@@ -198,10 +498,18 @@ fn start_asr_worker(
                             }
                         }
                     }
+                    if trace {
+                        crate::kernels::set_profile(false);
+                    }
                     break;
                 }
             }
         }
+        if let Some(handle) = prefetch_handle {
+            let _ = handle.join();
+        }
+        let engine = unsafe { &mut *(engine_addr as *mut crate::c_api::QwenAsrEngine) };
+        engine.ctx.stream_latency_trace = false;
     })
 }
 
@@ -475,20 +783,28 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeStartVadSession(
 
     let (tx, rx) = mpsc::channel();
     let queued_samples = Arc::new(AtomicU64::new(0));
+    let closed = Arc::new(AtomicBool::new(false));
+    let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+    if latency_enabled() {
+        latency_log(&format!("event=session_created session_id={}", session_id));
+    }
     let worker = start_asr_worker(
+        session_id,
         handle as usize,
         Arc::new(java_vm),
         listener_ref,
         rx,
         queued_samples.clone(),
         save_dir_opt.clone(),
+        closed.clone(),
     );
 
     let session = VadAsrSession {
+        session_id,
         engine_addr: handle as usize,
         task_tx: tx,
         queued_samples,
-        closed: AtomicBool::new(false),
+        closed,
         worker: Mutex::new(Some(worker)),
         _save_audio_dir: save_dir_opt,
     };
@@ -523,14 +839,25 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativePushPcm16(
     let sample_count = (byte_count as usize) / 2;
     let samples = std::slice::from_raw_parts(address_ptr as *const i16, sample_count);
 
-    let previous = session.queued_samples.fetch_add(sample_count as u64, Ordering::Relaxed);
+    let previous = session
+        .queued_samples
+        .fetch_add(sample_count as u64, Ordering::Relaxed);
     if previous + sample_count as u64 > MAX_QUEUED_SAMPLES {
-        session.queued_samples.fetch_sub(sample_count as u64, Ordering::Relaxed);
+        session
+            .queued_samples
+            .fetch_sub(sample_count as u64, Ordering::Relaxed);
         return -1;
     }
 
     let samples_f32: Vec<f32> = samples.iter().map(|&s| (s as f32) / 32768.0).collect();
-    if session.task_tx.send(VadMsg::Audio(samples_f32)).is_err() {
+    if session
+        .task_tx
+        .send(VadMsg::Audio {
+            samples: samples_f32,
+            enqueued_at: Instant::now(),
+        })
+        .is_err()
+    {
         return -1;
     }
     1
@@ -549,7 +876,14 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeStopVadSession(
     }
 
     let session = Box::from_raw(session_handle as *mut VadAsrSession);
-    session.closed.store(true, Ordering::Relaxed);
+    let trace = latency_enabled();
+    if trace {
+        latency_log(&format!(
+            "event=native_stop_call session_id={}",
+            session.session_id
+        ));
+    }
+    session.closed.store(true, Ordering::Release);
     let _ = session.task_tx.send(VadMsg::Stop {
         finalize: finalize != JNI_FALSE,
     });
@@ -559,6 +893,12 @@ pub unsafe extern "system" fn Java_com_qwenasr_QAsrEngine_nativeStopVadSession(
     };
     if let Some(handle) = worker_handle {
         let _ = handle.join();
+    }
+    if trace {
+        latency_log(&format!(
+            "event=native_worker_joined session_id={}",
+            session.session_id
+        ));
     }
     let engine = &mut *(session.engine_addr as *mut crate::c_api::QwenAsrEngine);
     let _ = engine.ctx.set_prompt("");
@@ -579,7 +919,7 @@ mod tests {
         assert_eq!(cfg.min_silence_ms, 800);
         assert_eq!(cfg.speech_pad_ms, 180);
         assert_eq!(cfg.speech_tail_pad_ms, 100);
-        assert_eq!(cfg.stream_chunk_sec, 0.60);
+        assert_eq!(cfg.stream_chunk_sec, 0.40);
         assert_eq!(cfg.stream_rollback, 2);
         assert!(cfg.adaptive_drain);
     }

@@ -64,6 +64,7 @@ pub struct QwenCtx {
     pub past_text_conditioning: bool,
     pub skip_silence: bool,
     pub stream_adaptive_drain: bool,
+    pub(crate) stream_latency_trace: bool,
 
     // Optional prompt/language
     pub prompt: Option<String>,
@@ -196,6 +197,7 @@ impl QwenCtx {
             past_text_conditioning: true,
             skip_silence: true,
             stream_adaptive_drain: false,
+            stream_latency_trace: false,
             prompt: None,
             force_language: None,
             chinese_variant: None,

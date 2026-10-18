@@ -43,7 +43,7 @@ impl Default for VadStreamConfig {
             speech_pad_ms: 180,
             speech_tail_pad_ms: 100,
             max_speech_sec: 25.0,
-            stream_chunk_sec: 0.60,
+            stream_chunk_sec: 0.40,
             stream_rollback: 2,
             adaptive_drain: true,
         }
@@ -119,6 +119,18 @@ impl VadStreamSession {
         self.speech_start_sample = 0;
         self.last_speech_frame_sample = 0;
         self.accumulated_full_text.clear();
+    }
+
+    /// Current active speech audio range in milliseconds: (start_ms, end_ms).
+    pub fn current_speech_range_ms(&self) -> (f64, f64) {
+        if self.speech_active || !self.utterance_audio.is_empty() {
+            let start_ms = (self.speech_start_sample as f64 * 1000.0) / SAMPLE_RATE as f64;
+            let end_ms = ((self.speech_start_sample + self.utterance_audio.len()) as f64 * 1000.0)
+                / SAMPLE_RATE as f64;
+            (start_ms, end_ms)
+        } else {
+            (0.0, (self.total_samples_pushed as f64 * 1000.0) / SAMPLE_RATE as f64)
+        }
     }
 
     /// Push incoming 16kHz mono audio slice.

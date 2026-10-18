@@ -815,12 +815,8 @@ impl StreamState {
 }
 
 /// Process all available new audio incrementally.
-///
-/// `samples` is the **full** audio buffer accumulated so far (16 kHz mono f32).
-/// Processes all full chunks from `state.audio_cursor` to end of `samples`.
-/// When `finalize` is true, also processes any remaining partial chunk and
-/// emits all rollback-buffered tokens.
-/// Returns the newly emitted text delta (if any).
+/// `samples` is the full accumulated 16 kHz buffer. Finalization flushes the
+/// remaining partial chunk and rollback-buffered tokens.
 pub fn stream_push_audio(
     ctx: &mut QwenCtx,
     samples: &[f32],
@@ -917,13 +913,16 @@ pub fn stream_push_audio(
 
     // ---- Process full chunks, plus remainder if finalizing ----
     while state.audio_cursor < samples.len() {
+        let checkpoint_cursor = state.audio_cursor;
         let remaining = samples.len() - state.audio_cursor;
         if remaining < chunk_samples && !finalize {
             break; // Wait for more audio
         }
 
         let chunk_t0 = get_time_ms();
-        let step = if ctx.stream_adaptive_drain && remaining >= chunk_samples * 2 {
+        let step = if ctx.stream_adaptive_drain && (finalize || remaining >= chunk_samples * 2) {
+            // No more audio is coming at Stop: finalize the complete tail once,
+            // rather than re-encoding a full chunk and then a short remainder.
             remaining
         } else {
             chunk_samples
@@ -1182,7 +1181,10 @@ pub fn stream_push_audio(
             );
         }
 
-        if ctx.static_prefix_kv_cache.as_ref().map(|cache| &cache.tokens)
+        if ctx
+            .static_prefix_kv_cache
+            .as_ref()
+            .map(|cache| &cache.tokens)
             != Some(&prefix_tokens)
         {
             let (k, v) = ctx.kv_cache.snapshot_prefix(prefix_len);
@@ -1225,8 +1227,12 @@ pub fn stream_push_audio(
         let mut chunk_tokens: Vec<i32> = Vec::new();
         let mut chunk_converted: Vec<Option<String>> = Vec::new();
         let mut n_generated = 0;
+        let mut token_ready_ms = Vec::new();
 
         while n_generated < max_new_tokens {
+            if ctx.stream_latency_trace {
+                token_ready_ms.push(elapsed_ms(t0));
+            }
             n_generated += 1;
             if token == TOKEN_ENDOFTEXT || token == TOKEN_IM_END || token == TOKEN_PIPE {
                 break;
@@ -1258,6 +1264,20 @@ pub fn stream_push_audio(
         ctx.perf_decode_ms += decode_ms;
         ctx.perf_decode_loop_ms += decode_ms;
 
+        #[cfg(feature = "android")]
+        if ctx.stream_latency_trace {
+            let times = token_ready_ms
+                .iter()
+                .map(|ms| format!("{ms:.2}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            crate::jni_api::latency_log(&format!(
+                "event=decode_pass final={} generated={} limit={} prefix_tokens={} new_audio_ms={:.2} reused_prefill={} prefill_rows={} prefill_ms={:.2} decode_ms={:.2} token_ready_ms={}",
+                is_final, chunk_tokens.len(), max_new_tokens, n_prefix_tokens,
+                (state.audio_cursor - checkpoint_cursor) as f64 / 16.0,
+                reused_prefill, prefill_len, prefill_ms, decode_ms, times
+            ));
+        }
         // ---- Update raw token history ----
         state.raw_tokens.truncate(n_prefix_tokens);
         state.raw_converted.truncate(n_prefix_tokens);
@@ -1444,7 +1464,8 @@ pub fn stream_push_audio(
                 if i >= state.stable_text_tokens.len() {
                     state.stable_text_tokens.push(candidate_tokens[i]);
                 }
-                let piece_str: Option<&str> = if let Some(Some(ref s)) = candidate_converted.get(i) {
+                let piece_str: Option<&str> = if let Some(Some(ref s)) = candidate_converted.get(i)
+                {
                     Some(s.as_str())
                 } else if let Some(ref adapter) = ctx.adapter {
                     adapter.convert_token_static(candidate_tokens[i])

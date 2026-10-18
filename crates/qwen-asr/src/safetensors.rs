@@ -356,22 +356,100 @@ impl MultiSafetensors {
         Some(MultiSafetensors { shards })
     }
 
+#[inline]
+unsafe fn madvise_prefetch(data: *mut libc::c_void, length: usize) {
+    #[cfg(target_os = "android")]
+    {
+        const MADV_POPULATE_READ: libc::c_int = 22;
+        let res = libc::madvise(data, length, MADV_POPULATE_READ);
+        if res != 0 {
+            libc::madvise(data, length, libc::MADV_WILLNEED);
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        libc::madvise(data, length, libc::MADV_WILLNEED);
+    }
+}
+
     /// Advise kernel to preload Shard 1 (Encoder: 320 MB) into RAM
     pub fn preload_encoder(&self) {
         #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
         if let Some(shard) = self.shards.first() {
             unsafe {
-                libc::madvise(shard.data as *mut _, shard.file_size, libc::MADV_WILLNEED);
+                Self::madvise_prefetch(shard.data as *mut _, shard.file_size);
             }
         }
     }
 
     /// Advise kernel to preload Shards 2..N (Decoder: 1.64 GB) into RAM
     pub fn preload_decoder(&self) {
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        {
+            let packed = self.shards.iter().any(|shard| {
+                shard.tensors.iter().any(|tensor| {
+                    tensor.name.starts_with("thinker.model.layers.")
+                        && tensor.name.ends_with("_kleidiai_i8mm_packed")
+                })
+            });
+            if packed {
+                let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                if page <= 0 {
+                    self.preload_decoder_legacy();
+                    return;
+                }
+                let page = page as usize;
+                // Small ranges enqueue readahead throughout the actually-used weights,
+                // instead of relying on one advisory request for a ~500 MB shard.
+                // Do not read the large, mostly-unused token embedding table.
+                let batch = (1024 * 1024 / page).max(1) * page;
+                for shard in &self.shards {
+                    let mut ranges: Vec<(usize, usize)> = shard
+                        .tensors
+                        .iter()
+                        .filter(|tensor| {
+                            (tensor.name.starts_with("thinker.model.layers.")
+                                && tensor.name.ends_with("_kleidiai_i8mm_packed"))
+                                || tensor.name == "thinker.lm_head.weight"
+                        })
+                        .map(|tensor| {
+                            let start =
+                                (8 + shard.header_size + tensor.data_offset).min(shard.file_size);
+                            (
+                                start / page * page,
+                                start.saturating_add(tensor.data_size).min(shard.file_size),
+                            )
+                        })
+                        .collect();
+                    ranges.sort_unstable();
+                    let mut advised_until = 0;
+                    for (start, end) in ranges {
+                        let mut cursor = start.max(advised_until);
+                        while cursor < end {
+                            let length = (end - cursor).min(batch);
+                            unsafe {
+                                Self::madvise_prefetch(
+                                    shard.data.add(cursor) as *mut _,
+                                    length,
+                                );
+                            }
+                            cursor += batch;
+                        }
+                        advised_until = advised_until.max(end.div_ceil(page) * page);
+                    }
+                }
+                return;
+            }
+        }
+        self.preload_decoder_legacy();
+    }
+
+    pub(crate) fn preload_decoder_legacy(&self) {
         #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
         for shard in self.shards.iter().skip(1) {
             unsafe {
-                libc::madvise(shard.data as *mut _, shard.file_size, libc::MADV_WILLNEED);
+                Self::madvise_prefetch(shard.data as *mut _, shard.file_size);
             }
         }
     }

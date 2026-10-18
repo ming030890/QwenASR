@@ -282,9 +282,10 @@ fn get_pool() -> &'static Arc<ThreadPool> {
     })
 }
 
-fn pool_worker(pool: Arc<ThreadPool>, tid: usize) {
+fn pool_worker(pool: Arc<ThreadPool>, tid: usize, initial_generation: u64) {
     crate::affinity::ensure_current_thread_pinned();
-    let mut last_gen: u64 = 0;
+    // Helpers added after an earlier dispatch must not execute its expired closure.
+    let mut last_gen = initial_generation;
     loop {
         // Fast path: spin briefly on atomic generation counter
         let mut found = false;
@@ -322,7 +323,9 @@ fn pool_worker(pool: Arc<ThreadPool>, tid: usize) {
             unsafe { core::mem::transmute(pool.fn_call_atomic.load(Ordering::Relaxed)) };
         let n_threads = pool.n_threads_atomic.load(Ordering::Relaxed);
 
-        fn_call(fn_ptr, tid, n_threads);
+        if tid < n_threads {
+            fn_call(fn_ptr, tid, n_threads);
+        }
         pool.done_atomic.fetch_add(1, Ordering::Release);
     }
 }
@@ -335,11 +338,12 @@ fn ensure_workers(pool: &Arc<ThreadPool>, n_threads: usize) {
         return;
     }
     let start = spawned + 1;
+    let initial_generation = pool.gen_atomic.load(Ordering::Acquire);
     for tid in start..n_threads {
         let p = pool.clone();
         thread::Builder::new()
             .name(format!("qwen-worker-{}", tid))
-            .spawn(move || pool_worker(p, tid))
+            .spawn(move || pool_worker(p, tid, initial_generation))
             .expect("failed to spawn worker thread");
     }
     SPAWNED_THREADS.store(n_threads - 1, Ordering::Relaxed);
@@ -437,7 +441,10 @@ fn parallel_for<F: Fn(usize, usize) + Send + Sync>(f: F) {
     f(0, n_threads);
 
     // Wait for workers: spin on atomic done counter
-    let expected = n_threads - 1;
+    // Every spawned worker must acknowledge the dispatch, even when inactive.
+    // Otherwise shrinking the pool can let an inactive worker count as an active
+    // completion and leave the previous closure running after it has been dropped.
+    let expected = SPAWNED_THREADS.load(Ordering::Relaxed);
     loop {
         if pool.done_atomic.load(Ordering::Acquire) >= expected {
             break;
@@ -1333,6 +1340,14 @@ pub fn linear_nobias_int8_kleidiai(
     linear_int8_kleidiai_shared(&mut [(y, rhs_packed, out_dim)], x, seq_len, in_dim);
 }
 
+#[cfg(feature = "kleidiai")]
+static KLEIDIAI_MATVEC_ENABLED: AtomicBool = AtomicBool::new(true);
+
+#[cfg(feature = "kleidiai")]
+pub(crate) fn set_kleidiai_matvec_enabled(enabled: bool) {
+    KLEIDIAI_MATVEC_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
 /// Quantize/pack one activation matrix and reuse it for independent projections.
 #[cfg(feature = "kleidiai")]
 pub fn linear_int8_kleidiai_shared(
@@ -1341,9 +1356,38 @@ pub fn linear_int8_kleidiai_shared(
     seq_len: usize,
     in_dim: usize,
 ) {
+    linear_int8_kleidiai_impl(
+        projections,
+        x,
+        seq_len,
+        in_dim,
+        seq_len == 1 && KLEIDIAI_MATVEC_ENABLED.load(Ordering::Relaxed),
+    );
+}
+
+#[cfg(feature = "kleidiai")]
+fn linear_int8_kleidiai_impl(
+    projections: &mut [(&mut [f32], &[i8], usize)],
+    x: &[f32],
+    seq_len: usize,
+    in_dim: usize,
+    use_matvec: bool,
+) {
     use std::ffi::c_void;
 
     unsafe extern "C" {
+        fn kai_run_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod(
+            m: usize,
+            n: usize,
+            k: usize,
+            lhs_packed: *const c_void,
+            rhs_packed: *const c_void,
+            dst: *mut f32,
+            dst_stride_row: usize,
+            dst_stride_col: usize,
+            scalar_min: f32,
+            scalar_max: f32,
+        );
         fn kai_get_mr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm() -> usize;
         fn kai_get_kr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm() -> usize;
         fn kai_get_sr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm() -> usize;
@@ -1390,7 +1434,19 @@ pub fn linear_int8_kleidiai_shared(
     }
 
     unsafe {
-        let mr = kai_get_mr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm();
+        // The RHS layout (nr=4, kr=8, sr=1, K padded to 32) is shared.
+        // Only the LHS needs mr=1 packing for single-token SDOT; packing it as
+        // mr=4 and running the 16-row I8MM kernel wastes work on decode.
+        let mr = if use_matvec {
+            1
+        } else {
+            kai_get_mr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm()
+        };
+        let run = if use_matvec {
+            kai_run_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod
+        } else {
+            kai_run_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm
+        };
         let kr = kai_get_kr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm();
         let sr = kai_get_sr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm();
         let lhs_size =
@@ -1414,7 +1470,8 @@ pub fn linear_int8_kleidiai_shared(
         let n_threads = get_num_threads();
         for (y, rhs_packed, out_dim) in projections.iter_mut() {
             let out_dim = *out_dim;
-            if seq_len >= 16 && n_threads > 1 {
+            let parallel_matvec = use_matvec && in_dim.saturating_mul(out_dim) >= 1_048_576;
+            if n_threads > 1 && (seq_len >= 16 || parallel_matvec) {
                 let y_ptr = y.as_mut_ptr() as usize;
                 let rhs_ptr = rhs_packed.as_ptr() as usize;
                 let lhs_ptr = lhs_packed.as_ptr() as usize;
@@ -1438,7 +1495,7 @@ pub fn linear_int8_kleidiai_shared(
                     let local_rhs = (rhs_ptr as *const u8).add(rhs_offset);
                     let local_dst = (y_ptr as *mut f32).add(n_start);
 
-                    kai_run_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm(
+                    run(
                         seq_len,
                         n_actual,
                         in_dim,
@@ -1452,7 +1509,7 @@ pub fn linear_int8_kleidiai_shared(
                     );
                 });
             } else {
-                kai_run_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm(
+                run(
                     seq_len,
                     out_dim,
                     in_dim,
@@ -3220,6 +3277,37 @@ mod tests {
             0,
         );
         assert_eq!(threaded, reference);
+        set_threads(1);
+    }
+}
+
+#[cfg(all(test, feature = "kleidiai", target_arch = "aarch64"))]
+#[path = "kleidiai_matvec_tests.rs"]
+mod kleidiai_matvec_tests;
+
+#[cfg(test)]
+mod pool_resize_tests {
+    use super::*;
+    #[test]
+    fn shrinking_pool_waits_for_active_workers_and_dispatches_each_item_once() {
+        for threads in [2, 4, 2, 1, 3, 1, 4, 2] {
+            set_threads(threads);
+            for _ in 0..32 {
+                let counters: Vec<AtomicUsize> = (0..257).map(|_| AtomicUsize::new(0)).collect();
+                parallel_for(|tid, count| {
+                    assert!(tid < count);
+                    if tid + 1 == count {
+                        std::thread::yield_now();
+                    }
+                    for index in (tid..counters.len()).step_by(count) {
+                        counters[index].fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+                assert!(counters
+                    .iter()
+                    .all(|counter| counter.load(Ordering::Relaxed) == 1));
+            }
+        }
         set_threads(1);
     }
 }
