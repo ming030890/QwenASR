@@ -1,7 +1,7 @@
 //! Shared V2 causal CNN. INT8 matrices stay quantized; clients share weights.
 //! Context is BOS + the last 32 canonical tokens, exactly as in V2 evaluation.
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -24,9 +24,19 @@ impl Tensor {
         (0..self.shape[0]).map(|i|crate::dot(&self.q[i*n..(i+1)*n],x)*self.scale+bias.values[i]).collect()
     }
 }
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnglishSuggestion {
+    pub word: String, pub score: f32, pub edits: u8, pub completed_chars: usize,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnglishSuggestions {
+    pub candidates: Vec<EnglishSuggestion>, pub correction: Option<String>, pub known: bool,
+}
 struct Weights {
     raw: Box<[u8]>, tokens: Vec<String>, ids: HashMap<String,usize>, english: Regex,
-    words: HashSet<usize>, embedding: usize, ffn: usize, dilations: Vec<usize>,
+    spellings: Vec<(String, Vec<usize>)>, words: HashSet<usize>, embedding: usize, ffn: usize, dilations: Vec<usize>,
     tensors: HashMap<String,Tensor>,
 }
 static SHARED: OnceLock<Mutex<Weak<Weights>>> = OnceLock::new();
@@ -98,7 +108,13 @@ impl CnnLanguageModel {
             return Err("Overlapping or trailing CNN weights".into());
         }
         if meta.english_word_ids.iter().any(|&id|id>=meta.vocab_size) {return Err("Invalid English word IDs".into());}
-        Ok(Weights {raw:bytes.into(),tokens:meta.tokens,ids,words:meta.english_word_ids.into_iter().collect(),
+        let mut spellings: std::collections::BTreeMap<String,Vec<usize>>=std::collections::BTreeMap::new();
+        for &id in &meta.english_word_ids {
+            if let Some(word)=crate::cnn_spelling::canonical(&meta.tokens[id]) {
+                spellings.entry(word).or_default().push(id);
+            }
+        }
+        Ok(Weights {raw:bytes.into(),tokens:meta.tokens,ids,spellings:spellings.into_iter().collect(),words:meta.english_word_ids.into_iter().collect(),
             english:Regex::new(r"^[A-Za-z0-9]+(?:['’\-][A-Za-z0-9]+)*").unwrap(),
             embedding:meta.embed_dim,ffn:meta.ffn_dim,dilations:meta.dilations,tensors})
     }
@@ -187,6 +203,45 @@ impl CnnLanguageModel {
     }
     pub fn completions(&mut self,left:&str,prefix:&str,limit:usize)->Result<Vec<crate::TokenPrediction>,String> {
         self.suggest(left,prefix,limit,true)
+    }
+    /// Enumerate the spelling neighborhood before LM ranking, so lexical order or
+    /// corpus frequency cannot prune a plausible correction out of the pool.
+    pub fn english_suggestions(&mut self,left:&str,typed:&str,limit:usize)->Result<EnglishSuggestions,String> {
+        let Some(input)=crate::cnn_spelling::canonical(typed) else {
+            return Ok(EnglishSuggestions {candidates:vec![],correction:None,known:false});
+        };
+        let radius=if input.len()>=5 {2}else{1};
+        let mut pool=Vec::new();
+        let mut known=false;
+        for (word,ids) in &self.weights.spellings {
+            if word==&input {known=true;continue;}
+            let completion=word.starts_with(&input);
+            let edits=if completion {0}else {
+                match crate::cnn_spelling::distance(input.as_bytes(),word.as_bytes(),radius) {
+                    Some(n)=>n,None=>continue
+                }
+            };
+            pool.push((word.clone(),ids.clone(),edits,if completion {word.len()-input.len()}else{0}));
+        }
+        let context=self.context(left);
+        let logp=self.log_probabilities(&context)?;
+        let mut ranked:Vec<_>=pool.into_iter().map(|(_word,ids,edits,completed_chars)| {
+            let id=ids.into_iter().max_by(|&a,&b|logp[a].total_cmp(&logp[b]).then(b.cmp(&a))).unwrap();
+            // A simple edit-channel prior, not a second spelling model or a
+            // calibrated confidence probability. Exact-prefix completions cost no edits.
+            EnglishSuggestion {word:self.weights.tokens[id].clone(),score:logp[id]-2.*edits as f32,
+                edits,completed_chars}
+        }).collect();
+        ranked.sort_by(|a,b|b.score.total_cmp(&a.score).then(a.word.cmp(&b.word)));
+        let correction=ranked.first().filter(|best| {
+            !known && input.len()>=3 && best.edits==1 && best.completed_chars==0 &&
+            // Retain uncertain input and valid in-vocabulary spellings. For a
+            // sole alternative require useful absolute LM support as well.
+            best.score+2.*best.edits as f32>=0.0001f32.ln() &&
+            ranked.get(1).map_or(true,|runner|best.score-runner.score>=if left.trim().is_empty() {6.} else {4.})
+        }).map(|best|best.word.clone());
+        ranked.truncate(limit);
+        Ok(EnglishSuggestions {candidates:ranked,correction,known})
     }
     fn suggest(&mut self,left:&str,prefix:&str,limit:usize,english_only:bool)->Result<Vec<crate::TokenPrediction>,String> {
         let ids=self.context(left);

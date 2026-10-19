@@ -39,7 +39,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ids = if let Some(raw) = x["context_ids"].as_array() {
             raw.iter().map(|v| v.as_u64().unwrap() as usize).collect()
         } else { lm.context(left, right) };
-        let mut result = if let Some(code) = x["code"].as_str() {
+        let mut result = if let Some(typed) = x["typed"].as_str() {
+            serde_json::to_value(lm.english_suggestions(left,typed,8).map_err(io::Error::other)?)?
+        } else if let Some(code) = x["code"].as_str() {
             let engine = quick.as_mut().ok_or("Quick assets required")?;
             let mode = format!("{:?}", engine.lm.mode(left, right));
             let c = engine

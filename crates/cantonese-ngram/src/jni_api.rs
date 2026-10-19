@@ -51,6 +51,25 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_SharedLm
     }
 }
 
+/// Typo generation and contextual ranking use the same vocabulary/weights as Quick.
+#[no_mangle]
+pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_SharedLmEnglishEngine_nativeSuggest(
+    mut env:JNIEnv,_class:JClass,handle:jlong,left:JString,typed:JString,
+) -> jstring {
+    let result=(||->Result<String,String> {
+        let left:String=env.get_string(&left).map_err(|e|e.to_string())?.into();
+        let typed:String=env.get_string(&typed).map_err(|e|e.to_string())?.into();
+        let engine=engines().lock().map_err(|_|"Registry poisoned")?.get(&handle).cloned().ok_or("Closed shared engine")?;
+        let mut engine=engine.lock().map_err(|_|"Shared engine poisoned")?;
+        let model=engine.lm.neural.as_mut().ok_or("Shared model missing")?;
+        serde_json::to_string(&model.english_suggestions(&left,&typed,8)?).map_err(|e|e.to_string())
+    })();
+    match result {
+        Ok(json)=>env.new_string(json).map(|s|s.into_raw()).unwrap_or(std::ptr::null_mut()),
+        Err(error)=>{let _=env.throw_new("java/lang/IllegalStateException",error);std::ptr::null_mut()}
+    }
+}
+
 pub(crate) fn mixed_candidate_order(handle: i64, left: &str, right: &str, words: &[String]) -> Option<Vec<usize>> {
     let engine = engines().lock().ok()?.get(&handle)?.clone();
     let mut engine = engine.lock().ok()?;

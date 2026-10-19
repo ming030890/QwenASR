@@ -21,7 +21,18 @@ fn main()->Result<(),Box<dyn std::error::Error>> {
     let next=cached.completions("I said ","",8)?;
     assert!(!next.is_empty());
     assert!(next.iter().all(|p|p.token.is_ascii()));
+    let mut spelling=Vec::new();
+    for (left,typed,expected) in [("how are ","yiu","you"),("the screen is ","briken","broken"),
+        ("I said ","helllo","hello"),("I use a ","keybord","keyboard"),("I read ","teh","the")] {
+        let started=std::time::Instant::now();
+        let result=cached.english_suggestions(left,typed,8)?;
+        assert!(result.candidates.iter().any(|c|c.word.eq_ignore_ascii_case(expected)),"Missing {typed} -> {expected}: {result:?}");
+        spelling.push(serde_json::json!({"left":left,"typed":typed,"result":result,"elapsed_ms":started.elapsed().as_secs_f64()*1000.}));
+    }
+    for word in ["keyboard","hello","you","world","Xentara","bokeh","Alstom"] {
+        assert!(cached.english_suggestions("I said ",word,8)?.correction.is_none(),"Changed {word}");
+    }
     println!("{}",serde_json::json!({"passed":true,"weights_shared":true,"cache_edit_max_difference":max,
-        "prefix_candidates":prefixes,"english_next_words":next}));
+        "prefix_candidates":prefixes,"english_next_words":next,"spelling_cases":spelling}));
     Ok(())
 }
