@@ -2,6 +2,7 @@
 use crate::{memory::MemoryLanguageModel, LanguageModel, TokenPrediction};
 
 pub enum NeuralLanguageModel {
+    Cnn(crate::cnn::CnnLanguageModel),
     Dense(LanguageModel),
     Memory(MemoryLanguageModel),
 }
@@ -12,26 +13,29 @@ impl From<LanguageModel> for NeuralLanguageModel {
 }
 impl NeuralLanguageModel {
     pub fn has_byte_fallback(&self)->bool {
-        match self {Self::Dense(m)=>m.tokenizer.has_byte_fallback(),Self::Memory(_)=>false}
+        match self {Self::Cnn(_)=>true,Self::Dense(m)=>m.tokenizer.has_byte_fallback(),Self::Memory(_)=>false}
     }
     pub fn tokenize(&self,text:&str)->Vec<usize> {
-        match self { Self::Dense(m)=>m.tokenizer.tokenize(text),Self::Memory(m)=>m.tokenize(text) }
+        match self { Self::Cnn(m)=>m.tokenize_with_units(text).0,Self::Dense(m)=>m.tokenizer.tokenize(text),Self::Memory(m)=>m.tokenize(text) }
     }
     pub fn tokenize_with_units(&self,text:&str)->(Vec<usize>,usize) {
         match self {
+            Self::Cnn(m)=>m.tokenize_with_units(text),
             Self::Dense(m)=>m.tokenizer.tokenize_with_units(text),
             // Legacy memory tokenization has no byte expansion.
             Self::Memory(m)=>{let tokens=m.tokenize(text);let units=tokens.len();(tokens,units)}
         }
     }
     pub fn token(&self, id: usize) -> Option<&str> {
-        match self { Self::Dense(m) => m.tokens.get(id).map(String::as_str), Self::Memory(m) => m.token(id) }
+        match self { Self::Cnn(m)=>m.token(id),Self::Dense(m) => m.tokens.get(id).map(String::as_str), Self::Memory(m) => m.token(id) }
     }
     pub fn vocabulary_size(&self) -> usize {
-        match self { Self::Dense(m) => m.tokens.len(), Self::Memory(m) => m.vocabulary_size() }
+        match self { Self::Cnn(m)=>m.vocabulary_size(),Self::Dense(m) => m.tokens.len(), Self::Memory(m) => m.vocabulary_size() }
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.starts_with(b"CNG2") {
+        if bytes.starts_with(b"KBCNN01\0") {
+            crate::cnn::CnnLanguageModel::from_bytes(bytes).map(Self::Cnn)
+        } else if bytes.starts_with(b"CNG2") {
             MemoryLanguageModel::from_bytes(bytes).map(Self::Memory)
         } else {
             LanguageModel::from_bytes(bytes).map(Self::Dense)
@@ -39,42 +43,49 @@ impl NeuralLanguageModel {
     }
     pub fn minimum_context_tokens(&self) -> usize {
         match self {
+            Self::Cnn(_)=>0,
             Self::Dense(m) => if m.neural_short_contexts { 0 } else { 2 },
             Self::Memory(_) => 1,
         }
     }
     pub fn supports_context(&self, ids: &[usize]) -> bool {
         match self {
+            Self::Cnn(m)=>ids.len()<=33 && ids.iter().all(|&id|id<m.vocabulary_size()),
             Self::Dense(m) => m.neural_short_contexts || ids.iter().filter(|&&id| id >= 3).count() >= 2,
             Self::Memory(m) => m.supports_context(ids),
         }
     }
     pub fn token_id(&self, token: &str) -> Option<usize> {
         match self {
+            Self::Cnn(m)=>m.token_id(token),
             Self::Dense(m) => m.tokenizer.id(token),
             Self::Memory(m) => m.token_id(token),
         }
     }
     pub fn supports_candidate(&self, ids: &[usize], id: usize) -> bool {
         match self {
+            Self::Cnn(m)=>id>=8 && id<m.vocabulary_size(),
             Self::Dense(m) => id >= 3 && id < m.tokens.len(),
             Self::Memory(m) => m.supports_candidate(ids, id),
         }
     }
     pub fn context(&self, left: &str, right: &str) -> Vec<usize> {
         match self {
+            Self::Cnn(m)=>m.context(left),
             Self::Dense(m) => m.context(left, right),
             Self::Memory(m) => m.context(left, right),
         }
     }
     pub fn context_lengths(&self) -> (usize, usize) {
         match self {
+            Self::Cnn(_)=>(32,0),
             Self::Dense(m) => m.context_lengths(),
             Self::Memory(_) => (8, 4),
         }
     }
     pub fn scores(&mut self, ids: &[usize], candidates: &[usize]) -> Result<Vec<f32>, String> {
         match self {
+            Self::Cnn(m)=>m.scores(ids,candidates),
             Self::Dense(m) => m.scores(ids, candidates),
             Self::Memory(m) => m.scores(ids, candidates),
         }
@@ -86,6 +97,7 @@ impl NeuralLanguageModel {
         limit: usize,
     ) -> Result<Vec<TokenPrediction>, String> {
         match self {
+            Self::Cnn(m)=>m.predict(left,"",limit),
             Self::Dense(m) => m.predict(left, right, limit),
             Self::Memory(m) => m.predict(left, right, limit),
         }
@@ -96,10 +108,30 @@ impl NeuralLanguageModel {
         right: &str,
         candidates: &[String],
     ) -> Result<Vec<usize>, String> {
+        if matches!(self,Self::Cnn(_)) {
+            let scores=score_sequences(self,left,right,candidates)?;
+            let mut order:Vec<_>=(0..candidates.len()).collect();
+            order.sort_by(|&a,&b|scores[b].log_probability.total_cmp(&scores[a].log_probability).then(a.cmp(&b)));
+            return Ok(order);
+        }
         match self {
+            Self::Cnn(_)=>unreachable!(),
             Self::Dense(m) => m.rank(left, right, candidates),
             Self::Memory(m) => m.rank(left, right, candidates),
         }
+    }
+    pub fn completions(&mut self,left:&str,prefix:&str,limit:usize)->Result<Vec<TokenPrediction>,String> {
+        match self {Self::Cnn(m)=>m.completions(left,prefix,limit),_=>Err("Shared CNN required for completions".into())}
+    }
+    pub fn log_probabilities(&mut self,ids:&[usize])->Result<Vec<f32>,String> {
+        if let Self::Cnn(m)=self {return m.log_probabilities(ids);}
+        let targets:Vec<_>=(3..self.vocabulary_size()).filter(|&id|self.supports_candidate(ids,id)).collect();
+        let logits=self.scores(ids,&targets)?;
+        let max=logits.iter().copied().fold(f32::NEG_INFINITY,f32::max);
+        let z=max+logits.iter().map(|v|(v-max).exp()).sum::<f32>().ln();
+        let mut values=vec![f32::NEG_INFINITY;self.vocabulary_size()];
+        for (id,score) in targets.into_iter().zip(logits) {values[id]=score-z;}
+        Ok(values)
     }
 }
 
@@ -127,7 +159,6 @@ pub fn score_sequences(model:&mut NeuralLanguageModel,left:&str,right:&str,candi
     if candidates.len()>128 {return Err("Too many sequence candidates".into());}
     let (nleft,nright)=model.context_lengths();
     let initial=model.context(left,right);
-    let all:Vec<_>=(3..model.vocabulary_size()).collect();
     // Group every requested token by its exact context before inference. The old
     // 16-distribution cache cleared the common initial context whenever many
     // byte-fallback spellings filled it, repeating full-vocabulary projections.
@@ -163,10 +194,8 @@ pub fn score_sequences(model:&mut NeuralLanguageModel,left:&str,right:&str,candi
             logical_units,tokens:tokens.len(),supported,spelling_log_probability:None,spelling_characters:None});
     }
     for (context,targets) in groups {
-        let scores=model.scores(&context,&all)?;
-        let max=scores.iter().copied().fold(f32::NEG_INFINITY,f32::max);
-        let z=max+scores.iter().map(|v|(v-max).exp()).sum::<f32>().ln();
-        for (candidate,position,token) in targets {paths[candidate][position]=scores[token-3]-z;}
+        let scores=model.log_probabilities(&context)?;
+        for (candidate,position,token) in targets {paths[candidate][position]=scores[token];}
     }
     for (row,path) in result.iter_mut().zip(paths) {
         if row.supported {

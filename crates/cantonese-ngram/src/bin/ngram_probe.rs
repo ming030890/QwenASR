@@ -73,14 +73,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|v| v.as_u64().unwrap() as usize)
                 .collect();
             if x["distribution"].as_bool().unwrap_or(false) {
-                let all: Vec<_> = (3..lm.vocabulary_size()).collect();
-                let scores = lm.scores(&ids, &all).map_err(io::Error::other)?;
-                let max = scores.iter().copied().fold(f32::NEG_INFINITY,f32::max);
-                let logsum = max + scores.iter().map(|v| (v-max).exp()).sum::<f32>().ln();
-                let probabilities: Vec<_> = targets.iter().map(|&id| if id>=3 && id<lm.vocabulary_size() { scores[id-3]-logsum } else { -1e4 }).collect();
+                let scores = lm.log_probabilities(&ids).map_err(io::Error::other)?;
+                let probabilities: Vec<_> = targets.iter().map(|&id| if id<lm.vocabulary_size() { scores[id] } else { -1e4 }).collect();
                 let mut order: Vec<_> = (0..scores.len()).collect();
                 order.sort_unstable_by(|&a,&b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
-                let top3: Vec<_> = order.iter().take(3).map(|i| i+3).collect();
+                let top3: Vec<_> = order.iter().take(3).copied().collect();
                 serde_json::json!({"context_ids":ids,"log_probs":probabilities,"top3":top3})
             } else {
                 let scores = lm.scores(&ids, &targets).map_err(io::Error::other)?;

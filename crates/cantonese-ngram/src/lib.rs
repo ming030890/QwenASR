@@ -3,6 +3,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 pub mod counts;
+pub mod cnn;
 pub mod english;
 pub mod hwr;
 pub mod hybrid;
@@ -115,12 +116,15 @@ fn dot(q: &[i8], x: &[f32]) -> f32 {
     }
 }
 fn norm(x: &[f32], weight: &Tensor, bias: &Tensor) -> Vec<f32> {
+    norm_values(x, &weight.values, &bias.values)
+}
+fn norm_values(x: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
     let mean = x.iter().sum::<f32>() / x.len() as f32;
     let variance = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / x.len() as f32;
     let inverse = (variance + 1e-5).sqrt().recip();
     x.iter()
         .enumerate()
-        .map(|(i, &v)| (v - mean) * inverse * weight.values[i] + bias.values[i])
+        .map(|(i, &v)| (v - mean) * inverse * weight[i] + bias[i])
         .collect()
 }
 fn floats(bytes: &[u8]) -> Result<Vec<f32>, String> {

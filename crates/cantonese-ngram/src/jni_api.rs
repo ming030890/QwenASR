@@ -21,10 +21,64 @@ fn engines() -> &'static Mutex<HashMap<i64, Arc<Mutex<QuickEngine>>>> {
     ENGINES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// English prefix completion shares the Quick engine's model and inference state.
+#[no_mangle]
+pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_SharedLmEnglishEngine_nativeComplete(
+    mut env:JNIEnv,_class:JClass,handle:jlong,left:JString,prefix:JString,
+) -> jobject {
+    let result=(||->Result<Vec<String>,String> {
+        let left:String=env.get_string(&left).map_err(|e|e.to_string())?.into();
+        let prefix:String=env.get_string(&prefix).map_err(|e|e.to_string())?.into();
+        if prefix.len()>128 {return Err("English prefix too long".into());}
+        let engine=engines().lock().map_err(|_|"Registry poisoned")?.get(&handle).cloned().ok_or("Closed shared engine")?;
+        let mut engine=engine.lock().map_err(|_|"Shared engine poisoned")?;
+        let model=engine.lm.neural.as_mut().ok_or("Shared model missing")?;
+        Ok(model.completions(&left,&prefix,8)?.into_iter().map(|p|p.token).collect())
+    })();
+    match result {
+        Ok(values)=>{
+            let array=match env.new_object_array(values.len() as i32,"java/lang/String",jni::objects::JObject::null()) {
+                Ok(a)=>a,Err(_)=>return std::ptr::null_mut()
+            };
+            for (i,value) in values.iter().enumerate() {
+                let Ok(s)=env.new_string(value) else {return std::ptr::null_mut();};
+                if env.set_object_array_element(&array,i as i32,&s).is_err() {return std::ptr::null_mut();}
+                let _=env.delete_local_ref(s);
+            }
+            array.into_raw()
+        },
+        Err(error)=>{let _=env.throw_new("java/lang/IllegalStateException",error);std::ptr::null_mut()}
+    }
+}
+
 pub(crate) fn mixed_candidate_order(handle: i64, left: &str, right: &str, words: &[String]) -> Option<Vec<usize>> {
     let engine = engines().lock().ok()?.get(&handle)?.clone();
     let mut engine = engine.lock().ok()?;
     crate::quick::rank_mixed(&mut engine.lm, left, right, words).ok()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_SharedLmEnglishEngine_nativeRank(
+    mut env:JNIEnv,_class:JClass,handle:jlong,left:JString,right:JString,words:jni::objects::JObjectArray,
+) -> jstring {
+    let result=(||->Result<String,String> {
+        let left:String=env.get_string(&left).map_err(|e|e.to_string())?.into();
+        let right:String=env.get_string(&right).map_err(|e|e.to_string())?.into();
+        let n=env.get_array_length(&words).map_err(|e|e.to_string())?;
+        if n>128 {return Err("Too many candidates".into());}
+        let mut candidates=Vec::new();
+        for i in 0..n {
+            let value=JString::from(env.get_object_array_element(&words,i).map_err(|e|e.to_string())?);
+            candidates.push(env.get_string(&value).map_err(|e|e.to_string())?.into());
+            env.delete_local_ref(value).map_err(|e|e.to_string())?;
+        }
+        let order=mixed_candidate_order(handle,&left,&right,&candidates).ok_or("Shared model unavailable")?;
+        serde_json::to_string(&order).map_err(|e|e.to_string())
+    })();
+    match result {
+        Ok(json)=>env.new_string(json).map(|s|s.into_raw()).unwrap_or(std::ptr::null_mut()),
+        Err(error)=>{let _=env.throw_new("java/lang/IllegalStateException",error);std::ptr::null_mut()}
+    }
 }
 
 #[no_mangle]

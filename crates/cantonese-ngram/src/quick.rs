@@ -306,15 +306,7 @@ impl QuickEngine {
 
 fn neural_log_probabilities(neural: &mut crate::NeuralLanguageModel, left: &str, right: &str) -> Result<Vec<f32>, String> {
     let ids = neural.context(left, right);
-    let targets: Vec<_> = (3..neural.vocabulary_size()).filter(|&id| neural.supports_candidate(&ids, id)).collect();
-    if targets.is_empty() { return Err("No supported LM hypotheses".into()); }
-    let logits = neural.scores(&ids, &targets)?;
-    if logits.iter().any(|v| !v.is_finite()) { return Err("Nonfinite LM probabilities".into()); }
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let logsum = max + logits.iter().map(|v| (v - max).exp()).sum::<f32>().ln();
-    let mut values = vec![f32::NEG_INFINITY; neural.vocabulary_size()];
-    for (id, score) in targets.into_iter().zip(logits) { values[id] = score - logsum; }
-    Ok(values)
+    neural.log_probabilities(&ids)
 }
 
 // Banded edit distance against English LM-token prefixes. The LM supplies their
@@ -424,16 +416,7 @@ fn sequence_scores(
         let ids = neural.context(left, right);
         let hit = distribution_cache.as_ref().map(|(cached_ids, _)| cached_ids == &ids).unwrap_or(false);
         if !hit {
-            let targets: Vec<_> = (3..neural.vocabulary_size())
-                .filter(|&id| neural.supports_candidate(&ids, id))
-                .collect();
-            let logits = neural.scores(&ids, &targets)?;
-            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let logsum = max + logits.iter().map(|v| (v - max).exp()).sum::<f32>().ln();
-            let mut values = vec![f32::NEG_INFINITY; neural.vocabulary_size()];
-            for (id, score) in targets.into_iter().zip(logits) {
-                values[id] = score - logsum;
-            }
+            let values = neural.log_probabilities(&ids)?;
             *distribution_cache = Some((ids.clone(), values));
         }
         let values = &distribution_cache.as_ref().unwrap().1;
