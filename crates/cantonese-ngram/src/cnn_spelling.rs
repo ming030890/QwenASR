@@ -8,7 +8,8 @@ pub fn canonical(word: &str) -> Option<String> {
 
 /// Optimal string alignment: insertion, deletion, substitution, adjacent swap.
 pub fn distance(input: &[u8], word: &[u8], radius: usize) -> Option<u8> {
-    if input.is_empty() || input.len() > 32 || word.len() > 32 || input.len().abs_diff(word.len()) > radius {
+    let len_diff = input.len().abs_diff(word.len());
+    if input.is_empty() || input.len() > 32 || word.len() > 32 || len_diff > 1 || len_diff > radius {
         return None;
     }
     let mut previous = [0u8; 33];
@@ -29,6 +30,45 @@ pub fn distance(input: &[u8], word: &[u8], radius: usize) -> Option<u8> {
         previous = current;
     }
     (previous[input.len()] as usize <= radius).then_some(previous[input.len()])
+}
+
+pub fn qwerty_adjacent(a: u8, b: u8) -> bool {
+    const ROWS: [&[u8]; 3] = [b"qwertyuiop", b"asdfghjkl", b"zxcvbnm"];
+    let pos = |c: u8| -> Option<(usize, usize)> {
+        for (r, row) in ROWS.iter().enumerate() {
+            if let Some(col) = row.iter().position(|&k| k == c) {
+                return Some((r, col));
+            }
+        }
+        None
+    };
+    match (pos(a), pos(b)) {
+        (Some((r1, c1)), Some((r2, c2))) => a != b && r1.abs_diff(r2) <= 1 && c1.abs_diff(c2) <= 1,
+        _ => false,
+    }
+}
+
+pub fn edit_penalty(input: &[u8], word: &[u8], edits: u8) -> f32 {
+    if edits == 0 {
+        return 0.0;
+    }
+    if input.len() == word.len() {
+        let mut adj = 0;
+        let mut non_adj = 0;
+        for (&a, &b) in input.iter().zip(word.iter()) {
+            if a != b {
+                if qwerty_adjacent(a, b) {
+                    adj += 1;
+                } else {
+                    non_adj += 1;
+                }
+            }
+        }
+        if (adj + non_adj) as u8 == edits {
+            return adj as f32 * 1.0 + non_adj as f32 * 2.0;
+        }
+    }
+    edits as f32 * 1.5
 }
 
 #[cfg(test)]

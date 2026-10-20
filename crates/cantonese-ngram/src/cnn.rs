@@ -210,7 +210,7 @@ impl CnnLanguageModel {
         let Some(input)=crate::cnn_spelling::canonical(typed) else {
             return Ok(EnglishSuggestions {candidates:vec![],correction:None,known:false});
         };
-        let radius=if input.len()>=5 {2}else{1};
+        let radius=if input.len()>=6 {3}else if input.len()>=4 {2}else{1};
         let mut pool=Vec::new();
         let mut known=false;
         for (word,ids) in &self.weights.spellings {
@@ -225,20 +225,41 @@ impl CnnLanguageModel {
         }
         let context=self.context(left);
         let logp=self.log_probabilities(&context)?;
-        let mut ranked:Vec<_>=pool.into_iter().map(|(_word,ids,edits,completed_chars)| {
+        let mut ranked:Vec<_>=pool.into_iter().map(|(word,ids,edits,completed_chars)| {
             let id=ids.into_iter().max_by(|&a,&b|logp[a].total_cmp(&logp[b]).then(b.cmp(&a))).unwrap();
-            // A simple edit-channel prior, not a second spelling model or a
-            // calibrated confidence probability. Exact-prefix completions cost no edits.
-            EnglishSuggestion {word:self.weights.tokens[id].clone(),score:logp[id]-2.*edits as f32,
+            let penalty = if completed_chars > 0 {
+                completed_chars as f32 * 0.5
+            } else {
+                crate::cnn_spelling::edit_penalty(input.as_bytes(), word.as_bytes(), edits)
+            };
+            EnglishSuggestion {word:self.weights.tokens[id].clone(),score:logp[id]-penalty,
                 edits,completed_chars}
         }).collect();
         ranked.sort_by(|a,b|b.score.total_cmp(&a.score).then(a.word.cmp(&b.word)));
         let correction=ranked.first().filter(|best| {
-            !known && input.len()>=3 && best.edits==1 && best.completed_chars==0 &&
-            // Retain uncertain input and valid in-vocabulary spellings. For a
-            // sole alternative require useful absolute LM support as well.
-            best.score+2.*best.edits as f32>=0.0001f32.ln() &&
-            ranked.get(1).map_or(true,|runner|best.score-runner.score>=if left.trim().is_empty() {6.} else {4.})
+            if known || input.len() < 3 || best.completed_chars > 0 || best.word.len() < 3 {
+                return false;
+            }
+            let len_diff = input.len().abs_diff(best.word.len());
+            if best.edits >= 2 && len_diff > 0 {
+                return false;
+            }
+            if input.len() <= 3 && best.word.len() < input.len() {
+                return false;
+            }
+            let max_allowed_edits = if input.len() >= 6 { 3 } else if input.len() >= 5 { 2 } else { 1 };
+            if best.edits > max_allowed_edits {
+                return false;
+            }
+            if best.score < -24.0 {
+                return false;
+            }
+            let margin = if left.trim().is_empty() {
+                if best.edits == 1 { 1.2 } else { 1.8 }
+            } else {
+                if best.edits == 1 { 0.8 } else { 1.4 }
+            };
+            ranked.get(1).map_or(true, |runner| best.score - runner.score >= margin)
         }).map(|best|best.word.clone());
         ranked.truncate(limit);
         Ok(EnglishSuggestions {candidates:ranked,correction,known})
