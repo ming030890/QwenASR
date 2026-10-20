@@ -107,6 +107,42 @@ pub struct QuickEngine {
     distribution_cache: Option<(Vec<usize>, Vec<f32>)>,
 }
 impl QuickEngine {
+    /// First paint for short codes: rank modeled characters with one distribution,
+    /// retaining every byte-fallback character in dictionary order at the end.
+    /// Full sequence ranking follows asynchronously and remains authoritative.
+    pub fn preview_candidates(&mut self, version: u32, code: &str, left: &str, right: &str)
+        -> Result<Vec<String>, String> {
+        let dictionary = match version {
+            3 => &self.three,
+            5 => &self.five,
+            _ => return Err("Unknown Quick version".into()),
+        };
+        if QuickDictionary::code_index(code).is_none() { return Ok(Vec::new()); }
+        let source = dictionary.candidates(code);
+        if source.is_empty() { return Ok(Vec::new()); }
+        if self.lm.mode(left, right) != Mode::Neural {
+            let order = self.lm.rank(left, right, source)?;
+            return Ok(order.into_iter().map(|i| source[i].clone()).collect());
+        }
+        let neural = self.lm.neural.as_mut().unwrap();
+        let context = neural.context(left, right);
+        let values = neural.log_probabilities(&context)?;
+        let mut scored = Vec::new();
+        let mut tail = Vec::new();
+        for (i, text) in source.iter().enumerate() {
+            let tokens = neural.tokenize(text);
+            if tokens.len() == 1 && neural.supports_candidate(&context, tokens[0]) {
+                scored.push((i, values[tokens[0]]));
+            } else {
+                tail.push(text.clone());
+            }
+        }
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut result: Vec<_> = scored.into_iter().map(|(i, _)| source[i].clone()).collect();
+        result.extend(tail);
+        Ok(result)
+    }
+
     pub fn new(three: QuickDictionary, five: QuickDictionary, lm: HybridLanguageModel) -> Self {
         Self {
             three,
@@ -487,6 +523,21 @@ mod tests {
             dictionary(5),
             HybridLanguageModel::new(None, None, &[]).unwrap(),
         )
+    }
+
+    #[test]
+    fn short_previews_keep_all_matches_and_reject_phrase_codes() {
+        let mut engine = engine();
+        for version in [3, 5] {
+            for code in ["q", "hi", "HI", "zz"] {
+                assert_eq!(engine.preview_candidates(version, code, "", "").unwrap(),
+                    engine.candidates(version, code, "", "").unwrap());
+            }
+            for code in ["", "hion", "a1", "ø"] {
+                assert!(engine.preview_candidates(version, code, "", "").unwrap().is_empty());
+            }
+        }
+        assert!(engine.preview_candidates(4, "hi", "", "").is_err());
     }
 
     #[test]

@@ -5,7 +5,6 @@ use std::collections::HashMap;
 pub mod counts;
 pub mod cnn;
 mod cnn_spelling;
-pub mod english;
 pub mod hwr;
 pub mod hybrid;
 #[cfg(feature = "android")]

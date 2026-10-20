@@ -1,5 +1,30 @@
 //! Bounded spelling candidates from the shared LM vocabulary, without another word list.
 
+#[derive(serde::Deserialize)]
+struct AcceptancePolicy {
+    means: [f64; 6], scales: [f64; 6], weights: [f64; 7], threshold: f64,
+    margin_cap: f64, minimum_observed_length: usize, minimum_candidate_length: usize,
+    preserve_known_words: bool,
+}
+
+/// Coefficients and cutoff fitted on separate mobile prompt groups. The score is
+/// a learned decision value, not a per-user correctness guarantee.
+pub fn accept(typed: &str, known: bool, word: &str, completed: usize, score: f32, runner: Option<f32>, literal: Option<f32>) -> bool {
+    static POLICY: std::sync::OnceLock<AcceptancePolicy> = std::sync::OnceLock::new();
+    let policy = POLICY.get_or_init(|| serde_json::from_str(include_str!("english_acceptance.json"))
+        .expect("Invalid compiled English acceptance policy"));
+    if (known && (policy.preserve_known_words || literal.is_none())) || completed > 0 ||
+        typed.len() < policy.minimum_observed_length || word.len() < policy.minimum_candidate_length {
+        return false;
+    }
+    let margin = runner.map(|r| score as f64-r as f64).unwrap_or(policy.margin_cap).min(policy.margin_cap);
+    let values = [score as f64, margin, if known {1.} else {0.}, literal.unwrap_or(0.) as f64,
+        literal.map(|s|score as f64-s as f64).unwrap_or(0.), if typed.contains('\'') {1.} else {0.}];
+    let logit = policy.weights[0] + (0..6).map(|i|
+        policy.weights[i+1]*(values[i]-policy.means[i])/policy.scales[i]).sum::<f64>();
+    1. / (1. + (-logit).exp()) >= policy.threshold
+}
+
 pub fn canonical(word: &str) -> Option<String> {
     let word = word.replace('’', "'").to_ascii_lowercase();
     (!word.is_empty() && word.len() <= 32 && word.bytes().all(|c| c.is_ascii_lowercase() || c == b'\''))
@@ -86,6 +111,16 @@ pub fn edit_penalty(input: &[u8], word: &[u8], edits: u8) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn learned_acceptance_compares_the_literal_and_never_automatically_completes() {
+        assert!(accept("teh", false, "the", 0, -5., Some(-15.),None));
+        assert!(!accept("name", true, "word", 0, -5., Some(-15.),Some(-1.)));
+        assert!(accept("hou", true, "you", 0, -3., Some(-15.),Some(-15.)));
+        assert!(!accept("hou", true, "you", 0, -3., Some(-15.),None));
+        assert!(!accept("hel", false, "hello", 2, -5., Some(-15.),None));
+        assert!(!accept("name", false, "word", 0, -20., Some(-20.1),None));
+        assert!(!accept("a", false, "and", 0, -1., Some(-20.),None));
+    }
     #[test]
     fn generates_real_typo_operations_with_a_bounded_radius() {
         for (typed, word, edits) in [("yiu", "you", 1), ("teh", "the", 1),

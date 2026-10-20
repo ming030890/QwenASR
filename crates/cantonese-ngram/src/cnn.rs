@@ -33,6 +33,7 @@ pub struct EnglishSuggestion {
 #[serde(rename_all = "camelCase")]
 pub struct EnglishSuggestions {
     pub candidates: Vec<EnglishSuggestion>, pub correction: Option<String>, pub known: bool,
+    pub literal_score: Option<f32>,
 }
 struct Weights {
     raw: Box<[u8]>, tokens: Vec<String>, ids: HashMap<String,usize>, english: Regex,
@@ -208,13 +209,14 @@ impl CnnLanguageModel {
     /// corpus frequency cannot prune a plausible correction out of the pool.
     pub fn english_suggestions(&mut self,left:&str,typed:&str,limit:usize)->Result<EnglishSuggestions,String> {
         let Some(input)=crate::cnn_spelling::canonical(typed) else {
-            return Ok(EnglishSuggestions {candidates:vec![],correction:None,known:false});
+            return Ok(EnglishSuggestions {candidates:vec![],correction:None,known:false,literal_score:None});
         };
         let radius=if input.len()>=6 {3}else if input.len()>=4 {2}else{1};
         let mut pool=Vec::new();
         let mut known=false;
+        let mut literal_ids=Vec::new();
         for (word,ids) in &self.weights.spellings {
-            if word==&input {known=true;continue;}
+            if word==&input {known=true;literal_ids=ids.clone();continue;}
             let completion=word.starts_with(&input);
             let edits=if completion {0}else {
                 match crate::cnn_spelling::distance(input.as_bytes(),word.as_bytes(),radius) {
@@ -225,11 +227,15 @@ impl CnnLanguageModel {
         }
         let context=self.context(left);
         let logp=self.log_probabilities(&context)?;
+        // Reuse the same distribution as candidate ranking; no extra CNN pass.
+        let literal_score=literal_ids.into_iter().map(|id|logp[id]).max_by(f32::total_cmp);
         let input_is_lower = input.bytes().all(|b| b.is_ascii_lowercase());
         let mut ranked:Vec<_>=pool.into_iter().map(|(word,ids,edits,completed_chars)| {
             let id = ids.into_iter().max_by(|&a,&b| logp[a].total_cmp(&logp[b]).then(b.cmp(&a))).unwrap();
             let penalty = if completed_chars > 0 {
-                completed_chars as f32 * 0.5
+                // A partial word is not an insertion error. Let the contextual
+                // LM rank completions without an extra length preference.
+                0.0
             } else {
                 crate::cnn_spelling::edit_penalty(input.as_bytes(), word.as_bytes(), edits)
             };
@@ -288,42 +294,12 @@ impl CnnLanguageModel {
             }
         }
         ranked.sort_by(|a,b|b.score.total_cmp(&a.score).then(a.word.cmp(&b.word)));
-        let correction=ranked.first().filter(|best| {
-            if known || input.len() < 3 || best.completed_chars > 0 || best.word.len() < 3 {
-                return false;
-            }
-            let len_diff = input.len().abs_diff(best.word.len());
-            if best.edits >= 2 && len_diff > 0 {
-                return false;
-            }
-            if input.len() <= 3 && best.word.len() < input.len() {
-                return false;
-            }
-            let max_allowed_edits = if input.len() >= 6 { 3 } else if input.len() >= 5 { 2 } else { 1 };
-            if best.edits > max_allowed_edits {
-                return false;
-            }
-            if best.score < -24.0 {
-                return false;
-            }
-            let base_margin = if left.trim().is_empty() {
-                if best.edits == 1 { 0.8 } else { 1.2 }
-            } else {
-                if best.edits == 1 { 0.5 } else { 0.8 }
-            };
-            ranked.get(1).map_or(true, |runner| {
-                let required = if runner.edits > best.edits {
-                    0.0
-                } else if runner.edits == best.edits && runner.completed_chars == 0 && input.len().abs_diff(runner.word.len()) > len_diff {
-                    base_margin * 0.5
-                } else {
-                    base_margin
-                };
-                best.score - runner.score >= required
-            })
-        }).map(|best|best.word.clone());
+        let correction=ranked.first().filter(|best|
+            crate::cnn_spelling::accept(&input, known, &best.word, best.completed_chars,
+                best.score, ranked.get(1).map(|runner|runner.score),literal_score))
+            .map(|best|best.word.clone());
         ranked.truncate(limit);
-        Ok(EnglishSuggestions {candidates:ranked,correction,known})
+        Ok(EnglishSuggestions {candidates:ranked,correction,known,literal_score})
     }
     fn suggest(&mut self,left:&str,prefix:&str,limit:usize,english_only:bool)->Result<Vec<crate::TokenPrediction>,String> {
         let ids=self.context(left);

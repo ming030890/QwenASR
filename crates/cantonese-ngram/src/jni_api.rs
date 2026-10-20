@@ -119,41 +119,6 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_quick_NativeQuic
     }
 }
 
-/// Reuse the keyboard's bilingual NN; unsupported words get no context bonus.
-pub(crate) fn english_context_scores(handle: i64, left: &str, right: &str, words: &[String]) -> Option<Vec<f32>> {
-    let engine = engines().lock().ok()?.get(&handle)?.clone();
-    let mut engine = engine.lock().ok()?;
-    let neural = engine.lm.neural.as_mut()?;
-    let ids = neural.context(left, right);
-    if !neural.supports_context(&ids) { return None; }
-    let supported: Vec<_> = words.iter().enumerate().filter_map(|(i, word)|
-        neural.token_id(word).filter(|&id| neural.supports_candidate(&ids, id)).map(|id| (i, id))).collect();
-    if supported.len() < 2 { return None; }
-    let logits = neural.scores(&ids, &supported.iter().map(|p| p.1).collect::<Vec<_>>()).ok()?;
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut scores = vec![0.; words.len()];
-    for ((index, _), logit) in supported.into_iter().zip(logits) {
-        // Bounded relative logit signal preserves typo evidence and unknown vocabulary.
-        scores[index] = 2. + (logit - max).clamp(-2., 0.);
-    }
-    Some(scores)
-}
-
-pub(crate) fn sequence_evidence(handle:i64,left:&str,right:&str,words:&[String])
-    ->Option<Vec<crate::neural::SequenceEvidence>> {
-    let engine=engines().lock().ok()?.get(&handle)?.clone();
-    let mut engine=engine.lock().ok()?;
-    let model=engine.lm.neural.as_mut()?;
-    crate::neural::score_sequences(model,left,right,words).ok()
-}
-
-pub(crate) fn known_sequences(handle:i64,words:&[String])->Option<Vec<bool>> {
-    let engine=engines().lock().ok()?.get(&handle)?.clone();
-    let engine=engine.lock().ok()?;
-    let model=engine.lm.neural.as_ref()?;
-    Some(words.iter().map(|text| !text.trim().is_empty() && text.split_whitespace().all(|word| model.token_id(word).is_some())).collect())
-}
-
 #[no_mangle]
 pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_quick_NativeQuickEngine_nativeCreate(
     mut env: JNIEnv,
@@ -216,6 +181,7 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_quick_NativeQuic
     code: JString,
     left: JString,
     right: JString,
+    preview: jni::sys::jboolean,
 ) -> jobject {
     let result = (|| -> Result<Vec<String>, String> {
         let code: String = env.get_string(&code).map_err(|e| e.to_string())?.into();
@@ -228,7 +194,11 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_quick_NativeQuic
             .cloned()
             .ok_or("Closed Quick engine")?;
         let mut guard = engine.lock().map_err(|_| "Quick engine poisoned")?;
-        guard.candidates(version as u32, &code, &left, &right)
+        if preview != 0 {
+            guard.preview_candidates(version as u32, &code, &left, &right)
+        } else {
+            guard.candidates(version as u32, &code, &left, &right)
+        }
     })();
     match result {
         Ok(strings) => {

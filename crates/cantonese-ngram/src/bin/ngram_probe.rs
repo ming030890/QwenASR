@@ -40,13 +40,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             raw.iter().map(|v| v.as_u64().unwrap() as usize).collect()
         } else { lm.context(left, right) };
         let mut result = if let Some(typed) = x["typed"].as_str() {
-            serde_json::to_value(lm.english_suggestions(left,typed,8).map_err(io::Error::other)?)?
+            let limit = x["spelling_limit"].as_u64().unwrap_or(8).min(4096) as usize;
+            serde_json::to_value(lm.english_suggestions(left,typed,limit).map_err(io::Error::other)?)?
         } else if let Some(code) = x["code"].as_str() {
             let engine = quick.as_mut().ok_or("Quick assets required")?;
             let mode = format!("{:?}", engine.lm.mode(left, right));
-            let c = engine
-                .candidates(x["version"].as_u64().unwrap_or(3) as u32, code, left, right)
-                .map_err(io::Error::other)?;
+            let version = x["version"].as_u64().unwrap_or(3) as u32;
+            let c = if x["preview"].as_bool().unwrap_or(false) {
+                engine.preview_candidates(version, code, left, right)
+            } else {
+                engine.candidates(version, code, left, right)
+            }.map_err(io::Error::other)?;
             serde_json::json!({"context_ids":ids,"mode":mode,"candidates":c})
         } else if let Some(candidates)=x["sequences"].as_array() {
             let candidates:Vec<String>=candidates.iter().map(|s|s.as_str().unwrap().to_owned()).collect();

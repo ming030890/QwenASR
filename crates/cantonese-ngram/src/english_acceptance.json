@@ -1,0 +1,88 @@
+{
+  "schema": "shared-english-acceptance-v2",
+  "model_sha256": "915bc80d53d225469e8bfe90d328ac1565647181e485cb3f0e9c32f47c946322",
+  "features": [
+    "winner_score",
+    "runner_margin",
+    "known_word",
+    "literal_score",
+    "score_over_literal",
+    "observed_apostrophe"
+  ],
+  "means": [
+    -11.28628955937009,
+    4.357691940489407,
+    0.48411497730711045,
+    -3.7384042691174506,
+    -2.0631983523650175,
+    0.025340393343419063
+  ],
+  "scales": [
+    5.072642533967047,
+    4.412846750218541,
+    0.49974760234947235,
+    4.7001117923935025,
+    4.316465172724486,
+    0.15715679370813043
+  ],
+  "weights": [
+    -1.289236195548159,
+    0.8496028515979095,
+    1.2779955113660044,
+    -1.573809087973068,
+    0.1592541404707128,
+    1.5521424284628493,
+    -0.7789172433796652
+  ],
+  "threshold": 0.7535520633370493,
+  "margin_cap": 20.0,
+  "minimum_observed_length": 3,
+  "minimum_candidate_length": 3,
+  "preserve_known_words": false,
+  "provenance": {
+    "report_sha256": "966ee0dcf8cd42ca98404d3cb65a2517158193bcd0eac4dbbbce4cb3799311de",
+    "frozen_selection_sha256": "a7e43d15f5564a887ff86b29bebae21ee59c9722bf46eae2b710c029f502959a",
+    "fit_rows": 2644,
+    "evaluation": {
+      "cases": 2042,
+      "top1": 573,
+      "top8": 648,
+      "mrr": 603.0333333333333,
+      "typos": 744,
+      "applied": 384,
+      "correct": 361,
+      "false_changes": 5,
+      "preservation": 1298,
+      "wrong": 23,
+      "f05": 0.7916666666666666,
+      "precision": 0.9401041666666666,
+      "recall": 0.4852150537634409,
+      "false_change_rate": 0.003852080123266564,
+      "top8_rate": 0.31733594515181196,
+      "mrr_rate": 0.295315050603983
+    },
+    "baseline": {
+      "cases": 2042,
+      "top1": 573,
+      "top8": 648,
+      "mrr": 603.0333333333333,
+      "typos": 744,
+      "applied": 364,
+      "correct": 336,
+      "false_changes": 9,
+      "preservation": 1298,
+      "wrong": 28,
+      "f05": 0.7636363636363637,
+      "precision": 0.9230769230769231,
+      "recall": 0.45161290322580644,
+      "false_change_rate": 0.006933744221879815,
+      "top8_rate": 0.31733594515181196,
+      "mrr_rate": 0.295315050603983
+    },
+    "adoption": "F0.5 improved from 0.763636 to 0.791667; TRAIN fit/calibration, frozen selection before evaluation; no new language model",
+    "calibrated_threshold": 0.7535520633370497,
+    "numeric_boundary": "Export cutoff four float64 ULPs below the calibrated boundary so tied calibration cases are included across NumPy/Python/Rust sigmoid rounding"
+  },
+  "remaining_unlearned": "Eligibility support bounds and candidate ranking penalties; ongoing fitting",
+  "primary_metric": "f0.5"
+}
