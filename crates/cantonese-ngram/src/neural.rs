@@ -159,7 +159,13 @@ pub struct SequenceEvidence {
 }
 pub fn score_sequences(model:&mut NeuralLanguageModel,left:&str,right:&str,candidates:&[String])
     ->Result<Vec<SequenceEvidence>,String> {
-    if candidates.len()>128 {return Err("Too many sequence candidates".into());}
+    if candidates.len() > 128 {
+        let mut results = Vec::with_capacity(candidates.len());
+        for chunk in candidates.chunks(128) {
+            results.extend(score_sequences(model, left, right, chunk)?);
+        }
+        return Ok(results);
+    }
     let (nleft,nright)=model.context_lengths();
     let initial=model.context(left,right);
     // Group every requested token by its exact context before inference. The old
