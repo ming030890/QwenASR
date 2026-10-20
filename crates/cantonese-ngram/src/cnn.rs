@@ -254,12 +254,21 @@ impl CnnLanguageModel {
             if best.score < -24.0 {
                 return false;
             }
-            let margin = if left.trim().is_empty() {
-                if best.edits == 1 { 1.2 } else { 1.8 }
+            let base_margin = if left.trim().is_empty() {
+                if best.edits == 1 { 0.8 } else { 1.2 }
             } else {
-                if best.edits == 1 { 0.8 } else { 1.4 }
+                if best.edits == 1 { 0.5 } else { 0.8 }
             };
-            ranked.get(1).map_or(true, |runner| best.score - runner.score >= margin)
+            ranked.get(1).map_or(true, |runner| {
+                let required = if runner.edits > best.edits {
+                    0.0
+                } else if runner.edits == best.edits && runner.completed_chars == 0 && input.len().abs_diff(runner.word.len()) > len_diff {
+                    base_margin * 0.5
+                } else {
+                    base_margin
+                };
+                best.score - runner.score >= required
+            })
         }).map(|best|best.word.clone());
         ranked.truncate(limit);
         Ok(EnglishSuggestions {candidates:ranked,correction,known})

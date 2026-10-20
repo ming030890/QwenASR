@@ -52,7 +52,9 @@ pub fn edit_penalty(input: &[u8], word: &[u8], edits: u8) -> f32 {
     if edits == 0 {
         return 0.0;
     }
-    if input.len() == word.len() {
+    let len_diff = input.len().abs_diff(word.len());
+    let mut cost;
+    if len_diff == 0 {
         let mut adj = 0;
         let mut non_adj = 0;
         for (&a, &b) in input.iter().zip(word.iter()) {
@@ -65,10 +67,24 @@ pub fn edit_penalty(input: &[u8], word: &[u8], edits: u8) -> f32 {
             }
         }
         if (adj + non_adj) as u8 == edits {
-            return adj as f32 * 1.0 + non_adj as f32 * 2.0;
+            cost = adj as f32 * 1.0 + non_adj as f32 * 2.0;
+        } else {
+            // Transposition or alternation error (e.g. teh -> the, thses -> these)
+            let has_foreign = word.iter().any(|b| !input.contains(b));
+            if !has_foreign {
+                cost = edits as f32 * 1.0;
+            } else {
+                cost = edits as f32 * 1.5;
+            }
         }
+    } else {
+        // Omission or extra character: length difference costs extra
+        cost = edits as f32 * 1.5 + len_diff as f32 * 2.0;
     }
-    edits as f32 * 1.5
+    if edits >= 2 {
+        cost += (edits - 1) as f32 * 2.0;
+    }
+    cost
 }
 
 #[cfg(test)]
