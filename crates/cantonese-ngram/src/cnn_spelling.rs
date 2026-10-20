@@ -67,22 +67,18 @@ pub fn edit_penalty(input: &[u8], word: &[u8], edits: u8) -> f32 {
             }
         }
         if (adj + non_adj) as u8 == edits {
-            cost = adj as f32 * 1.0 + non_adj as f32 * 2.0;
+            cost = adj as f32 * 1.0 + non_adj as f32 * 2.5;
         } else {
             // Transposition or alternation error (e.g. teh -> the, thses -> these)
-            let has_foreign = word.iter().any(|b| !input.contains(b));
-            if !has_foreign {
-                cost = edits as f32 * 1.0;
-            } else {
-                cost = edits as f32 * 1.5;
-            }
+            let foreign_count = word.iter().filter(|b| !input.contains(b)).count();
+            cost = edits as f32 * 1.0 + foreign_count as f32 * 2.5;
         }
     } else {
         // Omission or extra character: length difference costs extra
-        cost = edits as f32 * 1.5 + len_diff as f32 * 2.0;
+        cost = edits as f32 * 1.5 + len_diff as f32 * 3.0;
     }
     if edits >= 2 {
-        cost += (edits - 1) as f32 * 2.0;
+        cost += (edits - 1) as f32 * 3.0;
     }
     cost
 }

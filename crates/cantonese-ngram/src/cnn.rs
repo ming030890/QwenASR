@@ -225,16 +225,68 @@ impl CnnLanguageModel {
         }
         let context=self.context(left);
         let logp=self.log_probabilities(&context)?;
+        let input_is_lower = input.bytes().all(|b| b.is_ascii_lowercase());
         let mut ranked:Vec<_>=pool.into_iter().map(|(word,ids,edits,completed_chars)| {
-            let id=ids.into_iter().max_by(|&a,&b|logp[a].total_cmp(&logp[b]).then(b.cmp(&a))).unwrap();
+            let id = ids.into_iter().max_by(|&a,&b| logp[a].total_cmp(&logp[b]).then(b.cmp(&a))).unwrap();
             let penalty = if completed_chars > 0 {
                 completed_chars as f32 * 0.5
             } else {
                 crate::cnn_spelling::edit_penalty(input.as_bytes(), word.as_bytes(), edits)
             };
-            EnglishSuggestion {word:self.weights.tokens[id].clone(),score:logp[id]-penalty,
+            let word_str = if input_is_lower { word } else { self.weights.tokens[id].clone() };
+            EnglishSuggestion {word:word_str, score:logp[id]-penalty,
                 edits,completed_chars}
         }).collect();
+        if !known && input.len() >= 5 {
+            let mut merge_splits = Vec::new();
+            // Case 1: Direct split (omitted space), e.g. yousupport -> you support
+            for k in 2..input.len() - 1 {
+                let w1 = &input[..k];
+                let w2 = &input[k..];
+                if w1.len() >= 2 && w2.len() >= 2 {
+                    if let (Ok(idx1), Ok(idx2)) = (
+                        self.weights.spellings.binary_search_by(|(w, _)| w.as_str().cmp(w1)),
+                        self.weights.spellings.binary_search_by(|(w, _)| w.as_str().cmp(w2)),
+                    ) {
+                        merge_splits.push((idx1, idx2, 1, 1.5f32));
+                    }
+                }
+            }
+            // Case 2: Space-adjacent key mistap (b, n, v, c, m), e.g. youbsupport -> you support
+            if input.len() >= 6 {
+                for k in 2..input.len() - 2 {
+                    let ch = input.as_bytes()[k];
+                    if matches!(ch, b'b' | b'n' | b'v' | b'c' | b'm') {
+                        let w1 = &input[..k];
+                        let w2 = &input[k + 1..];
+                        if w1.len() >= 2 && w2.len() >= 2 {
+                            if let (Ok(idx1), Ok(idx2)) = (
+                                self.weights.spellings.binary_search_by(|(w, _)| w.as_str().cmp(w1)),
+                                self.weights.spellings.binary_search_by(|(w, _)| w.as_str().cmp(w2)),
+                            ) {
+                                merge_splits.push((idx1, idx2, 1, 1.0f32));
+                            }
+                        }
+                    }
+                }
+            }
+            for (idx1, idx2, edits, penalty_base) in merge_splits {
+                let (w1, ids1) = &self.weights.spellings[idx1];
+                let (w2, ids2) = &self.weights.spellings[idx2];
+                let id1 = ids1.iter().copied().max_by(|&a,&b| logp[a].total_cmp(&logp[b]).then(b.cmp(&a))).unwrap();
+                let id2 = ids2.iter().copied().max_by(|&a,&b| logp[a].total_cmp(&logp[b]).then(b.cmp(&a))).unwrap();
+                let text1 = if input_is_lower { w1.as_str() } else { self.weights.tokens[id1].as_str() };
+                let text2 = if input_is_lower { w2.as_str() } else { self.weights.tokens[id2].as_str() };
+                let combined_word = format!("{text1} {text2}");
+                let score = logp[id1] + logp[id2] * 0.5 - penalty_base;
+                ranked.push(EnglishSuggestion {
+                    word: combined_word,
+                    score,
+                    edits,
+                    completed_chars: 0,
+                });
+            }
+        }
         ranked.sort_by(|a,b|b.score.total_cmp(&a.score).then(a.word.cmp(&b.word)));
         let correction=ranked.first().filter(|best| {
             if known || input.len() < 3 || best.completed_chars > 0 || best.word.len() < 3 {
