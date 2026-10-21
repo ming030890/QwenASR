@@ -150,6 +150,7 @@ pub struct SequenceEvidence {
     /// Keep the encoded-token mean above for existing calibrated callers.
     pub unit_log_probability: f32,
     pub logical_units: usize,
+    pub cohesion_log_probability: f32,
     pub tokens: usize,
     pub supported: bool,
     #[serde(skip_serializing_if="Option::is_none")]
@@ -200,18 +201,26 @@ pub fn score_sequences(model:&mut NeuralLanguageModel,left:&str,right:&str,candi
         result.push(SequenceEvidence {log_probability:-1e4,
             mean_log_probability:-1e4,
             unit_log_probability:-1e4,
-            logical_units,tokens:tokens.len(),supported,spelling_log_probability:None,spelling_characters:None});
+            logical_units,cohesion_log_probability:0.,tokens:tokens.len(),supported,spelling_log_probability:None,spelling_characters:None});
     }
+    let mut independent_distribution = None;
     for (context,targets) in groups {
         let scores=model.log_probabilities(&context)?;
+        if context == initial { independent_distribution = Some(scores.clone()); }
         for (candidate,position,token) in targets {paths[candidate][position]=scores[token];}
     }
-    for (row,path) in result.iter_mut().zip(paths) {
+    for ((row,path),text) in result.iter_mut().zip(paths).zip(candidates) {
         if row.supported {
             // Preserve the original left-to-right f32 addition order exactly.
             let total=path.into_iter().fold(0.,|sum,value|sum+value);
             row.log_probability=total;row.mean_log_probability=total/row.tokens as f32;
             row.unit_log_probability=total/row.logical_units.max(1) as f32;
+            if text.chars().all(crate::tokenizer::is_han) && row.tokens == row.logical_units {
+                if let Some(independent) = &independent_distribution {
+                    let tokens = model.tokenize_with_units(text).0;
+                    row.cohesion_log_probability = total - tokens.iter().map(|&id| independent[id]).sum::<f32>();
+                }
+            }
         }
     }
     if let NeuralLanguageModel::Dense(parent)=model {

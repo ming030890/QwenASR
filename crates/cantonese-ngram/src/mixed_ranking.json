@@ -1,0 +1,19 @@
+{
+  "weights": [
+    0.44879913040890423,
+    0.2720426806054438,
+    0.10338054821321122,
+    -2.7042952978573935
+  ],
+  "features": [
+    "sequence_log_probability",
+    "unit_log_probability",
+    "cohesion_log_probability",
+    "english_key_edit_distance"
+  ],
+  "model_sha256": "915bc80d53d225469e8bfe90d328ac1565647181e485cb3f0e9c32f47c946322",
+  "cohort_sha256": "1166a375f244134b06593820c5b7ce6a5469f37c87ecbe09a1a4c6233da9c9db",
+  "seed": "mixed-ranking-20261021-v1",
+  "fit_rows": 150,
+  "scope": "SSD TRAIN-derived phrases and natural English contexts; group-disjoint calibration; developmental, not an untouched test"
+}

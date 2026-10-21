@@ -31,9 +31,15 @@ pub struct EnglishSuggestion {
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ApostropheEvidence {
+    pub word: String, pub features: [f64; 3], pub score: f32,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EnglishSuggestions {
     pub candidates: Vec<EnglishSuggestion>, pub correction: Option<String>, pub known: bool,
     pub literal_score: Option<f32>,
+    pub apostrophe_evidence: Vec<ApostropheEvidence>,
 }
 struct Weights {
     raw: Box<[u8]>, tokens: Vec<String>, ids: HashMap<String,usize>, english: Regex,
@@ -43,7 +49,7 @@ struct Weights {
 static SHARED: OnceLock<Mutex<Weak<Weights>>> = OnceLock::new();
 
 pub struct CnnLanguageModel {
-    weights: Arc<Weights>, buffers: Vec<Vec<f32>>, prefix: Vec<usize>, projected: Vec<f32>,
+    weights: Arc<Weights>, buffers: Vec<Vec<f32>>, prefix: Vec<usize>, projected: Vec<f32>, include_bos: bool,
 }
 impl CnnLanguageModel {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self,String> {
@@ -53,7 +59,7 @@ impl CnnLanguageModel {
             None=>{let w=Arc::new(Self::parse(bytes)?);*cache=Arc::downgrade(&w);w}
         };
         let buffers=weights.dilations.iter().map(|&d|vec![0.;2*d*weights.ffn]).collect();
-        Ok(Self {weights,buffers,prefix:Vec::new(),projected:Vec::new()})
+        Ok(Self {weights,buffers,prefix:Vec::new(),projected:Vec::new(),include_bos:true})
     }
     fn parse(bytes:&[u8])->Result<Weights,String> {
         if bytes.get(..8)!=Some(b"KBCNN01\0") || bytes.len()<12 {return Err("Invalid CNN header".into());}
@@ -159,11 +165,25 @@ impl CnnLanguageModel {
         let n=crate::norm_values(&h,&t["final_norm.weight"].values,&t["final_norm.bias"].values);
         self.projected=t["out_proj.weight"].linear(&n,&t["out_proj.bias"]);
     }
+    /// Diagnostic ablation. Production construction retains the trained BOS path.
+    pub fn set_include_bos(&mut self, include: bool) {
+        if self.include_bos != include {
+            self.include_bos = include;
+            self.prefix.clear(); self.projected.clear();
+            self.buffers.iter_mut().for_each(|b|b.fill(0.));
+        }
+    }
     fn project(&mut self,ids:&[usize])->Result<(),String> {
         if ids.len()>33 || ids.iter().any(|&i|i>=self.vocabulary_size()) {return Err("Invalid CNN context".into());}
-        let mut sequence=vec![1];sequence.extend(ids.iter().copied().filter(|&i|i!=0 && i!=1));
+        let mut sequence=if self.include_bos {vec![1]} else {vec![]};sequence.extend(ids.iter().copied().filter(|&i|i!=0 && i!=1));
         if sequence.len()>33 {return Err("CNN context exceeds 32 tokens".into());}
-        if self.prefix==sequence {return Ok(());}
+        if self.prefix==sequence && self.projected.len()==self.weights.embedding {return Ok(());}
+        if sequence.is_empty() {
+            // With no input, the no-BOS ablation uses output biases as its prior.
+            self.buffers.iter_mut().for_each(|b|b.fill(0.));
+            self.prefix.clear(); self.projected=vec![0.;self.weights.embedding];
+            return Ok(());
+        }
         let from=if !self.prefix.is_empty() && sequence.starts_with(&self.prefix) {self.prefix.len()} else {
             self.buffers.iter_mut().for_each(|b|b.fill(0.));0
         };
@@ -209,7 +229,7 @@ impl CnnLanguageModel {
     /// corpus frequency cannot prune a plausible correction out of the pool.
     pub fn english_suggestions(&mut self,left:&str,typed:&str,limit:usize)->Result<EnglishSuggestions,String> {
         let Some(input)=crate::cnn_spelling::canonical(typed) else {
-            return Ok(EnglishSuggestions {candidates:vec![],correction:None,known:false,literal_score:None});
+            return Ok(EnglishSuggestions {candidates:vec![],correction:None,known:false,literal_score:None,apostrophe_evidence:vec![]});
         };
         let radius=if input.len()>=6 {3}else if input.len()>=4 {2}else{1};
         let mut pool=Vec::new();
@@ -293,13 +313,44 @@ impl CnnLanguageModel {
                 });
             }
         }
+        // Restore punctuation using the same CNN's byte fallback. Word-token and
+        // byte-sequence scores have different units, so restoration is calibrated
+        // separately on TRAIN instead of treating a byte average as a word score.
+        let original_best = ranked.iter().map(|r|r.score).max_by(f32::total_cmp);
+        let mut apostrophe_evidence = Vec::new();
+        let mut restored = None;
+        for form in crate::cnn_spelling::apostrophe_forms(&input) {
+            let ids = self.tokenize_with_units(&form.word).0;
+            let mut context = context.clone();
+            let mut score = 0.;
+            for &id in &ids {
+                score += self.log_probabilities(&context)?[id];
+                context.rotate_left(1); context[31] = id;
+            }
+            let features = [(score-literal_score.unwrap_or(score)) as f64,
+                (score-original_best.unwrap_or(score)) as f64,
+                (form.count as f64).ln_1p()-(form.bare_count as f64).ln_1p()];
+            if crate::cnn_spelling::accept_apostrophe(features) { restored = Some(form.word.clone()); }
+            apostrophe_evidence.push(ApostropheEvidence { word: form.word.clone(), features, score });
+            // Keep the word decision intact; restore surfaces only when the fitted
+            // punctuation decision passes, otherwise retain the word decision.
+        }
         ranked.sort_by(|a,b|b.score.total_cmp(&a.score).then(a.word.cmp(&b.word)));
         let correction=ranked.first().filter(|best|
             crate::cnn_spelling::accept(&input, known, &best.word, best.completed_chars,
                 best.score, ranked.get(1).map(|runner|runner.score),literal_score))
             .map(|best|best.word.clone());
+        for evidence in &apostrophe_evidence {
+            ranked.insert(0, EnglishSuggestion { word: evidence.word.clone(),
+                score: evidence.score, edits: 1, completed_chars: 0 });
+        }
+        ranked.sort_by(|a,b|b.score.total_cmp(&a.score).then(a.word.cmp(&b.word)));
+        if let Some(word) = &restored {
+            if let Some(index) = ranked.iter().position(|r| &r.word == word) { ranked[..=index].rotate_right(1); }
+        }
+        let correction = restored.or(correction);
         ranked.truncate(limit);
-        Ok(EnglishSuggestions {candidates:ranked,correction,known,literal_score})
+        Ok(EnglishSuggestions {candidates:ranked,correction,known,literal_score,apostrophe_evidence})
     }
     fn suggest(&mut self,left:&str,prefix:&str,limit:usize,english_only:bool)->Result<Vec<crate::TokenPrediction>,String> {
         let ids=self.context(left);

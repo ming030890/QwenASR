@@ -45,6 +45,7 @@ impl QuickLanguageEvidence {
 struct Phrase {
     text: String,
     score: f32,
+    joint: f32,
     characters: usize,
 }
 
@@ -185,10 +186,19 @@ impl QuickEngine {
                 positions: vec![vec![Phrase {
                     text: String::new(),
                     score: 0.,
+                    joint: 0.,
                     characters: 0,
                 }]],
             });
         }
+        // One background distribution lets final phrase ranking measure internal
+        // association without another pass for each candidate. Short previews and
+        // single-code ordering keep their existing path.
+        let background = if code.len()>2 {
+            if let Some(model)=self.lm.neural.as_mut().filter(|m|m.has_byte_fallback()) {
+                let ids=model.context(left,right); Some(model.log_probabilities(&ids)?)
+            } else {None}
+        } else {None};
         let cache = self.cache.as_mut().unwrap();
         let common = cache
             .code
@@ -241,6 +251,7 @@ impl QuickEngine {
                         paths.push(Phrase {
                             text: format!("{}{text}", prefix.text),
                             score: prefix.score + score + boost,
+                            joint: prefix.joint + score,
                             characters: prefix.characters + 1,
                         });
                     }
@@ -292,7 +303,18 @@ impl QuickEngine {
             );
             Ok(result)
         } else {
-            Ok(phrases.iter().take(100).map(|p| p.text.clone()).collect())
+            let mut order: Vec<_> = (0..phrases.len()).collect();
+            if let Some(background) = &background {
+                let model = self.lm.neural.as_ref().unwrap();
+                let scores: Vec<_> = phrases.iter().map(|p| {
+                    let independent: Option<Vec<_>> = p.text.chars().map(|c| model.token_id(&c.to_string())
+                        .map(|id|background[id])).collect();
+                    let cohesion = independent.map(|v|p.joint-v.iter().sum::<f32>()).unwrap_or(0.);
+                    mixed_score([p.joint as f64,(p.joint/p.characters as f32) as f64,cohesion as f64,0.])
+                }).collect();
+                order.sort_by(|&a,&b|scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+            }
+            Ok(order.into_iter().take(100).map(|i|phrases[i].text.clone()).collect())
         }
     }
 
@@ -369,73 +391,46 @@ fn english_prefix_cost(typed: &str, token: &str) -> Option<f32> {
         .min_by(f32::total_cmp)
 }
 
-/// One LM scale for Chinese phrases and English words. Average token log probability
-/// avoids treating a multi-character Chinese phrase as several competing candidates.
-pub fn rank_mixed(lm: &mut HybridLanguageModel, left: &str, right: &str, candidates: &[String]) -> Result<Vec<usize>, String> {
+/// Key likelihood is exact for generated Quick candidates, and edit distance for
+/// English alternatives. It is evidence for calibration, not a language priority.
+pub fn mixed_features(e: &crate::neural::SequenceEvidence, text: &str, observed: &str) -> [f64; 4] {
+    let cost = if observed.is_empty() || text.chars().any(crate::tokenizer::is_han) { 0. } else {
+        let a = observed.to_ascii_lowercase(); let b = text.to_ascii_lowercase();
+        let a = a.as_bytes(); let b = b.as_bytes();
+        let mut before = vec![0; b.len()+1];
+        let mut previous: Vec<usize> = (0..=b.len()).collect();
+        for i in 1..=a.len() {
+            let mut current = vec![i; b.len()+1];
+            for j in 1..=b.len() {
+                current[j] = (previous[j]+1).min(current[j-1]+1).min(previous[j-1]+usize::from(a[i-1]!=b[j-1]));
+                if i>1 && j>1 && a[i-1]==b[j-2] && a[i-2]==b[j-1] {current[j]=current[j].min(before[j-2]+1);}
+            }
+            before=previous; previous=current;
+        }
+        previous[b.len()] as f64
+    };
+    [e.log_probability as f64,e.unit_log_probability as f64,e.cohesion_log_probability as f64,cost]
+}
+
+pub fn mixed_score(features: [f64;4]) -> f64 {
+    #[derive(serde::Deserialize)]
+    struct Policy { weights: [f64;4] }
+    static POLICY: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
+    let p=POLICY.get_or_init(||serde_json::from_str(include_str!("mixed_ranking.json")).expect("Invalid mixed ranking policy"));
+    (0..4).map(|i|p.weights[i]*features[i]).sum()
+}
+
+/// Calibrated sequence, per-unit, association and key evidence on one shared LM
+/// scale. Candidate scripts do not impose a priority on the final ordering.
+pub fn rank_mixed(lm: &mut HybridLanguageModel, left: &str, right: &str, candidates: &[String], observed: &str) -> Result<Vec<usize>, String> {
     if let Some(model)=lm.neural.as_mut().filter(|m|m.has_byte_fallback()) {
         let scores=crate::neural::score_sequences(model,left,right,candidates)?;
+        let values: Vec<_> = scores.iter().zip(candidates).map(|(e,text)| mixed_score(mixed_features(e,text,observed))).collect();
         let mut order:Vec<_>=(0..scores.len()).collect();
-        order.sort_by(|&a,&b| {
-            let a_han = candidates[a].chars().any(crate::tokenizer::is_han);
-            let b_han = candidates[b].chars().any(crate::tokenizer::is_han);
-            if a_han != b_han {
-                return b_han.cmp(&a_han);
-            }
-            scores[b].unit_log_probability.total_cmp(&scores[a].unit_log_probability).then(a.cmp(&b))
-        });
+        order.sort_by(|&a,&b|values[b].total_cmp(&values[a]).then(a.cmp(&b)));
         return Ok(order);
     }
-    if lm.mode(left, right) != Mode::Neural {
-        let mut order = lm.rank(left, right, candidates)?;
-        order.sort_by(|&a, &b| {
-            let a_han = candidates[a].chars().any(crate::tokenizer::is_han);
-            let b_han = candidates[b].chars().any(crate::tokenizer::is_han);
-            if a_han != b_han {
-                b_han.cmp(&a_han)
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        });
-        return Ok(order);
-    }
-    let mut cache: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
-    let mut scores = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        let tokens: Vec<String> = if candidate.is_ascii() {
-            vec![candidate.to_ascii_lowercase()]
-        } else {
-            candidate.chars().map(|c| c.to_string()).collect()
-        };
-        let mut context = left.to_owned();
-        let mut total = 0.;
-        for token in &tokens {
-            if !cache.contains_key(&context) {
-                let neural = lm.neural.as_mut().unwrap();
-                let ids = neural.context(&context, right);
-                let targets: Vec<_> = (3..neural.vocabulary_size()).filter(|&id| neural.supports_candidate(&ids, id)).collect();
-                let logits = neural.scores(&ids, &targets)?;
-                let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let logsum = max + logits.iter().map(|v| (v - max).exp()).sum::<f32>().ln();
-                let mut values = vec![-20.; neural.vocabulary_size()];
-                for (id, score) in targets.into_iter().zip(logits) { values[id] = score - logsum; }
-                cache.insert(context.clone(), values);
-            }
-            let neural = lm.neural.as_ref().unwrap();
-            total += neural.token_id(token).map(|id| cache[&context][id]).unwrap_or(-20.);
-            context.push_str(token);
-        }
-        scores.push(if tokens.is_empty() { f32::NEG_INFINITY } else { total / tokens.len() as f32 });
-    }
-    let mut order: Vec<_> = (0..candidates.len()).collect();
-    order.sort_by(|&a, &b| {
-        let a_han = candidates[a].chars().any(crate::tokenizer::is_han);
-        let b_han = candidates[b].chars().any(crate::tokenizer::is_han);
-        if a_han != b_han {
-            return b_han.cmp(&a_han);
-        }
-        scores[b].total_cmp(&scores[a]).then(a.cmp(&b))
-    });
-    Ok(order)
+    lm.rank(left, right, candidates)
 }
 
 // Normalize over the full neural vocabulary. Normalizing only over one code's

@@ -31,6 +31,27 @@ pub fn canonical(word: &str) -> Option<String> {
         .then_some(word)
 }
 
+#[derive(serde::Deserialize)]
+pub struct ApostropheForm { pub word: String, pub count: usize, pub bare_count: usize }
+
+/// Forms and ambiguity evidence attested only on TRAIN prompts.
+pub fn apostrophe_forms(input: &str) -> impl Iterator<Item = &'static ApostropheForm> + '_ {
+    static FORMS: std::sync::OnceLock<Vec<ApostropheForm>> = std::sync::OnceLock::new();
+    FORMS.get_or_init(|| serde_json::from_str(include_str!("english_apostrophe_forms.json"))
+        .expect("Invalid apostrophe surface forms")).iter()
+        .filter(move |form| form.word.bytes().filter(|&b| b != b'\'').eq(input.bytes()))
+}
+
+pub fn accept_apostrophe(features: [f64; 3]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Policy { means: [f64; 3], scales: [f64; 3], weights: [f64; 4], threshold: f64 }
+    static POLICY: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
+    let p = POLICY.get_or_init(|| serde_json::from_str(include_str!("english_apostrophe_acceptance.json"))
+        .expect("Invalid apostrophe acceptance policy"));
+    let z = p.weights[0] + (0..3).map(|i| p.weights[i+1]*(features[i]-p.means[i])/p.scales[i]).sum::<f64>();
+    1. / (1. + (-z).exp()) >= p.threshold
+}
+
 /// Optimal string alignment: insertion, deletion, substitution, adjacent swap.
 pub fn distance(input: &[u8], word: &[u8], radius: usize) -> Option<u8> {
     let len_diff = input.len().abs_diff(word.len());
@@ -111,6 +132,19 @@ pub fn edit_penalty(input: &[u8], word: &[u8], edits: u8) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restores_only_attested_missing_apostrophes_with_calibrated_evidence() {
+        let input = canonical("DONT").unwrap();
+        let forms: Vec<_> = apostrophe_forms(&input).collect();
+        assert_eq!(forms.len(), 1);
+        assert_eq!(forms[0].word, "don't");
+        assert!(forms[0].count > 0);
+        assert!(apostrophe_forms("don't").next().is_none());
+        assert!(apostrophe_forms("dnot").next().is_none());
+        assert!(accept_apostrophe([1., 3., 2.]));
+        assert!(!accept_apostrophe([-12., -10., -2.]));
+    }
+
     #[test]
     fn learned_acceptance_compares_the_literal_and_never_automatically_completes() {
         assert!(accept("teh", false, "the", 0, -5., Some(-15.),None));

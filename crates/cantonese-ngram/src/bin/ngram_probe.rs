@@ -31,6 +31,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let no_bos = args.iter().any(|a| a=="--no-bos");
+    if no_bos {
+        if let NeuralLanguageModel::Cnn(model)=&mut lm {model.set_include_bos(false);}
+        if let Some(model)=quick.as_mut().and_then(|q|q.lm.neural.as_mut()) {
+            if let NeuralLanguageModel::Cnn(model)=model {model.set_include_bos(false);}
+        }
+    }
     for line in io::stdin().lock().lines() {
         let x: serde_json::Value = serde_json::from_str(&line?)?;
         let started = std::time::Instant::now();
@@ -52,6 +59,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 engine.candidates(version, code, left, right)
             }.map_err(io::Error::other)?;
             serde_json::json!({"context_ids":ids,"mode":mode,"candidates":c})
+        } else if let Some(candidates)=x["mixed"].as_array() {
+            let candidates:Vec<String>=candidates.iter().map(|s|s.as_str().unwrap().to_owned()).collect();
+            let observed=x["observed"].as_str().unwrap_or("");
+            let evidence=cantonese_engine::neural::score_sequences(&mut lm,left,right,&candidates).map_err(io::Error::other)?;
+            let features:Vec<_>=evidence.iter().zip(&candidates).map(|(e,s)|cantonese_engine::quick::mixed_features(e,s,observed)).collect();
+            let scores:Vec<_>=features.iter().map(|f|cantonese_engine::quick::mixed_score(*f)).collect();
+            let mut order:Vec<_>=(0..scores.len()).collect();
+            order.sort_by(|&a,&b|scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+            serde_json::json!({"evidence":evidence,"features":features,"scores":scores,"order":order})
         } else if let Some(candidates)=x["sequences"].as_array() {
             let candidates:Vec<String>=candidates.iter().map(|s|s.as_str().unwrap().to_owned()).collect();
             let evidence=cantonese_engine::neural::score_sequences(&mut lm,left,right,&candidates).map_err(io::Error::other)?;

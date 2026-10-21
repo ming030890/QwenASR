@@ -1,0 +1,31 @@
+{
+  "means": [
+    -4.054836081607001,
+    -3.0132253851209367,
+    1.2238023400220643
+  ],
+  "scales": [
+    5.256729330924441,
+    5.021588556640954,
+    1.4229599218366238
+  ],
+  "weights": [
+    1.2272834814123075,
+    0.501842453586055,
+    0.24041983076030476,
+    0.7402110347027326
+  ],
+  "threshold": 0.8109033740693117,
+  "regularization": 0.1,
+  "calibration_f05": 0.9493670886075949,
+  "features": [
+    "surface_logp_minus_literal",
+    "surface_logp_minus_best_word_edit_score",
+    "log1p_surface_count_minus_log1p_bare_count"
+  ],
+  "model_sha256": "915bc80d53d225469e8bfe90d328ac1565647181e485cb3f0e9c32f47c946322",
+  "forms_sha256": "610b016b874e823de73b41a1c9fb62705e7af15a463f6e3a5542e3102cdbc9a8",
+  "training_rows": 112,
+  "calibration_rows": 20,
+  "provenance": "TRAIN only; original observed cases plus missing-apostrophe examples/clean controls from unique TRAIN reference prompts; prompt-group fit/calibration"
+}

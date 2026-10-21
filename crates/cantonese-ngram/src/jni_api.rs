@@ -75,19 +75,20 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_SharedLm
     }
 }
 
-pub(crate) fn mixed_candidate_order(handle: i64, left: &str, right: &str, words: &[String]) -> Option<Vec<usize>> {
+pub(crate) fn mixed_candidate_order(handle: i64, left: &str, right: &str, words: &[String], observed: &str) -> Option<Vec<usize>> {
     let engine = engines().lock().ok()?.get(&handle)?.clone();
     let mut engine = engine.english.lock().ok()?;
-    crate::quick::rank_mixed(&mut engine, left, right, words).ok()
+    crate::quick::rank_mixed(&mut engine, left, right, words, observed).ok()
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_SharedLmEnglishEngine_nativeRank(
-    mut env:JNIEnv,_class:JClass,handle:jlong,left:JString,right:JString,words:jni::objects::JObjectArray,
+    mut env:JNIEnv,_class:JClass,handle:jlong,left:JString,right:JString,words:jni::objects::JObjectArray,observed:JString,
 ) -> jstring {
     let result=(||->Result<String,String> {
         let left:String=env.get_string(&left).map_err(|e|e.to_string())?.into();
         let right:String=env.get_string(&right).map_err(|e|e.to_string())?.into();
+        let observed:String=env.get_string(&observed).map_err(|e|e.to_string())?.into();
         let n=env.get_array_length(&words).map_err(|e|e.to_string())?;
         if n>128 {return Err("Too many candidates".into());}
         let mut candidates=Vec::new();
@@ -96,7 +97,7 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_SharedLm
             candidates.push(env.get_string(&value).map_err(|e|e.to_string())?.into());
             env.delete_local_ref(value).map_err(|e|e.to_string())?;
         }
-        let order=mixed_candidate_order(handle,&left,&right,&candidates).ok_or("Shared model unavailable")?;
+        let order=mixed_candidate_order(handle,&left,&right,&candidates,&observed).ok_or("Shared model unavailable")?;
         serde_json::to_string(&order).map_err(|e|e.to_string())
     })();
     match result {
@@ -320,13 +321,13 @@ mod tests {
         // Traverse the production nativeRank registry path on another worker.
         let (send, receive) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            send.send(mixed_candidate_order(id, "", "", &[])).unwrap();
+            send.send(mixed_candidate_order(id, "", "", &[], "")).unwrap();
         });
         let result = receive.recv_timeout(std::time::Duration::from_secs(1));
         drop(occupied);
         worker.join().unwrap();
         assert_eq!(result.unwrap(), Some(vec![]));
         engines().lock().unwrap().remove(&id);
-        assert_eq!(mixed_candidate_order(id, "", "", &[]), None);
+        assert_eq!(mixed_candidate_order(id, "", "", &[], ""), None);
     }
 }
