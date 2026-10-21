@@ -98,6 +98,13 @@ pub fn edit_penalty(input: &[u8], word: &[u8], edits: u8) -> f32 {
     if edits == 0 {
         return 0.0;
     }
+    // Five existing operation costs fitted on recorded TRAIN typos; fixed on
+    // selection before evaluation. See keyboard EDIT_POSITION_COSTS.md.
+    const NEIGHBOR: f32 = 0.574436466482213;
+    const OTHER: f32 = 3.7162379435897606;
+    const SWAP: f32 = 0.9146548439690982;
+    const EXTRA: f32 = 4.541078382355206;
+    const MISSING: f32 = 1.9126156502899054;
     let len_diff = input.len().abs_diff(word.len());
     let mut cost;
     if len_diff == 0 {
@@ -113,15 +120,17 @@ pub fn edit_penalty(input: &[u8], word: &[u8], edits: u8) -> f32 {
             }
         }
         if (adj + non_adj) as u8 == edits {
-            cost = adj as f32 * 1.0 + non_adj as f32 * 2.5;
+            cost = adj as f32 * NEIGHBOR + non_adj as f32 * OTHER;
         } else {
             // Transposition or alternation error (e.g. teh -> the, thses -> these)
             let foreign_count = word.iter().filter(|b| !input.contains(b)).count();
-            cost = edits as f32 * 1.0 + foreign_count as f32 * 2.5;
+            cost = edits as f32 * SWAP + foreign_count as f32 * OTHER;
         }
     } else {
-        // Omission or extra character: length difference costs extra
-        cost = edits as f32 * 1.5 + len_diff as f32 * 3.0;
+        // Candidate generation bounds length difference to one. Keep the
+        // original 4.5 surcharge for each further edit in this branch.
+        let base = if input.len() > word.len() { EXTRA } else { MISSING };
+        return base + edits.saturating_sub(1) as f32 * 4.5;
     }
     if edits >= 2 {
         cost += (edits - 1) as f32 * 3.0;
@@ -155,6 +164,18 @@ mod tests {
         assert!(!accept("name", false, "word", 0, -20., Some(-20.1),None));
         assert!(!accept("a", false, "and", 0, -1., Some(-20.),None));
     }
+    #[test]
+    fn fitted_costs_preserve_operation_order_without_a_position_prior() {
+        assert_eq!(edit_penalty(b"game", b"game", 0), 0.);
+        let neighbor = edit_penalty(b"gwme", b"game", 1);
+        assert_eq!(neighbor, edit_penalty(b"fame", b"game", 1));
+        assert!(neighbor < edit_penalty(b"gpme", b"game", 1));
+        assert!(edit_penalty(b"keybord", b"keyboard", 1) <
+            edit_penalty(b"keyboarrd", b"keyboard", 1));
+        assert!(edit_penalty(b"wroldd", b"world", 2) >
+            edit_penalty(b"worldd", b"world", 1));
+    }
+
     #[test]
     fn generates_real_typo_operations_with_a_bounded_radius() {
         for (typed, word, edits) in [("yiu", "you", 1), ("teh", "the", 1),
