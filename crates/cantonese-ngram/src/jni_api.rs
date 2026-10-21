@@ -15,13 +15,18 @@ use std::sync::{
     Arc, Mutex, OnceLock,
 };
 
-static ENGINES: OnceLock<Mutex<HashMap<i64, Arc<Mutex<QuickEngine>>>>> = OnceLock::new();
+// Share immutable NN weights, never mutable inference buffers or the Quick lock.
+struct KeyboardEngines {
+    quick: Mutex<QuickEngine>,
+    english: Mutex<HybridLanguageModel>,
+}
+static ENGINES: OnceLock<Mutex<HashMap<i64, Arc<KeyboardEngines>>>> = OnceLock::new();
 static NEXT: AtomicI64 = AtomicI64::new(1);
-fn engines() -> &'static Mutex<HashMap<i64, Arc<Mutex<QuickEngine>>>> {
+fn engines() -> &'static Mutex<HashMap<i64, Arc<KeyboardEngines>>> {
     ENGINES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// English prefix completion shares the Quick engine's model and inference state.
+/// English completion shares Quick's vocabulary and weights, with independent state.
 #[no_mangle]
 pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_SharedLmEnglishEngine_nativeComplete(
     mut env:JNIEnv,_class:JClass,handle:jlong,left:JString,prefix:JString,
@@ -31,8 +36,8 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_SharedLm
         let prefix:String=env.get_string(&prefix).map_err(|e|e.to_string())?.into();
         if prefix.len()>128 {return Err("English prefix too long".into());}
         let engine=engines().lock().map_err(|_|"Registry poisoned")?.get(&handle).cloned().ok_or("Closed shared engine")?;
-        let mut engine=engine.lock().map_err(|_|"Shared engine poisoned")?;
-        let model=engine.lm.neural.as_mut().ok_or("Shared model missing")?;
+        let mut engine=engine.english.lock().map_err(|_|"Shared engine poisoned")?;
+        let model=engine.neural.as_mut().ok_or("Shared model missing")?;
         Ok(model.completions(&left,&prefix,8)?.into_iter().map(|p|p.token).collect())
     })();
     match result {
@@ -60,8 +65,8 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_SharedLm
         let left:String=env.get_string(&left).map_err(|e|e.to_string())?.into();
         let typed:String=env.get_string(&typed).map_err(|e|e.to_string())?.into();
         let engine=engines().lock().map_err(|_|"Registry poisoned")?.get(&handle).cloned().ok_or("Closed shared engine")?;
-        let mut engine=engine.lock().map_err(|_|"Shared engine poisoned")?;
-        let model=engine.lm.neural.as_mut().ok_or("Shared model missing")?;
+        let mut engine=engine.english.lock().map_err(|_|"Shared engine poisoned")?;
+        let model=engine.neural.as_mut().ok_or("Shared model missing")?;
         serde_json::to_string(&model.english_suggestions(&left,&typed,8)?).map_err(|e|e.to_string())
     })();
     match result {
@@ -72,8 +77,8 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_SharedLm
 
 pub(crate) fn mixed_candidate_order(handle: i64, left: &str, right: &str, words: &[String]) -> Option<Vec<usize>> {
     let engine = engines().lock().ok()?.get(&handle)?.clone();
-    let mut engine = engine.lock().ok()?;
-    crate::quick::rank_mixed(&mut engine.lm, left, right, words).ok()
+    let mut engine = engine.english.lock().ok()?;
+    crate::quick::rank_mixed(&mut engine, left, right, words).ok()
 }
 
 #[no_mangle]
@@ -110,7 +115,7 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_quick_NativeQuic
         let right: String = env.get_string(&right).map_err(|e| e.to_string())?.into();
         let chinese: String = env.get_string(&chinese).map_err(|e| e.to_string())?.into();
         let engine = engines().lock().map_err(|_| "Registry poisoned")?.get(&handle).cloned().ok_or("Closed Quick engine")?;
-        let result = engine.lock().map_err(|_| "Quick engine poisoned")?.language_evidence(&code, &left, &right, &chinese)?;
+        let result = engine.quick.lock().map_err(|_| "Quick engine poisoned")?.language_evidence(&code, &left, &right, &chinese)?;
         serde_json::to_string(&result).map_err(|e| e.to_string())
     })();
     match result {
@@ -129,7 +134,7 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_quick_NativeQuic
     counts: JByteArray,
     labels: JByteArray,
 ) -> jlong {
-    let result = (|| -> Result<QuickEngine, String> {
+    let result = (|| -> Result<KeyboardEngines, String> {
         let three = env.convert_byte_array(three).map_err(|e| e.to_string())?;
         let five = env.convert_byte_array(five).map_err(|e| e.to_string())?;
         let neural = env.convert_byte_array(neural).map_err(|e| e.to_string())?;
@@ -140,27 +145,31 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_quick_NativeQuic
             .lines()
             .map(|s| s.trim_end().to_owned())
             .collect();
-        let neural = if neural.is_empty() {
-            None
-        } else {
-            Some(NeuralLanguageModel::from_bytes(&neural)?)
+        let make_lm = || -> Result<HybridLanguageModel, String> {
+            // CNN construction reuses Arc<Weights>; only caches/buffers are private.
+            let model = if neural.is_empty() { None } else {
+                Some(NeuralLanguageModel::from_bytes(&neural)?)
+            };
+            let counts = if counts.is_empty() || model.as_ref()
+                .map(|m| m.minimum_context_tokens() == 0).unwrap_or(false) {
+                None
+            } else { Some(CsrLanguageModel::parse(&counts)?) };
+            HybridLanguageModel::with_neural(model, counts, &labels)
         };
-        let counts = if counts.is_empty() || neural.as_ref().map(|m| m.minimum_context_tokens()==0).unwrap_or(false) {
-            None
-        } else {
-            Some(CsrLanguageModel::parse(&counts)?)
-        };
-        Ok(QuickEngine::new(
-            QuickDictionary::from_bytes(&three, 3)?,
-            QuickDictionary::from_bytes(&five, 5)?,
-            HybridLanguageModel::with_neural(neural, counts, &labels)?,
-        ))
+        Ok(KeyboardEngines {
+            quick: Mutex::new(QuickEngine::new(
+                QuickDictionary::from_bytes(&three, 3)?,
+                QuickDictionary::from_bytes(&five, 5)?,
+                make_lm()?,
+            )),
+            english: Mutex::new(make_lm()?),
+        })
     })();
     match result {
         Ok(engine) => {
             let id = NEXT.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut registry) = engines().lock() {
-                registry.insert(id, Arc::new(Mutex::new(engine)));
+                registry.insert(id, Arc::new(engine));
                 id
             } else {
                 0
@@ -193,7 +202,7 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_quick_NativeQuic
             .get(&handle)
             .cloned()
             .ok_or("Closed Quick engine")?;
-        let mut guard = engine.lock().map_err(|_| "Quick engine poisoned")?;
+        let mut guard = engine.quick.lock().map_err(|_| "Quick engine poisoned")?;
         if preview != 0 {
             guard.preview_candidates(version as u32, &code, &left, &right)
         } else {
@@ -246,7 +255,7 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_quick_NativeQuic
             .get(&handle)
             .cloned()
             .ok_or("Closed Quick engine")?;
-        let mut guard = engine.lock().map_err(|_| "Quick engine poisoned")?;
+        let mut guard = engine.quick.lock().map_err(|_| "Quick engine poisoned")?;
         let (_, predictions) = guard
             .lm
             .predict(&left, &right, limit.clamp(0, 100) as usize)?;
@@ -286,5 +295,38 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_quick_NativeQuic
 ) {
     if let Ok(mut registry) = engines().lock() {
         registry.remove(&handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn english_ranking_does_not_acquire_quick_inference_lock() {
+        let dictionary = vec![0; 703 * 4];
+        let make_lm = || HybridLanguageModel::with_neural(None, None, &[]).unwrap();
+        let engine = Arc::new(KeyboardEngines {
+            quick: Mutex::new(QuickEngine::new(
+                QuickDictionary::from_bytes(&dictionary, 3).unwrap(),
+                QuickDictionary::from_bytes(&dictionary, 5).unwrap(), make_lm(),
+            )),
+            english: Mutex::new(make_lm()),
+        });
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        engines().lock().unwrap().insert(id, engine.clone());
+        let occupied = engine.quick.lock().unwrap();
+        assert!(engine.english.try_lock().is_ok());
+        // Traverse the production nativeRank registry path on another worker.
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            send.send(mixed_candidate_order(id, "", "", &[])).unwrap();
+        });
+        let result = receive.recv_timeout(std::time::Duration::from_secs(1));
+        drop(occupied);
+        worker.join().unwrap();
+        assert_eq!(result.unwrap(), Some(vec![]));
+        engines().lock().unwrap().remove(&id);
+        assert_eq!(mixed_candidate_order(id, "", "", &[]), None);
     }
 }
