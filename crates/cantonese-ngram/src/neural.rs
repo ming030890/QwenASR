@@ -126,6 +126,9 @@ impl NeuralLanguageModel {
     pub fn english_suggestions(&mut self,left:&str,typed:&str,limit:usize)->Result<crate::cnn::EnglishSuggestions,String> {
         match self {Self::Cnn(m)=>m.english_suggestions(left,typed,limit),_=>Err("Shared CNN required for spelling suggestions".into())}
     }
+    pub fn english_suggestions_with_touch(&mut self,left:&str,typed:&str,limit:usize,touch:Option<&crate::touch::TouchScorer>)->Result<crate::cnn::EnglishSuggestions,String> {
+        match self {Self::Cnn(m)=>m.english_suggestions_with_touch(left,typed,limit,touch),_=>Err("Shared CNN required for spelling suggestions".into())}
+    }
     pub fn log_probabilities(&mut self,ids:&[usize])->Result<Vec<f32>,String> {
         if let Self::Cnn(m)=self {return m.log_probabilities(ids);}
         let targets:Vec<_>=(3..self.vocabulary_size()).filter(|&id|self.supports_candidate(ids,id)).collect();

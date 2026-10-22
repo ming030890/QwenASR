@@ -5,6 +5,7 @@ use std::collections::HashMap;
 pub mod counts;
 pub mod cnn;
 mod cnn_spelling;
+pub mod touch;
 pub mod hwr;
 pub mod hybrid;
 #[cfg(feature = "android")]
@@ -14,6 +15,8 @@ pub mod neural;
 pub mod phrases;
 pub use neural::NeuralLanguageModel;
 pub mod quick;
+pub mod suggestion_request;
+pub mod suggestions;
 pub mod tokenizer;
 
 #[derive(Deserialize)]

@@ -187,7 +187,14 @@ impl CnnLanguageModel {
         let from=if !self.prefix.is_empty() && sequence.starts_with(&self.prefix) {self.prefix.len()} else {
             self.buffers.iter_mut().for_each(|b|b.fill(0.));0
         };
-        for &id in &sequence[from..] {self.step(id);}
+        for &id in &sequence[from..] {
+            if let Err(error)=crate::suggestion_request::check() {
+                self.prefix.clear();self.projected.clear();
+                self.buffers.iter_mut().for_each(|b|b.fill(0.));
+                return Err(error);
+            }
+            self.step(id);
+        }
         self.prefix=sequence;
         if self.projected.iter().any(|v|!v.is_finite()) {return Err("Nonfinite CNN projection".into());}
         Ok(())
@@ -201,11 +208,16 @@ impl CnnLanguageModel {
         }).collect()
     }
     pub fn log_probabilities(&mut self,ids:&[usize])->Result<Vec<f32>,String> {
+        crate::suggestion_request::check()?;
+        if let Some(values)=crate::suggestion_request::cached(ids) {return Ok(values);}
         let targets:Vec<_>=(0..self.vocabulary_size()).collect();
         let mut values=self.scores(ids,&targets)?;
         let max=values.iter().copied().fold(f32::NEG_INFINITY,f32::max);
         let z=max+values.iter().map(|v|(v-max).exp()).sum::<f32>().ln();
-        values.iter_mut().for_each(|v|*v-=z);Ok(values)
+        values.iter_mut().for_each(|v|*v-=z);
+        crate::suggestion_request::check()?;
+        crate::suggestion_request::remember(ids,&values);
+        Ok(values)
     }
     pub fn rank(&mut self,left:&str,candidates:&[String])->Result<Vec<usize>,String> {
         let mut scores=Vec::new();
@@ -228,6 +240,9 @@ impl CnnLanguageModel {
     /// Enumerate the spelling neighborhood before LM ranking, so lexical order or
     /// corpus frequency cannot prune a plausible correction out of the pool.
     pub fn english_suggestions(&mut self,left:&str,typed:&str,limit:usize)->Result<EnglishSuggestions,String> {
+        self.english_suggestions_with_touch(left,typed,limit,None)
+    }
+    pub fn english_suggestions_with_touch(&mut self,left:&str,typed:&str,limit:usize,touch:Option<&crate::touch::TouchScorer>)->Result<EnglishSuggestions,String> {
         let Some(input)=crate::cnn_spelling::canonical(typed) else {
             return Ok(EnglishSuggestions {candidates:vec![],correction:None,known:false,literal_score:None,apostrophe_evidence:vec![]});
         };
@@ -236,6 +251,7 @@ impl CnnLanguageModel {
         let mut known=false;
         let mut literal_ids=Vec::new();
         for (word,ids) in &self.weights.spellings {
+            crate::suggestion_request::check()?;
             if word==&input {known=true;literal_ids=ids.clone();continue;}
             let completion=word.starts_with(&input);
             let edits=if completion {0}else {
@@ -316,6 +332,15 @@ impl CnnLanguageModel {
         // Restore punctuation using the same CNN's byte fallback. Word-token and
         // byte-sequence scores have different units, so restoration is calibrated
         // separately on TRAIN instead of treating a byte average as a word score.
+        // Punctuation restoration has a separately calibrated policy. Leave it
+        // intact in this coordinate-only letter-substitution experiment.
+        if crate::cnn_spelling::apostrophe_forms(&input).next().is_none() {
+            if let Some(touch) = touch {
+                for row in &mut ranked {
+                    row.score += touch.adjustment(&row.word, row.edits, row.completed_chars);
+                }
+            }
+        }
         let original_best = ranked.iter().map(|r|r.score).max_by(f32::total_cmp);
         let mut apostrophe_evidence = Vec::new();
         let mut restored = None;

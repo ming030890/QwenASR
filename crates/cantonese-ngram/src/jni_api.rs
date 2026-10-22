@@ -15,6 +15,48 @@ use std::sync::{
     Arc, Mutex, OnceLock,
 };
 
+// Request tokens are independent of inference locks, so cancellation never waits
+// behind the model it is trying to interrupt. Removing a token also cancels work
+// that has not acquired its engine yet; running calls retain the Arc.
+static REQUESTS: OnceLock<Mutex<HashMap<i64, Arc<std::sync::atomic::AtomicBool>>>> = OnceLock::new();
+static NEXT_REQUEST: AtomicI64 = AtomicI64::new(1);
+fn requests() -> &'static Mutex<HashMap<i64, Arc<std::sync::atomic::AtomicBool>>> {
+    REQUESTS.get_or_init(||Mutex::new(HashMap::new()))
+}
+#[no_mangle]
+pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_NativeSuggestionRequest_nativeCreate(
+    _env:JNIEnv,_class:JClass,
+)->jlong {
+    let id=NEXT_REQUEST.fetch_add(1,Ordering::Relaxed);
+    requests().lock().unwrap().insert(id,Arc::new(std::sync::atomic::AtomicBool::new(false)));id
+}
+#[no_mangle]
+pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_NativeSuggestionRequest_nativeCancel(
+    _env:JNIEnv,_class:JClass,id:jlong,
+) {
+    if let Some(token)=requests().lock().unwrap().remove(&id) {token.store(true,Ordering::Release);}
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_NativeSharedSuggestions_nativeCompose(
+    mut env:JNIEnv,_class:JClass,handle:jlong,request:jlong,version:jint,code:JString,left:JString,right:JString,english:jni::sys::jboolean,
+)->jstring {
+    let result=(||->Result<String,String> {
+        let token=requests().lock().map_err(|_|"Request registry poisoned")?.get(&request).cloned().ok_or("Suggestion request cancelled")?;
+        let code:String=env.get_string(&code).map_err(|e|e.to_string())?.into();
+        let left:String=env.get_string(&left).map_err(|e|e.to_string())?.into();
+        let right:String=env.get_string(&right).map_err(|e|e.to_string())?.into();
+        if code.len()>128 || ![0,3,5].contains(&version) {return Err("Invalid composing request".into());}
+        let engine=engines().lock().map_err(|_|"Registry poisoned")?.get(&handle).cloned().ok_or("Closed shared engine")?;
+        let mut engine=engine.quick.lock().map_err(|_|"Shared engine poisoned")?;
+        crate::suggestion_request::run(token,||serde_json::to_string(&crate::suggestions::compose(&mut engine,version as u32,&code,&left,&right,english!=0)?).map_err(|e|e.to_string()))
+    })();
+    match result {
+        Ok(json)=>env.new_string(json).map(|s|s.into_raw()).unwrap_or(std::ptr::null_mut()),
+        Err(error)=>{let _=env.throw_new("java/lang/IllegalStateException",error);std::ptr::null_mut()}
+    }
+}
+
 // Share immutable NN weights, never mutable inference buffers or the Quick lock.
 struct KeyboardEngines {
     quick: Mutex<QuickEngine>,

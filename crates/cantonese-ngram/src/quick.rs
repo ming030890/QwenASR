@@ -54,6 +54,7 @@ struct PhraseCache {
     left: String,
     right: String,
     code: String,
+    joined: bool,
     positions: Vec<Vec<Phrase>>,
 }
 
@@ -153,6 +154,14 @@ impl QuickEngine {
             distribution_cache: None,
         }
     }
+    /// Start from the full next-token distribution, filter by the dictionary
+    /// code, then retain the best matching transitions. Never truncate the
+    /// global vocabulary or dictionary before applying the code constraint.
+    pub fn collect_candidates(&mut self, version:u32, code:&str, left:&str, right:&str)->Result<Vec<String>,String> {
+        if code.len()<=2 {return self.preview_candidates(version,code,left,right);}
+        self.candidates_impl(version,code,left,right,true)
+    }
+
     pub fn candidates(
         &mut self,
         version: u32,
@@ -160,6 +169,9 @@ impl QuickEngine {
         left: &str,
         right: &str,
     ) -> Result<Vec<String>, String> {
+        self.candidates_impl(version,code,left,right,false)
+    }
+    fn candidates_impl(&mut self,version:u32,code:&str,left:&str,right:&str,joined:bool)->Result<Vec<String>,String> {
         let dictionary = match version {
             3 => &self.three,
             5 => &self.five,
@@ -175,7 +187,7 @@ impl QuickEngine {
         if self
             .cache
             .as_ref()
-            .map(|c| c.version != version || c.left != left || c.right != right)
+            .map(|c| c.version != version || c.left != left || c.right != right || c.joined != joined)
             .unwrap_or(true)
         {
             self.cache = Some(PhraseCache {
@@ -183,6 +195,7 @@ impl QuickEngine {
                 left: left.into(),
                 right: right.into(),
                 code: String::new(),
+                joined,
                 positions: vec![vec![Phrase {
                     text: String::new(),
                     score: 0.,
@@ -194,7 +207,7 @@ impl QuickEngine {
         // One background distribution lets final phrase ranking measure internal
         // association without another pass for each candidate. Short previews and
         // single-code ordering keep their existing path.
-        let background = if code.len()>2 {
+        let background = if code.len()>2 && !joined {
             if let Some(model)=self.lm.neural.as_mut().filter(|m|m.has_byte_fallback()) {
                 let ids=model.context(left,right); Some(model.log_probabilities(&ids)?)
             } else {None}
@@ -211,6 +224,7 @@ impl QuickEngine {
         // Keep separate beams by character count so one-letter codes cannot crowd
         // out longer codes that are needed to stay within the six-character cap.
         for end in cache.positions.len()..=code.len() {
+            crate::suggestion_request::check()?;
             let mut paths = Vec::new();
             for size in 1..=2.min(end) {
                 // In Quick, when the user has typed only 2 letters, it represents a single
@@ -226,9 +240,10 @@ impl QuickEngine {
                     continue;
                 }
                 // ARM mobile optimization: dictionary candidates are ordered by frequency.
-                let source_slice = if source.len() > MAX_SEGMENT_CANDIDATES { &source[..MAX_SEGMENT_CANDIDATES] } else { source };
+                let source_slice = if !joined && source.len() > MAX_SEGMENT_CANDIDATES { &source[..MAX_SEGMENT_CANDIDATES] } else { source };
                 let best_prefix_score = cache.positions[start].first().map(|p| p.score).unwrap_or(0.0);
                 for prefix in &cache.positions[start] {
+                    crate::suggestion_request::check()?;
                     if prefix.characters == MAX_QUICK_CHARACTERS {
                         continue;
                     }
@@ -238,7 +253,13 @@ impl QuickEngine {
                     }
                     let context = format!("{left}{}", prefix.text);
                     let scores = sequence_scores(&mut self.lm, &mut self.distribution_cache, &context, right, source_slice)?;
-                    for (text, score) in source_slice.iter().zip(scores) {
+                    let mut matching:Vec<_>=(0..source_slice.len()).collect();
+                    if joined {
+                        matching.sort_by(|&a,&b|scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+                        matching.truncate(MAX_SEGMENT_CANDIDATES);
+                    }
+                    for index in matching {
+                        let text=&source_slice[index];let score=scores[index];
                         // Skip impossible / unsupported transitions with negligible probability
                         if !score.is_finite() || (prefix.characters > 0 && score < MIN_STEP_TRANSITION_SCORE) {
                             continue;
@@ -303,6 +324,8 @@ impl QuickEngine {
             );
             Ok(result)
         } else {
+            // This is the generated pool. The joined request ranks it once with English.
+            if joined {return Ok(phrases.iter().map(|p|p.text.clone()).collect());}
             let mut order: Vec<_> = (0..phrases.len()).collect();
             if let Some(background) = &background {
                 let model = self.lm.neural.as_ref().unwrap();

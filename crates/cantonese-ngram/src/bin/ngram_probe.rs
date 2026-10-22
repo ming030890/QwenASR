@@ -32,6 +32,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let no_bos = args.iter().any(|a| a=="--no-bos");
+    let touch_model = args.iter().position(|a| a=="--touch-model").map(|i| {
+        let path=args.get(i+1).ok_or("Missing --touch-model path")?;
+        cantonese_engine::touch::TouchModel::from_json(&std::fs::read_to_string(path).map_err(|e|e.to_string())?)
+    }).transpose().map_err(io::Error::other)?;
     if no_bos {
         if let NeuralLanguageModel::Cnn(model)=&mut lm {model.set_include_bos(false);}
         if let Some(model)=quick.as_mut().and_then(|q|q.lm.neural.as_mut()) {
@@ -48,7 +52,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else { lm.context(left, right) };
         let mut result = if let Some(typed) = x["typed"].as_str() {
             let limit = x["spelling_limit"].as_u64().unwrap_or(8).min(4096) as usize;
-            serde_json::to_value(lm.english_suggestions(left,typed,limit).map_err(io::Error::other)?)?
+            let floats=|key:&str|->Vec<f32> { x[key].as_array().map(|a|a.iter().map(|v|v.as_f64().map(|n|n as f32).unwrap_or(f32::NAN)).collect()).unwrap_or_default() };
+            let geometry=floats("touch_geometry"); let points=floats("touch_points");
+            let canonical=typed.to_ascii_lowercase();
+            let touch=touch_model.as_ref().and_then(|m|m.prepare(&canonical,&geometry,&points));
+            serde_json::to_value(lm.english_suggestions_with_touch(left,typed,limit,touch.as_ref()).map_err(io::Error::other)?)?
         } else if let Some(code) = x["code"].as_str() {
             let engine = quick.as_mut().ok_or("Quick assets required")?;
             let mode = format!("{:?}", engine.lm.mode(left, right));
