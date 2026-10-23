@@ -11,6 +11,36 @@ pub struct JoinedSuggestions {
     pub code_length: usize,
 }
 
+/// Current-input suggestions without phrase beam search or bilingual reranking.
+/// The authoritative composing request still runs unchanged on separate state.
+pub fn preview(engine: &mut QuickEngine, version: u32, code: &str, left: &str, right: &str,
+    english_enabled: bool) -> Result<JoinedSuggestions, String> {
+    crate::suggestion_request::check()?;
+    let chinese = if version == 0 || code.is_empty() { vec![] }
+        else { engine.preview_composition(version, code, left, right)? };
+    let english = if english_enabled && !code.is_empty() {
+        engine.lm.neural.as_mut().ok_or("Shared model missing")?.english_suggestions(left, code, 8)?
+    } else {
+        crate::cnn::EnglishSuggestions { candidates: vec![], correction: None, known: false,
+            literal_score: None, apostrophe_evidence: vec![] }
+    };
+    let mut display = chinese.clone();
+    if !code.is_empty() {
+        display.push(code.to_owned());
+        display.extend(english.candidates.iter().map(|r| {
+            if code == code.to_uppercase() { r.word.to_uppercase() }
+            else if code.chars().next().is_some_and(|c| c.is_uppercase()) {
+                let mut chars = r.word.chars();
+                chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()
+            } else { r.word.clone() }
+        }));
+    }
+    let mut seen = std::collections::HashSet::new();
+    display.retain(|word| seen.insert(word.clone()));
+    Ok(JoinedSuggestions { chinese, display, english, evidence: None,
+        code_length: code.len().min(12) })
+}
+
 pub fn compose(
     engine: &mut QuickEngine,
     version: u32,

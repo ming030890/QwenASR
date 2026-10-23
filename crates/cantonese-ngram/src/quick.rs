@@ -58,9 +58,10 @@ struct PhraseCache {
     positions: Vec<Vec<Phrase>>,
 }
 
+#[derive(Clone)]
 pub struct QuickDictionary {
     pub version: u32,
-    codes: Vec<Vec<String>>,
+    codes: std::sync::Arc<Vec<Vec<String>>>,
 }
 impl QuickDictionary {
     pub fn from_bytes(bytes: &[u8], version: u32) -> Result<Self, String> {
@@ -81,7 +82,7 @@ impl QuickDictionary {
             let text = std::str::from_utf8(&pool[pair[0]..pair[1]]).map_err(|e| e.to_string())?;
             codes.push(text.chars().map(|c| c.to_string()).collect());
         }
-        Ok(Self { version, codes })
+        Ok(Self { version, codes: std::sync::Arc::new(codes) })
     }
     pub fn code_index(code: &str) -> Option<usize> {
         let code = code.to_ascii_lowercase();
@@ -109,6 +110,28 @@ pub struct QuickEngine {
     distribution_cache: Option<(Vec<usize>, Vec<f32>)>,
 }
 impl QuickEngine {
+    /// Bounded first paint: one greedy character path, with alternatives at
+    /// its last segment. Full beam search and bilingual ranking refine it later.
+    pub fn preview_composition(&mut self, version: u32, code: &str, left: &str, right: &str)
+        -> Result<Vec<String>, String> {
+        if code.len() <= 2 { return self.preview_candidates(version, code, left, right); }
+        if !code.bytes().all(|c| c.is_ascii_alphabetic()) { return Ok(vec![]); }
+        let code = &code[..code.len().min(12)];
+        let mut prefix = String::new();
+        for start in (0..code.len()).step_by(2) {
+            crate::suggestion_request::check()?;
+            let end = (start + 2).min(code.len());
+            let context = format!("{left}{prefix}");
+            let choices = self.preview_candidates(version, &code[start..end], &context, right)?;
+            if end == code.len() {
+                return Ok(choices.into_iter().take(10).map(|s| format!("{prefix}{s}")).collect());
+            }
+            let Some(first) = choices.first() else { return Ok(vec![]); };
+            prefix.push_str(first);
+        }
+        Ok(vec![])
+    }
+
     /// First paint for short codes: rank modeled characters with one distribution,
     /// retaining every byte-fallback character in dictionary order at the end.
     /// Full sequence ranking follows asynchronously and remains authoritative.
@@ -534,7 +557,7 @@ mod tests {
                 codes[QuickDictionary::code_index(code).unwrap()] =
                     text.chars().map(|c| c.to_string()).collect();
             }
-            QuickDictionary { version, codes }
+            QuickDictionary { version, codes: codes.into() }
         }
         QuickEngine::new(
             dictionary(3),
@@ -556,6 +579,21 @@ mod tests {
             }
         }
         assert!(engine.preview_candidates(4, "hi", "", "").is_err());
+    }
+
+    #[test]
+    fn composition_preview_matches_complete_code_and_preserves_final_segment_choices() {
+        let mut engine = engine();
+        for version in [3, 5] {
+            assert_eq!(engine.preview_composition(version, "HIon", "", "").unwrap(), ["我們", "我今"]);
+            assert_eq!(engine.preview_composition(version, "hio", "", "").unwrap(), ["我人"]);
+            for code in ["hi", "hion", "hio"] {
+                let preview = engine.preview_composition(version, code, "", "").unwrap();
+                let full = engine.candidates(version, code, "", "").unwrap();
+                assert!(preview.iter().all(|s| full.contains(s)));
+            }
+            assert!(engine.preview_composition(version, "hi!", "", "").unwrap().is_empty());
+        }
     }
 
     #[test]

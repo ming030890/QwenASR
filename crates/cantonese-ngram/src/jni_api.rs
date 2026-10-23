@@ -57,9 +57,59 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_NativeSh
     }
 }
 
+#[no_mangle]
+pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_NativeSharedSuggestions_nativePreview(
+    mut env: JNIEnv, _class: JClass, handle: jlong, request: jlong, version: jint,
+    code: JString, left: JString, right: JString, english: jni::sys::jboolean,
+) -> jstring {
+    let result = (|| -> Result<String, String> {
+        let token = requests().lock().map_err(|_| "Request registry poisoned")?
+            .get(&request).cloned().ok_or("Suggestion request cancelled")?;
+        let code: String = env.get_string(&code).map_err(|e| e.to_string())?.into();
+        let left: String = env.get_string(&left).map_err(|e| e.to_string())?.into();
+        let right: String = env.get_string(&right).map_err(|e| e.to_string())?.into();
+        if code.len() > 128 || ![0, 3, 5].contains(&version) { return Err("Invalid preview request".into()); }
+        let engine = engines().lock().map_err(|_| "Registry poisoned")?
+            .get(&handle).cloned().ok_or("Closed shared engine")?;
+        let mut engine = engine.preview.lock().map_err(|_| "Preview engine poisoned")?;
+        crate::suggestion_request::run(token, || serde_json::to_string(
+            &crate::suggestions::preview(&mut engine, version as u32, &code, &left, &right, english != 0)?
+        ).map_err(|e| e.to_string()))
+    })();
+    match result {
+        Ok(json) => env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut()),
+        Err(error) => { let _ = env.throw_new("java/lang/IllegalStateException", error); std::ptr::null_mut() }
+    }
+}
+
 // Share immutable NN weights, never mutable inference buffers or the Quick lock.
+#[no_mangle]
+pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_NativeSharedSuggestions_nativeBoundary(
+    mut env: JNIEnv, _class: JClass, handle: jlong, request: jlong, code: JString, left: JString,
+) -> jstring {
+    let result = (|| -> Result<String, String> {
+        let token = requests().lock().map_err(|_| "Request registry poisoned")?
+            .get(&request).cloned().ok_or("Suggestion request cancelled")?;
+        let code: String = env.get_string(&code).map_err(|e| e.to_string())?.into();
+        let left: String = env.get_string(&left).map_err(|e| e.to_string())?.into();
+        if code.len() > 128 { return Err("English input too long".into()); }
+        let engine = engines().lock().map_err(|_| "Registry poisoned")?
+            .get(&handle).cloned().ok_or("Closed shared engine")?;
+        let mut english = engine.english.lock().map_err(|_| "Shared engine poisoned")?;
+        crate::suggestion_request::run(token, || {
+            let model = english.neural.as_mut().ok_or("Shared model missing")?;
+            serde_json::to_string(&model.english_suggestions(&left, &code, 8)?).map_err(|e| e.to_string())
+        })
+    })();
+    match result {
+        Ok(json) => env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut()),
+        Err(error) => { let _ = env.throw_new("java/lang/IllegalStateException", error); std::ptr::null_mut() }
+    }
+}
+
 struct KeyboardEngines {
     quick: Mutex<QuickEngine>,
+    preview: Mutex<QuickEngine>,
     english: Mutex<HybridLanguageModel>,
 }
 static ENGINES: OnceLock<Mutex<HashMap<i64, Arc<KeyboardEngines>>>> = OnceLock::new();
@@ -199,10 +249,13 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_quick_NativeQuic
             } else { Some(CsrLanguageModel::parse(&counts)?) };
             HybridLanguageModel::with_neural(model, counts, &labels)
         };
+        let three = QuickDictionary::from_bytes(&three, 3)?;
+        let five = QuickDictionary::from_bytes(&five, 5)?;
         Ok(KeyboardEngines {
+            preview: Mutex::new(QuickEngine::new(three.clone(), five.clone(), make_lm()?)),
             quick: Mutex::new(QuickEngine::new(
-                QuickDictionary::from_bytes(&three, 3)?,
-                QuickDictionary::from_bytes(&five, 5)?,
+                three,
+                five,
                 make_lm()?,
             )),
             english: Mutex::new(make_lm()?),
@@ -350,6 +403,10 @@ mod tests {
         let dictionary = vec![0; 703 * 4];
         let make_lm = || HybridLanguageModel::with_neural(None, None, &[]).unwrap();
         let engine = Arc::new(KeyboardEngines {
+            preview: Mutex::new(QuickEngine::new(
+                QuickDictionary::from_bytes(&dictionary, 3).unwrap(),
+                QuickDictionary::from_bytes(&dictionary, 5).unwrap(), make_lm(),
+            )),
             quick: Mutex::new(QuickEngine::new(
                 QuickDictionary::from_bytes(&dictionary, 3).unwrap(),
                 QuickDictionary::from_bytes(&dictionary, 5).unwrap(), make_lm(),
@@ -360,6 +417,7 @@ mod tests {
         engines().lock().unwrap().insert(id, engine.clone());
         let occupied = engine.quick.lock().unwrap();
         assert!(engine.english.try_lock().is_ok());
+        assert!(engine.preview.try_lock().is_ok());
         // Traverse the production nativeRank registry path on another worker.
         let (send, receive) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {

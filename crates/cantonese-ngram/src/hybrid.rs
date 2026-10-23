@@ -38,6 +38,21 @@ pub struct HybridLanguageModel {
     neural_to_class: HashMap<usize, usize>,
     fallback_tokenizer: crate::tokenizer::Tokenizer,
 }
+
+fn apply_neural_priors(scores: &mut [f32], supported: &[(usize, usize)], logits: &[f32], weight: f32) {
+    if logits.is_empty() { return; }
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let logsum = max + logits.iter().map(|v| (v - max).exp()).sum::<f32>().ln();
+    // OOV classes retain their visual evidence, with the weakest supported
+    // prior when no finite count fallback is available.
+    let floor = logits.iter().copied().fold(f32::INFINITY, f32::min);
+    for score in scores.iter_mut() {
+        if !score.is_finite() { *score = weight * (floor - logsum); }
+    }
+    for ((index, _), value) in supported.iter().zip(logits) {
+        scores[*index] = weight * (value - logsum);
+    }
+}
 impl HybridLanguageModel {
     pub fn new(
         neural: Option<LanguageModel>,
@@ -239,12 +254,7 @@ impl HybridLanguageModel {
             if !supported.is_empty() {
                 let logits =
                     neural.scores(&ids, &supported.iter().map(|p| p.1).collect::<Vec<_>>())?;
-                let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let logsum = max + logits.iter().map(|v| (v - max).exp()).sum::<f32>().ln();
-                let weight = weights.neural;
-                for ((index, _), value) in supported.iter().zip(logits) {
-                    scores[*index] = weight * (value - logsum);
-                }
+                apply_neural_priors(&mut scores, &supported, &logits, weights.neural);
             }
         }
         Ok((mode, scores))
@@ -283,6 +293,22 @@ impl HybridLanguageModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unmodeled_handwriting_alternatives_cannot_escape_the_language_prior() {
+        // First two classes have equal contextual evidence; the third is OOV.
+        // It should not outrank a stronger visual alternative just because its
+        // missing -infinity prior used to be skipped by recognition fusion.
+        let raw = [-0.01, -1.0, -1.2];
+        let mut priors = [f32::NEG_INFINITY; 3];
+        apply_neural_priors(&mut priors, &[(0, 3), (1, 4)], &[-8.0, -8.0], 1.0);
+        let fused: Vec<_> = raw.iter().zip(priors).map(|(v,p)| v+p).collect();
+        assert!(fused[0] > fused[1] && fused[1] > fused[2]);
+        // Rare characters remain selectable when their strokes are stronger.
+        assert!(0.0 + priors[2] > -1.0 + priors[1]);
+        let mut counts = [f32::NEG_INFINITY, f32::NEG_INFINITY, -3.0];
+        apply_neural_priors(&mut counts, &[(0, 3), (1, 4)], &[-8.0, -8.0], 0.0);
+        assert_eq!(counts, [0.0, 0.0, -3.0]);
+    }
     #[test]
     fn rejects_invalid_calibration_and_accepts_zero_weight() {
         assert!(FusionWeights {

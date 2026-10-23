@@ -34,7 +34,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let version = input["version"].as_u64().unwrap_or(3) as u32;
         let legacy = input["legacy"].as_bool().unwrap_or(false);
         let started = std::time::Instant::now();
-        let mut output = if legacy {
+        let mut output = if input["preview"].as_bool().unwrap_or(false) {
+            suggestion_request::run(Arc::new(AtomicBool::new(false)), || {
+                serde_json::to_value(suggestions::preview(&mut quick, version, code, left, right, true)?)
+                    .map_err(|e| e.to_string())
+            })?
+        } else if legacy {
             let chinese = if version == 0 {
                 vec![]
             } else {
