@@ -363,7 +363,7 @@ impl CnnLanguageModel {
         ranked.sort_by(|a,b|b.score.total_cmp(&a.score).then(a.word.cmp(&b.word)));
         let correction=ranked.first().filter(|best|
             crate::cnn_spelling::accept(&input, known, &best.word, best.completed_chars,
-                best.score, ranked.get(1).map(|runner|runner.score),literal_score))
+                best.score, best.edits, ranked.get(1).map(|r|(r.score, r.edits, r.word.as_str())), literal_score))
             .map(|best|best.word.clone());
         for evidence in &apostrophe_evidence {
             ranked.insert(0, EnglishSuggestion { word: evidence.word.clone(),

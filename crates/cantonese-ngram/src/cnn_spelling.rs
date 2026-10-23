@@ -2,14 +2,31 @@
 
 #[derive(serde::Deserialize)]
 struct AcceptancePolicy {
-    means: [f64; 6], scales: [f64; 6], weights: [f64; 7], threshold: f64,
-    margin_cap: f64, minimum_observed_length: usize, minimum_candidate_length: usize,
+    means: [f64; 19],
+    scales: [f64; 19],
+    w1: [[f64; 19]; 16],
+    b1: [f64; 16],
+    w2: [f64; 16],
+    b2: f64,
+    threshold: f64,
+    margin_cap: f64,
+    minimum_observed_length: usize,
+    minimum_candidate_length: usize,
     preserve_known_words: bool,
 }
 
-/// Coefficients and cutoff fitted on separate mobile prompt groups. The score is
-/// a learned decision value, not a per-user correctness guarantee.
-pub fn accept(typed: &str, known: bool, word: &str, completed: usize, score: f32, runner: Option<f32>, literal: Option<f32>) -> bool {
+/// 2-layer FFN acceptance policy trained on real and synthetic typo data with
+/// learned edit costs and length interactions.
+pub fn accept(
+    typed: &str,
+    known: bool,
+    word: &str,
+    completed: usize,
+    score: f32,
+    edits: u8,
+    runner: Option<(f32, u8, &str)>,
+    literal: Option<f32>,
+) -> bool {
     static POLICY: std::sync::OnceLock<AcceptancePolicy> = std::sync::OnceLock::new();
     let policy = POLICY.get_or_init(|| serde_json::from_str(include_str!("english_acceptance.json"))
         .expect("Invalid compiled English acceptance policy"));
@@ -17,12 +34,118 @@ pub fn accept(typed: &str, known: bool, word: &str, completed: usize, score: f32
         typed.len() < policy.minimum_observed_length || word.len() < policy.minimum_candidate_length {
         return false;
     }
-    let margin = runner.map(|r| score as f64-r as f64).unwrap_or(policy.margin_cap).min(policy.margin_cap);
-    let values = [score as f64, margin, if known {1.} else {0.}, literal.unwrap_or(0.) as f64,
-        literal.map(|s|score as f64-s as f64).unwrap_or(0.), if typed.contains('\'') {1.} else {0.}];
-    let logit = policy.weights[0] + (0..6).map(|i|
-        policy.weights[i+1]*(values[i]-policy.means[i])/policy.scales[i]).sum::<f64>();
-    1. / (1. + (-logit).exp()) >= policy.threshold
+
+    let is_split = word.contains(' ');
+    let penalty = if is_split { 1.5 } else { edit_penalty(typed.as_bytes(), word.as_bytes(), edits) };
+    let raw_score = (score + penalty) as f64;
+
+    let (raw_margin, pen_margin) = match runner {
+        Some((r_score, r_edits, r_word)) => {
+            let r_split = r_word.contains(' ');
+            let r_penalty = if r_split { 1.5 } else { edit_penalty(typed.as_bytes(), r_word.as_bytes(), r_edits) };
+            let r_raw = (r_score + r_penalty) as f64;
+            (
+                (raw_score - r_raw).min(policy.margin_cap),
+                (score as f64 - r_score as f64).min(policy.margin_cap),
+            )
+        }
+        None => (policy.margin_cap, policy.margin_cap),
+    };
+
+    if pen_margin < 2.0 {
+        return false;
+    }
+    if edits >= 2 && score < -18.0 && pen_margin < 5.0 {
+        return false;
+    }
+    if known && literal.map(|lit| score <= lit).unwrap_or(true) {
+        return false;
+    }
+    if is_split {
+        return !known && pen_margin >= 3.0 && score >= -16.0;
+    }
+
+    let lit_score = literal.unwrap_or(0.0) as f64;
+    let score_over_lit = literal.map(|s| raw_score - s as f64).unwrap_or(0.0);
+    let len_typed = typed.len() as f64;
+    let len_word = word.len() as f64;
+    let len_diff = (typed.len().abs_diff(word.len())) as f64;
+    let edit_ratio = (edits as f64) / len_typed.max(1.0);
+
+    let mut adj = 0.0;
+    let mut non_adj = 0.0;
+    let mut swap = 0.0;
+    let mut extra = 0.0;
+    let mut missing = 0.0;
+
+    let typed_b = typed.as_bytes();
+    let word_b = word.as_bytes();
+    if typed_b.len() == word_b.len() {
+        let mut diff_count = 0;
+        let mut a_adj = 0.0;
+        let mut a_non_adj = 0.0;
+        for (&a, &b) in typed_b.iter().zip(word_b.iter()) {
+            if a != b {
+                diff_count += 1;
+                if qwerty_adjacent(a, b) {
+                    a_adj += 1.0;
+                } else {
+                    a_non_adj += 1.0;
+                }
+            }
+        }
+        if diff_count == edits as usize {
+            adj = a_adj;
+            non_adj = a_non_adj;
+        } else {
+            swap = edits as f64;
+            non_adj = word_b.iter().filter(|b| !typed_b.contains(b)).count() as f64;
+        }
+    } else {
+        if typed_b.len() > word_b.len() {
+            extra = 1.0;
+        } else {
+            missing = 1.0;
+        }
+    }
+
+    let first_diff = if !typed_b.is_empty() && !word_b.is_empty() && typed_b[0] != word_b[0] { 1.0 } else { 0.0 };
+    let is_space_split = if is_split { 1.0 } else { 0.0 };
+    let apostrophe_feat = if typed.contains('\'') || typed.contains('’') { 1.0 } else { 0.0 };
+
+    let values = [
+        raw_score,
+        lit_score,
+        score_over_lit,
+        raw_margin,
+        pen_margin,
+        if known { 1.0 } else { 0.0 },
+        len_typed,
+        len_word,
+        len_diff,
+        edits as f64,
+        edit_ratio,
+        adj,
+        non_adj,
+        swap,
+        extra,
+        missing,
+        first_diff,
+        is_space_split,
+        apostrophe_feat,
+    ];
+
+    let mut hidden = policy.b1;
+    for i in 0..16 {
+        for j in 0..19 {
+            hidden[i] += policy.w1[i][j] * (values[j] - policy.means[j]) / policy.scales[j];
+        }
+        if hidden[i] < 0.0 {
+            hidden[i] = 0.0;
+        }
+    }
+    let logit = policy.b2 + (0..16).map(|i| hidden[i] * policy.w2[i]).sum::<f64>();
+    1.0 / (1.0 + (-logit).exp()) >= policy.threshold
 }
 
 pub fn canonical(word: &str) -> Option<String> {
@@ -156,13 +279,13 @@ mod tests {
 
     #[test]
     fn learned_acceptance_compares_the_literal_and_never_automatically_completes() {
-        assert!(accept("teh", false, "the", 0, -5., Some(-15.),None));
-        assert!(!accept("name", true, "word", 0, -5., Some(-15.),Some(-1.)));
-        assert!(accept("hou", true, "you", 0, -3., Some(-15.),Some(-15.)));
-        assert!(!accept("hou", true, "you", 0, -3., Some(-15.),None));
-        assert!(!accept("hel", false, "hello", 2, -5., Some(-15.),None));
-        assert!(!accept("name", false, "word", 0, -20., Some(-20.1),None));
-        assert!(!accept("a", false, "and", 0, -1., Some(-20.),None));
+        assert!(accept("teh", false, "the", 0, -5., 1, Some((-15., 1, "tea")), None));
+        assert!(!accept("name", true, "word", 0, -5., 1, Some((-15., 1, "ward")), Some(-1.)));
+        assert!(accept("hou", true, "you", 0, -3., 1, Some((-15., 1, "how")), Some(-15.)));
+        assert!(!accept("hou", true, "you", 0, -3., 1, Some((-15., 1, "how")), None));
+        assert!(!accept("hel", false, "hello", 2, -5., 2, Some((-15., 0, "help")), None));
+        assert!(!accept("name", false, "word", 0, -20., 1, Some((-20.1, 1, "ward")), None));
+        assert!(!accept("a", false, "and", 0, -1., 0, Some((-20., 0, "any")), None));
     }
     #[test]
     fn fitted_costs_preserve_operation_order_without_a_position_prior() {
