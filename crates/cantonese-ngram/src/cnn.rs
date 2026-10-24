@@ -2,7 +2,7 @@
 //! Context is BOS + the last 32 canonical tokens, exactly as in V2 evaluation.
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 #[derive(Deserialize)]
@@ -20,8 +20,10 @@ impl Tensor {
         self.q[row*n..(row+1)*n].iter().map(|&v|v as f32*self.scale).collect()
     }
     fn linear(&self, x: &[f32], bias: &Tensor) -> Vec<f32> {
-        let n=self.shape[1];
-        (0..self.shape[0]).map(|i|crate::dot(&self.q[i*n..(i+1)*n],x)*self.scale+bias.values[i]).collect()
+        debug_assert_eq!(self.shape[1], x.len());
+        let mut values = crate::dot_matrix(&self.q, x);
+        for (score, &bias) in values.iter_mut().zip(&bias.values) { *score = *score*self.scale+bias; }
+        values
     }
 }
 #[derive(Debug, Clone, Serialize)]
@@ -41,15 +43,36 @@ pub struct EnglishSuggestions {
     pub literal_score: Option<f32>,
     pub apostrophe_evidence: Vec<ApostropheEvidence>,
 }
+/// Eligible spellings and split forms, enumerated without inference.
+pub struct EnglishCandidatePool {
+    input: String,
+    pool: Vec<(String, Vec<usize>, u8, usize)>,
+    known: bool,
+    literal_ids: Vec<usize>,
+    merge_splits: Vec<(usize,usize)>,
+    apostrophes: Vec<&'static crate::cnn_spelling::ApostropheForm>,
+}
+
 struct Weights {
     raw: Box<[u8]>, tokens: Vec<String>, ids: HashMap<String,usize>, english: Regex,
-    spellings: Vec<(String, Vec<usize>)>, words: HashSet<usize>, embedding: usize, ffn: usize, dilations: Vec<usize>,
+    spellings: Vec<(String, Vec<usize>)>, spelling_index: crate::spelling_index::SpellingIndex, words: HashSet<usize>, embedding: usize, ffn: usize, dilations: Vec<usize>,
     tensors: HashMap<String,Tensor>,
 }
 static SHARED: OnceLock<Mutex<Weak<Weights>>> = OnceLock::new();
 
+// Exact causal state at a scored prefix. Eight checkpoints cost at most 1.46 MiB
+// per inference instance with this model; weights remain shared across workers.
+const PREFIX_CHECKPOINTS: usize = 8;
+struct PrefixCheckpoint {
+    prefix: Vec<usize>,
+    buffers: Vec<Vec<f32>>,
+    projected: Vec<f32>,
+}
+
 pub struct CnnLanguageModel {
     weights: Arc<Weights>, buffers: Vec<Vec<f32>>, prefix: Vec<usize>, projected: Vec<f32>, include_bos: bool,
+    checkpoints: VecDeque<PrefixCheckpoint>,
+    normalized_projections: VecDeque<(Vec<usize>, Vec<f32>, f32)>,
 }
 impl CnnLanguageModel {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self,String> {
@@ -59,7 +82,7 @@ impl CnnLanguageModel {
             None=>{let w=Arc::new(Self::parse(bytes)?);*cache=Arc::downgrade(&w);w}
         };
         let buffers=weights.dilations.iter().map(|&d|vec![0.;2*d*weights.ffn]).collect();
-        Ok(Self {weights,buffers,prefix:Vec::new(),projected:Vec::new(),include_bos:true})
+        Ok(Self {weights,buffers,prefix:Vec::new(),projected:Vec::new(),include_bos:true,checkpoints:VecDeque::new(),normalized_projections:VecDeque::new()})
     }
     fn parse(bytes:&[u8])->Result<Weights,String> {
         if bytes.get(..8)!=Some(b"KBCNN01\0") || bytes.len()<12 {return Err("Invalid CNN header".into());}
@@ -121,7 +144,9 @@ impl CnnLanguageModel {
                 spellings.entry(word).or_default().push(id);
             }
         }
-        Ok(Weights {raw:bytes.into(),tokens:meta.tokens,ids,spellings:spellings.into_iter().collect(),words:meta.english_word_ids.into_iter().collect(),
+        let spellings: Vec<_> = spellings.into_iter().collect();
+        let spelling_index = crate::spelling_index::SpellingIndex::new(spellings.iter().map(|(w,_)|w.as_str()));
+        Ok(Weights {raw:bytes.into(),tokens:meta.tokens,ids,spellings,spelling_index,words:meta.english_word_ids.into_iter().collect(),
             english:Regex::new(r"^[A-Za-z0-9]+(?:['’\-][A-Za-z0-9]+)*").unwrap(),
             embedding:meta.embed_dim,ffn:meta.ffn_dim,dilations:meta.dilations,tensors})
     }
@@ -170,6 +195,8 @@ impl CnnLanguageModel {
         if self.include_bos != include {
             self.include_bos = include;
             self.prefix.clear(); self.projected.clear();
+            self.checkpoints.clear();
+            self.normalized_projections.clear();
             self.buffers.iter_mut().for_each(|b|b.fill(0.));
         }
     }
@@ -184,8 +211,24 @@ impl CnnLanguageModel {
             self.prefix.clear(); self.projected=vec![0.;self.weights.embedding];
             return Ok(());
         }
-        let from=if !self.prefix.is_empty() && sequence.starts_with(&self.prefix) {self.prefix.len()} else {
-            self.buffers.iter_mut().for_each(|b|b.fill(0.));0
+        // Candidate branches often share most of their causal context. Restore
+        // the longest exact checkpoint instead of replaying it from BOS. A sliding
+        // 32-token window must still match from its start; overlap alone is unsafe.
+        let current = if sequence.starts_with(&self.prefix) { self.prefix.len() } else { 0 };
+        let saved = self.checkpoints.iter().enumerate()
+            .filter(|(_, state)| state.prefix.len() > current && sequence.starts_with(&state.prefix))
+            .max_by_key(|(_, state)| state.prefix.len()).map(|(i, _)| i);
+        let from = if let Some(index) = saved {
+            let state = self.checkpoints.remove(index).unwrap();
+            self.buffers.clone_from(&state.buffers);
+            self.projected.clone_from(&state.projected);
+            let from = state.prefix.len();
+            self.checkpoints.push_back(state);
+            from
+        } else if current > 0 {
+            current
+        } else {
+            self.buffers.iter_mut().for_each(|b| b.fill(0.)); 0
         };
         for &id in &sequence[from..] {
             if let Err(error)=crate::suggestion_request::check() {
@@ -197,6 +240,12 @@ impl CnnLanguageModel {
         }
         self.prefix=sequence;
         if self.projected.iter().any(|v|!v.is_finite()) {return Err("Nonfinite CNN projection".into());}
+        if !self.checkpoints.iter().any(|state| state.prefix == self.prefix) {
+            if self.checkpoints.len() == PREFIX_CHECKPOINTS { self.checkpoints.pop_front(); }
+            self.checkpoints.push_back(PrefixCheckpoint {
+                prefix: self.prefix.clone(), buffers: self.buffers.clone(), projected: self.projected.clone(),
+            });
+        }
         Ok(())
     }
     pub fn scores(&mut self,ids:&[usize],targets:&[usize])->Result<Vec<f32>,String> {
@@ -207,13 +256,92 @@ impl CnnLanguageModel {
             Ok(crate::dot(&e.q[id*w.embedding..(id+1)*w.embedding],&self.projected)*e.scale+b[id])
         }).collect()
     }
+    pub fn log_probabilities_for(&mut self, ids: &[usize], targets: &[usize]) -> Result<Vec<f32>, String> {
+        crate::suggestion_request::check()?;
+        if targets.iter().any(|&id| id >= self.vocabulary_size()) { return Err("Invalid CNN candidate".into()); }
+        if let Some(values)=self.cached_target_scores(ids,targets) { return Ok(values); }
+        let values = self.log_probabilities(ids)?;
+        Ok(targets.iter().map(|&id| values[id]).collect())
+    }
+    fn cached_target_scores(&mut self, ids: &[usize], targets: &[usize]) -> Option<Vec<f32>> {
+        if let Some(values) = crate::suggestion_request::cached_targets(ids, targets) { return Some(values); }
+        let reusable = crate::suggestion_request::projection(ids).or_else(|| {
+            // Consecutive keys revisit the same Chinese/byte prefixes. Keep a
+            // small exact cache across requests on this independent worker.
+            let index = self.normalized_projections.iter().position(|(key, _, _)| key == ids)?;
+            let row = self.normalized_projections.remove(index).unwrap();
+            let result = (row.1.clone(), row.2);
+            self.normalized_projections.push_back(row);
+            Some(result)
+        });
+        if let Some((projected, z)) = reusable {
+            let w = &self.weights;
+            let e = &w.tensors["embedding.weight"]; let b = &w.tensors["output_bias"].values;
+            return Some(targets.iter().map(|&id| {
+                (crate::dot(&e.q[id*w.embedding..(id+1)*w.embedding], &projected)*e.scale+b[id])-z
+            }).collect());
+        }
+        None
+    }
+
+    pub fn log_probabilities_for_many(&mut self, requests: &[(Vec<usize>,Vec<usize>)]) -> Result<Vec<Vec<f32>>,String> {
+        let mut result=vec![vec![];requests.len()];
+        // Bound temporary output storage to four full tables, independent of pool size.
+        for (block,requests) in requests.chunks(16).enumerate() {
+            let mut missing=vec![];
+            for (index,(ids,targets)) in requests.iter().enumerate() {
+                crate::suggestion_request::check()?;
+                if targets.iter().any(|&id|id>=self.vocabulary_size()) { return Err("Invalid CNN candidate".into()); }
+                if let Some(values)=self.cached_target_scores(ids,targets) {
+                    result[block*16+index]=values;
+                } else {
+                    self.project(ids)?;
+                    missing.push((index,self.projected.clone()));
+                }
+            }
+            for batch in missing.chunks(4) {
+                crate::suggestion_request::check()?;
+                let projected:Vec<_>=batch.iter().map(|(_,p)|p.clone()).collect();
+                let w=&self.weights;let embedding=&w.tensors["embedding.weight"];let bias=&w.tensors["output_bias"];
+                let mut values=if batch.len()==4 {
+                    let mut values=crate::dot_matrix_batch4(&embedding.q,&projected);
+                    for row in &mut values {
+                        for (score,&bias) in row.iter_mut().zip(&bias.values) { *score=*score*embedding.scale+bias; }
+                    }
+                    crate::suggestion_request::record_output_batch(4);
+                    values
+                } else { projected.iter().map(|p|embedding.linear(p,bias)).collect() };
+                for ((index,p),values) in batch.iter().zip(values.drain(..)) {
+                    let (ids,targets)=&requests[*index];
+                    let values=self.normalize_output(ids,p,values)?;
+                    result[block*16+index]=targets.iter().map(|&id|values[id]).collect();
+                }
+            }
+        }
+        Ok(result)
+    }
+
     pub fn log_probabilities(&mut self,ids:&[usize])->Result<Vec<f32>,String> {
         crate::suggestion_request::check()?;
         if let Some(values)=crate::suggestion_request::cached(ids) {return Ok(values);}
-        let targets:Vec<_>=(0..self.vocabulary_size()).collect();
-        let mut values=self.scores(ids,&targets)?;
+        self.project(ids)?;
+        // This path always needs the complete vocabulary, in row order. Avoid
+        // materializing/validating 65,536 target IDs and use the tiled kernel.
+        let values=self.weights.tensors["embedding.weight"].linear(
+            &self.projected, &self.weights.tensors["output_bias"]);
+        let projected=self.projected.clone();
+        self.normalize_output(ids,&projected,values)
+    }
+
+    fn normalize_output(&mut self,ids:&[usize],projected:&[f32],mut values:Vec<f32>)->Result<Vec<f32>,String> {
         let max=values.iter().copied().fold(f32::NEG_INFINITY,f32::max);
         let z=max+values.iter().map(|v|(v-max).exp()).sum::<f32>().ln();
+        crate::suggestion_request::remember_projection(ids, projected, z);
+        if let Some(index) = self.normalized_projections.iter().position(|(key, _, _)| key == ids) {
+            self.normalized_projections.remove(index);
+        }
+        if self.normalized_projections.len() == 128 { self.normalized_projections.pop_front(); }
+        self.normalized_projections.push_back((ids.to_vec(), projected.to_vec(), z));
         values.iter_mut().for_each(|v|*v-=z);
         crate::suggestion_request::check()?;
         crate::suggestion_request::remember(ids,&values);
@@ -243,24 +371,102 @@ impl CnnLanguageModel {
         self.english_suggestions_with_touch(left,typed,limit,None)
     }
     pub fn english_suggestions_with_touch(&mut self,left:&str,typed:&str,limit:usize,touch:Option<&crate::touch::TouchScorer>)->Result<EnglishSuggestions,String> {
+        let pool = self.generate_english_candidates(typed)?;
+        self.rank_english_candidates(left,pool,limit,touch)
+    }
+
+    pub fn generate_english_candidates(&self, typed: &str) -> Result<Option<EnglishCandidatePool>,String> {
         let Some(input)=crate::cnn_spelling::canonical(typed) else {
-            return Ok(EnglishSuggestions {candidates:vec![],correction:None,known:false,literal_score:None,apostrophe_evidence:vec![]});
+            return Ok(None);
         };
         let radius=if input.len()>=6 {3}else if input.len()>=4 {2}else{1};
         let mut pool=Vec::new();
         let mut known=false;
         let mut literal_ids=Vec::new();
-        for (word,ids) in &self.weights.spellings {
+        for (index, edits) in self.weights.spelling_index.matches(&input, radius, true)? {
             crate::suggestion_request::check()?;
-            if word==&input {known=true;literal_ids=ids.clone();continue;}
-            let completion=word.starts_with(&input);
-            let edits=if completion {0}else {
-                match crate::cnn_spelling::distance(input.as_bytes(),word.as_bytes(),radius) {
-                    Some(n)=>n,None=>continue
+            let (word,ids) = &self.weights.spellings[index];
+            if word==&input {
+                known=true;
+                literal_ids=ids.clone();
+                let has_canonical_casing = ids.iter().any(|&id| {
+                    let t = &self.weights.tokens[id];
+                    t != &input && ((t.len() > 1 && t[1..].chars().any(|c| c.is_ascii_uppercase())) || t == "I")
+                });
+                if !has_canonical_casing {
+                    continue;
                 }
-            };
+            }
+            let completion=word.starts_with(&input);
             pool.push((word.clone(),ids.clone(),edits,if completion {word.len()-input.len()}else{0}));
         }
+        let mut merge_splits = Vec::new();
+        if !known && input.len() >= 4 {
+            let valid_len = |w: &str| w.len() >= 2 || matches!(w, "a" | "i");
+            let is_word = |w: &str| -> Option<usize> {
+                if valid_len(w) {
+                    self.weights.spellings.binary_search_by(|(cand, _)| cand.as_str().cmp(w)).ok()
+                } else {
+                    None
+                }
+            };
+            // 1. Direct split (omitted space), e.g. yousupport -> you support, alot -> a lot
+            for k in 1..input.len() {
+                let w1 = &input[..k];
+                let w2 = &input[k..];
+                if valid_len(w1) && valid_len(w2) {
+                    let o1 = is_word(w1);
+                    let o2 = is_word(w2);
+                    if let (Some(idx1), Some(idx2)) = (o1, o2) {
+                        merge_splits.push((idx1, idx2));
+                    } else if let (Some(idx1), None) = (o1, o2) {
+                        for (idx2, _) in self.weights.spelling_index.matches(w2, 1, false)? {
+                            merge_splits.push((idx1, idx2));
+                        }
+                    } else if let (None, Some(idx2)) = (o1, o2) {
+                        for (idx1, _) in self.weights.spelling_index.matches(w1, 1, false)? {
+                            merge_splits.push((idx1, idx2));
+                        }
+                    }
+                }
+            }
+            // 2. Space-adjacent key mistap (b, n, v, c, m), e.g. youbsupport -> you support, isbfien -> is fine
+            if input.len() >= 5 {
+                for k in 1..input.len() - 1 {
+                    let ch = input.as_bytes()[k];
+                    if matches!(ch, b'b' | b'n' | b'v' | b'c' | b'm') {
+                        let w1 = &input[..k];
+                        let w2 = &input[k + 1..];
+                        if valid_len(w1) && valid_len(w2) {
+                            let o1 = is_word(w1);
+                            let o2 = is_word(w2);
+                            if let (Some(idx1), Some(idx2)) = (o1, o2) {
+                                merge_splits.push((idx1, idx2));
+                            } else if let (Some(idx1), None) = (o1, o2) {
+                                for (idx2, _) in self.weights.spelling_index.matches(w2, 1, false)? {
+                            merge_splits.push((idx1, idx2));
+                        }
+                            } else if let (None, Some(idx2)) = (o1, o2) {
+                                for (idx1, _) in self.weights.spelling_index.matches(w1, 1, false)? {
+                            merge_splits.push((idx1, idx2));
+                        }
+                            }
+                        }
+                    }
+                }
+            }
+            merge_splits.sort_unstable();
+            merge_splits.dedup();
+        }
+        let apostrophes = crate::cnn_spelling::apostrophe_forms(&input).collect();
+        Ok(Some(EnglishCandidatePool { input, pool, known, literal_ids, merge_splits, apostrophes }))
+    }
+
+    pub fn rank_english_candidates(&mut self, left: &str, pool: Option<EnglishCandidatePool>, limit: usize,
+        touch: Option<&crate::touch::TouchScorer>) -> Result<EnglishSuggestions,String> {
+        let Some(EnglishCandidatePool { input, pool, known, literal_ids, merge_splits, apostrophes }) = pool else {
+            return Ok(EnglishSuggestions {candidates:vec![],correction:None,known:false,literal_score:None,apostrophe_evidence:vec![]});
+        };
         let context=self.context(left);
         let logp=self.log_probabilities(&context)?;
         // Reuse the same distribution as candidate ranking; no extra CNN pass.
@@ -275,44 +481,18 @@ impl CnnLanguageModel {
             } else {
                 crate::cnn_spelling::edit_penalty(input.as_bytes(), word.as_bytes(), edits)
             };
-            let word_str = if input_is_lower { word } else { self.weights.tokens[id].clone() };
+            let token_str = &self.weights.tokens[id];
+            let word_str = if (token_str.len() > 1 && token_str[1..].chars().any(|c| c.is_ascii_uppercase())) || token_str == "I" {
+                token_str.clone()
+            } else if input_is_lower {
+                word
+            } else {
+                token_str.clone()
+            };
             EnglishSuggestion {word:word_str, score:logp[id]-penalty,
                 edits,completed_chars}
         }).collect();
-        if !known && input.len() >= 5 {
-            let mut merge_splits = Vec::new();
-            // Case 1: Direct split (omitted space), e.g. yousupport -> you support
-            for k in 2..input.len() - 1 {
-                let w1 = &input[..k];
-                let w2 = &input[k..];
-                if w1.len() >= 2 && w2.len() >= 2 {
-                    if let (Ok(idx1), Ok(idx2)) = (
-                        self.weights.spellings.binary_search_by(|(w, _)| w.as_str().cmp(w1)),
-                        self.weights.spellings.binary_search_by(|(w, _)| w.as_str().cmp(w2)),
-                    ) {
-                        merge_splits.push((idx1, idx2, 1, 1.5f32));
-                    }
-                }
-            }
-            // Case 2: Space-adjacent key mistap (b, n, v, c, m), e.g. youbsupport -> you support
-            if input.len() >= 6 {
-                for k in 2..input.len() - 2 {
-                    let ch = input.as_bytes()[k];
-                    if matches!(ch, b'b' | b'n' | b'v' | b'c' | b'm') {
-                        let w1 = &input[..k];
-                        let w2 = &input[k + 1..];
-                        if w1.len() >= 2 && w2.len() >= 2 {
-                            if let (Ok(idx1), Ok(idx2)) = (
-                                self.weights.spellings.binary_search_by(|(w, _)| w.as_str().cmp(w1)),
-                                self.weights.spellings.binary_search_by(|(w, _)| w.as_str().cmp(w2)),
-                            ) {
-                                merge_splits.push((idx1, idx2, 1, 1.0f32));
-                            }
-                        }
-                    }
-                }
-            }
-            for (idx1, idx2, edits, penalty_base) in merge_splits {
+            for (idx1, idx2) in merge_splits {
                 let (w1, ids1) = &self.weights.spellings[idx1];
                 let (w2, ids2) = &self.weights.spellings[idx2];
                 let id1 = ids1.iter().copied().max_by(|&a,&b| logp[a].total_cmp(&logp[b]).then(b.cmp(&a))).unwrap();
@@ -320,7 +500,9 @@ impl CnnLanguageModel {
                 let text1 = if input_is_lower { w1.as_str() } else { self.weights.tokens[id1].as_str() };
                 let text2 = if input_is_lower { w2.as_str() } else { self.weights.tokens[id2].as_str() };
                 let combined_word = format!("{text1} {text2}");
-                let score = logp[id1] + logp[id2] * 0.5 - penalty_base;
+                let edits = crate::cnn_spelling::distance(input.as_bytes(), combined_word.as_bytes(), 3).unwrap_or(2);
+                let penalty = crate::cnn_spelling::edit_penalty(input.as_bytes(), combined_word.as_bytes(), edits);
+                let score = logp[id1] + logp[id2] * 0.5 - penalty;
                 ranked.push(EnglishSuggestion {
                     word: combined_word,
                     score,
@@ -328,13 +510,12 @@ impl CnnLanguageModel {
                     completed_chars: 0,
                 });
             }
-        }
         // Restore punctuation using the same CNN's byte fallback. Word-token and
         // byte-sequence scores have different units, so restoration is calibrated
         // separately on TRAIN instead of treating a byte average as a word score.
         // Punctuation restoration has a separately calibrated policy. Leave it
         // intact in this coordinate-only letter-substitution experiment.
-        if crate::cnn_spelling::apostrophe_forms(&input).next().is_none() {
+        if apostrophes.is_empty() {
             if let Some(touch) = touch {
                 for row in &mut ranked {
                     row.score += touch.adjustment(&row.word, row.edits, row.completed_chars);
@@ -344,7 +525,7 @@ impl CnnLanguageModel {
         let original_best = ranked.iter().map(|r|r.score).max_by(f32::total_cmp);
         let mut apostrophe_evidence = Vec::new();
         let mut restored = None;
-        for form in crate::cnn_spelling::apostrophe_forms(&input) {
+        for form in apostrophes {
             let ids = self.tokenize_with_units(&form.word).0;
             let mut context = context.clone();
             let mut score = 0.;
@@ -395,6 +576,125 @@ impl CnnLanguageModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "Set CANTONESE_CNN_TEST_MODEL to the packaged shared model"]
+    fn prefix_checkpoints_match_cold_inference_bit_for_bit() {
+        let bytes = std::fs::read(std::env::var("CANTONESE_CNN_TEST_MODEL").expect("Model fixture path")).unwrap();
+        let mut cached = CnnLanguageModel::from_bytes(&bytes).unwrap();
+        let mut cold = CnnLanguageModel::from_bytes(&bytes).unwrap();
+        let mut contexts = vec!["", "我想", "我想去", "我想食", "我想去食", "我想去飲", "I have a ", "I have a problem "]
+            .into_iter().map(String::from).collect::<Vec<_>>();
+        // Exceed cache capacity, revisit branches, then shift a full context window.
+        for i in 1..=12 { contexts.push("我".repeat(i)); }
+        contexts.extend(["我想去", "I have a ", "", "我們"].into_iter().map(String::from));
+        contexts.extend(["我".repeat(32), "我".repeat(31) + "們", "我".repeat(32) + "們"]);
+        for include_bos in [true, false, true] {
+            cached.set_include_bos(include_bos);
+            cold.set_include_bos(include_bos);
+            for left in &contexts {
+                let ids = cached.context(left);
+                cold.prefix.clear(); cold.projected.clear(); cold.checkpoints.clear();
+                cold.buffers.iter_mut().for_each(|b| b.fill(0.));
+                let actual = cached.log_probabilities(&ids).unwrap();
+                let expected = cold.log_probabilities(&ids).unwrap();
+                assert_eq!(actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "BOS={include_bos} context={left}");
+                assert!(cached.checkpoints.len() <= PREFIX_CHECKPOINTS);
+                assert!(cached.normalized_projections.len() <= 128);
+            }
+        }
+        let token = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ids = cached.context("取消之後仍然正確");
+        assert!(crate::suggestion_request::run(token.clone(), || {
+            token.store(true, std::sync::atomic::Ordering::Release);
+            cached.scores(&ids, &[8])
+        }).is_err());
+        cold.prefix.clear(); cold.projected.clear(); cold.checkpoints.clear();
+        cold.buffers.iter_mut().for_each(|b| b.fill(0.));
+        assert_eq!(cached.log_probabilities(&ids).unwrap(), cold.log_probabilities(&ids).unwrap());
+    }
+
+    #[test]
+    #[ignore = "Set CANTONESE_CNN_TEST_MODEL to the packaged shared model"]
+    fn compact_projection_scores_survive_distribution_eviction_exactly() {
+        let bytes = std::fs::read(std::env::var("CANTONESE_CNN_TEST_MODEL").expect("Model fixture path")).unwrap();
+        let mut model = CnnLanguageModel::from_bytes(&bytes).unwrap();
+        let ids = model.context("我想去食飯");
+        let expected = model.log_probabilities(&ids).unwrap();
+        let targets = [8, 12, 256, model.vocabulary_size() - 1, 8];
+        crate::suggestion_request::run(Arc::new(std::sync::atomic::AtomicBool::new(false)), || {
+            let filler = vec![0.; model.vocabulary_size()];
+            crate::suggestion_request::remember(&[usize::MAX], &filler); // Pin a different table.
+            model.log_probabilities(&ids)?;
+            let want = targets.iter().map(|&id| expected[id]).collect::<Vec<_>>();
+            assert_eq!(model.log_probabilities_for(&ids, &targets)?, want);
+            for i in 0..40 { crate::suggestion_request::remember(&[usize::MAX, i], &filler); }
+            assert!(crate::suggestion_request::cached_targets(&ids, &targets).is_none());
+            assert_eq!(model.log_probabilities_for(&ids, &targets)?, want);
+            assert_eq!(crate::suggestion_request::stats().projection_hits, 1);
+            // Compact-cache eviction falls back to ordinary exact inference.
+            for i in 0..1025 {
+                crate::suggestion_request::remember_projection(&[usize::MAX, i], &[0.; 128], 0.);
+            }
+            assert!(crate::suggestion_request::projection(&ids).is_none());
+            model.normalized_projections.clear();
+            assert_eq!(model.log_probabilities_for(&ids, &targets)?, want);
+            assert!(model.log_probabilities_for(&ids, &[model.vocabulary_size()]).is_err());
+            Ok(())
+        }).unwrap();
+        assert!(crate::suggestion_request::projection(&ids).is_none());
+        // Reuse across independent key requests keeps the exact normalizer.
+        crate::suggestion_request::run(Arc::new(std::sync::atomic::AtomicBool::new(false)), || {
+            assert_eq!(model.log_probabilities_for(&ids, &targets)?, targets.iter().map(|&id| expected[id]).collect::<Vec<_>>());
+            assert_eq!(crate::suggestion_request::stats().forwards, 0);
+            Ok(())
+        }).unwrap();
+        model.set_include_bos(false);
+        assert!(model.normalized_projections.is_empty());
+        assert!(model.checkpoints.is_empty());
+    }
+
+    #[test]
+    #[ignore="Set CANTONESE_CNN_TEST_MODEL to the packaged shared model"]
+    fn candidate_enumeration_runs_no_inference_and_batch_ranking_is_exact() {
+        let bytes=std::fs::read(std::env::var("CANTONESE_CNN_TEST_MODEL").unwrap()).unwrap();
+        let mut model=CnnLanguageModel::from_bytes(&bytes).unwrap();
+        crate::suggestion_request::run(Arc::new(std::sync::atomic::AtomicBool::new(false)),|| {
+            for typed in ["teh","continue","youbsupport","dont","problem"] {
+                model.generate_english_candidates(typed)?;
+                let radius=if typed.len()>=6 {3}else if typed.len()>=4 {2}else{1};
+                for (distance, completions) in [(radius,true),(1,false)] {
+                    let expected: Vec<_> = model.weights.spellings.iter().enumerate().filter_map(|(id,(word,_))| {
+                        if completions && word.starts_with(typed) { Some((id,0)) } else {
+                            crate::cnn_spelling::distance(typed.as_bytes(),word.as_bytes(),distance).map(|d| (id,d))
+                        }
+                    }).collect();
+                    assert_eq!(model.weights.spelling_index.matches(typed,distance,completions)?,expected);
+                }
+            }
+            assert_eq!(crate::suggestion_request::stats().forwards,0);
+            assert!(model.prefix.is_empty());
+            Ok(())
+        }).unwrap();
+        let contexts=["","我","我想","我想去","我想食","I have a ","I have a problem "];
+        let requests=(0..23).map(|i|(model.context(contexts[i%contexts.len()]),vec![8,12,256,model.vocabulary_size()-1])).collect::<Vec<_>>();
+        let mut scalar=CnnLanguageModel::from_bytes(&bytes).unwrap();
+        let expected=requests.iter().map(|(ids,targets)|scalar.log_probabilities_for(ids,targets).unwrap()).collect::<Vec<_>>();
+        crate::suggestion_request::run(Arc::new(std::sync::atomic::AtomicBool::new(false)),|| {
+            let actual=model.log_probabilities_for_many(&requests)?;
+            assert_eq!(actual,expected);
+            assert!(crate::suggestion_request::stats().output_batches>0);
+            assert_eq!(model.log_probabilities_for_many(&requests)?,expected);
+            Ok(())
+        }).unwrap();
+        let token=Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(crate::suggestion_request::run(token.clone(),|| {
+            token.store(true,std::sync::atomic::Ordering::Release);
+            model.log_probabilities_for_many(&requests)
+        }).is_err());
+        assert_eq!(model.log_probabilities_for_many(&requests).unwrap(),expected);
+    }
+
     #[test] fn rejects_incomplete_bundles() {
         for bytes in [b"".as_slice(),b"KBCNN01\0".as_slice(),b"KBCNN01\0\xff\xff\xff\xff".as_slice()] {
             assert!(CnnLanguageModel::from_bytes(bytes).is_err());

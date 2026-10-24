@@ -233,7 +233,7 @@ fn test_real_assets_tam_jai() {
 
     let mut pool = q_candidates.clone();
     pool.push("yjodfdve".to_string());
-    let order = cantonese_engine::quick::rank_mixed(&mut engine.lm, "", "", &pool).unwrap();
+    let order = cantonese_engine::quick::rank_mixed(&mut engine.lm, "", "", &pool, "yjodfdve").unwrap();
     let reranked: Vec<_> = order.iter().map(|&i| &pool[i]).collect();
     let reranked_tam_pos = reranked.iter().position(|c| *c == "譚仔米線").unwrap();
     let reranked_en_pos = reranked.iter().position(|c| *c == "yjodfdve").unwrap();

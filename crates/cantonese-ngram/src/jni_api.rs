@@ -46,7 +46,7 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_NativeSh
         let code:String=env.get_string(&code).map_err(|e|e.to_string())?.into();
         let left:String=env.get_string(&left).map_err(|e|e.to_string())?.into();
         let right:String=env.get_string(&right).map_err(|e|e.to_string())?.into();
-        if code.len()>128 || ![0,3,5].contains(&version) {return Err("Invalid composing request".into());}
+        if ![0,3,5].contains(&version) {return Err("Invalid composing request".into());}
         let engine=engines().lock().map_err(|_|"Registry poisoned")?.get(&handle).cloned().ok_or("Closed shared engine")?;
         let mut engine=engine.quick.lock().map_err(|_|"Shared engine poisoned")?;
         crate::suggestion_request::run(token,||serde_json::to_string(&crate::suggestions::compose(&mut engine,version as u32,&code,&left,&right,english!=0)?).map_err(|e|e.to_string()))
@@ -68,7 +68,7 @@ pub extern "system" fn Java_com_madeinhk_cantonesevoicekeyboard_english_NativeSh
         let code: String = env.get_string(&code).map_err(|e| e.to_string())?.into();
         let left: String = env.get_string(&left).map_err(|e| e.to_string())?.into();
         let right: String = env.get_string(&right).map_err(|e| e.to_string())?.into();
-        if code.len() > 128 || ![0, 3, 5].contains(&version) { return Err("Invalid preview request".into()); }
+        if ![0, 3, 5].contains(&version) { return Err("Invalid preview request".into()); }
         let engine = engines().lock().map_err(|_| "Registry poisoned")?
             .get(&handle).cloned().ok_or("Closed shared engine")?;
         let mut engine = engine.preview.lock().map_err(|_| "Preview engine poisoned")?;

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 pub mod counts;
 pub mod cnn;
 mod cnn_spelling;
+mod spelling_index;
 pub mod touch;
 pub mod hwr;
 pub mod hybrid;
@@ -118,6 +119,97 @@ fn dot(q: &[i8], x: &[f32]) -> f32 {
         q.iter().zip(x).map(|(&w, &v)| w as f32 * v).sum()
     }
 }
+/// Four independent rows share activation loads. Keep each row's two NEON
+/// accumulators and reduction order identical to `dot`, including scalar tails.
+fn dot_matrix(q: &[i8], x: &[f32]) -> Vec<f32> {
+    assert!(!x.is_empty() && q.len() % x.len() == 0);
+    let columns = x.len();
+    let rows = q.len() / columns;
+    let mut output = vec![0.; rows];
+    let mut row = 0;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let end = columns / 8 * 8;
+        while row + 4 <= rows {
+            let mut a0 = vdupq_n_f32(0.); let mut b0 = vdupq_n_f32(0.);
+            let mut a1 = vdupq_n_f32(0.); let mut b1 = vdupq_n_f32(0.);
+            let mut a2 = vdupq_n_f32(0.); let mut b2 = vdupq_n_f32(0.);
+            let mut a3 = vdupq_n_f32(0.); let mut b3 = vdupq_n_f32(0.);
+            for i in (0..end).step_by(8) {
+                let low = vld1q_f32(x.as_ptr().add(i));
+                let high = vld1q_f32(x.as_ptr().add(i + 4));
+                macro_rules! accumulate {
+                    ($offset:expr, $a:ident, $b:ident) => {{
+                        let w = vmovl_s8(vld1_s8(q.as_ptr().add((row + $offset)*columns + i)));
+                        $a = vfmaq_f32($a, vcvtq_f32_s32(vmovl_s16(vget_low_s16(w))), low);
+                        $b = vfmaq_f32($b, vcvtq_f32_s32(vmovl_s16(vget_high_s16(w))), high);
+                    }};
+                }
+                accumulate!(0, a0, b0); accumulate!(1, a1, b1);
+                accumulate!(2, a2, b2); accumulate!(3, a3, b3);
+            }
+            let sums = [vaddvq_f32(vaddq_f32(a0, b0)), vaddvq_f32(vaddq_f32(a1, b1)),
+                vaddvq_f32(vaddq_f32(a2, b2)), vaddvq_f32(vaddq_f32(a3, b3))];
+            for offset in 0..4 {
+                let tail = q[(row+offset)*columns+end..(row+offset+1)*columns].iter()
+                    .zip(&x[end..]).map(|(&w, &v)| w as f32*v).sum::<f32>();
+                output[row+offset] = sums[offset] + tail;
+            }
+            row += 4;
+        }
+    }
+    while row < rows {
+        output[row] = dot(&q[row*columns..(row+1)*columns], x);
+        row += 1;
+    }
+    output
+}
+
+/// Score four independent contexts against the same matrix. Convert each INT8
+/// weight vector once, preserving each context's original accumulation order.
+fn dot_matrix_batch4(q: &[i8], xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    assert_eq!(xs.len(),4);
+    let columns = xs[0].len();
+    assert!(columns > 0 && xs.iter().all(|x|x.len()==columns) && q.len()%columns==0);
+    #[cfg(not(target_arch="aarch64"))]
+    { xs.iter().map(|x|dot_matrix(q,x)).collect() }
+    #[cfg(target_arch="aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let rows=q.len()/columns;
+        let end=columns/8*8;
+        let mut out=vec![vec![0.;rows];4];
+        for row in 0..rows {
+            let mut a0=vdupq_n_f32(0.);let mut b0=vdupq_n_f32(0.);
+            let mut a1=vdupq_n_f32(0.);let mut b1=vdupq_n_f32(0.);
+            let mut a2=vdupq_n_f32(0.);let mut b2=vdupq_n_f32(0.);
+            let mut a3=vdupq_n_f32(0.);let mut b3=vdupq_n_f32(0.);
+            for i in (0..end).step_by(8) {
+                let w=vmovl_s8(vld1_s8(q.as_ptr().add(row*columns+i)));
+                let low=vcvtq_f32_s32(vmovl_s16(vget_low_s16(w)));
+                let high=vcvtq_f32_s32(vmovl_s16(vget_high_s16(w)));
+                macro_rules! accumulate {
+                    ($context:expr,$a:ident,$b:ident)=>{{
+                        $a=vfmaq_f32($a,low,vld1q_f32(xs[$context].as_ptr().add(i)));
+                        $b=vfmaq_f32($b,high,vld1q_f32(xs[$context].as_ptr().add(i+4)));
+                    }};
+                }
+                accumulate!(0,a0,b0);accumulate!(1,a1,b1);
+                accumulate!(2,a2,b2);accumulate!(3,a3,b3);
+            }
+            let sums=[vaddvq_f32(vaddq_f32(a0,b0)),vaddvq_f32(vaddq_f32(a1,b1)),
+                vaddvq_f32(vaddq_f32(a2,b2)),vaddvq_f32(vaddq_f32(a3,b3))];
+            for context in 0..4 {
+                let tail=q[row*columns+end..(row+1)*columns].iter().zip(&xs[context][end..])
+                    .map(|(&w,&v)|w as f32*v).sum::<f32>();
+                out[context][row]=sums[context]+tail;
+            }
+        }
+        out
+    }
+}
+
 fn norm(x: &[f32], weight: &Tensor, bias: &Tensor) -> Vec<f32> {
     norm_values(x, &weight.values, &bias.values)
 }
@@ -514,6 +606,38 @@ impl LanguageModel {
 #[cfg(test)]
 mod prediction_tests {
     use super::*;
+    #[test]
+    fn context_batch_matrix_matches_independent_rows_bit_for_bit() {
+        for columns in [1,7,8,9,16,127,128,129,384,768] {
+            for rows in [0,1,3,4,5,17,129] {
+                let q=(0..rows*columns).map(|i|(i*37+13) as u8 as i8).collect::<Vec<_>>();
+                let xs=(0..4).map(|seed|(0..columns).map(|i|((i*11+seed*7)%29) as f32/17.-0.8).collect()).collect::<Vec<Vec<_>>>();
+                let got=dot_matrix_batch4(&q,&xs);
+                for (got,x) in got.iter().zip(&xs) {
+                    let want=dot_matrix(&q,x);
+                    assert_eq!(got.iter().map(|v|v.to_bits()).collect::<Vec<_>>(),want.iter().map(|v|v.to_bits()).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tiled_int8_matrix_matches_existing_dot_bit_for_bit() {
+        for columns in [1, 3, 7, 8, 9, 15, 16, 17, 127, 128, 129, 384, 768] {
+            for rows in 0..10 {
+                for seed in [0, 1, 17] {
+                    let q = (0..rows*columns).map(|i| (i*37+seed*13) as u8 as i8).collect::<Vec<_>>();
+                    let x = (0..columns).map(|i| ((i*11+seed)%29) as f32/17.-0.8).collect::<Vec<_>>();
+                    let expected = q.chunks_exact(columns).map(|r| dot(r, &x).to_bits()).collect::<Vec<_>>();
+                    let actual = dot_matrix(&q, &x).into_iter().map(f32::to_bits).collect::<Vec<_>>();
+                    assert_eq!(actual, expected, "rows={rows} columns={columns} seed={seed}");
+                }
+                let x = vec![0.; columns];
+                assert_eq!(dot_matrix(&vec![-128; rows*columns], &x), vec![0.; rows]);
+            }
+        }
+    }
+
     #[test]
     fn int16_dot_matches_scalar_for_signed_values_and_simd_tails() {
         for size in [0,1,7,8,9,17,128] {

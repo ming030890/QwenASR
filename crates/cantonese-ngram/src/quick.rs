@@ -2,7 +2,6 @@
 use crate::hybrid::{HybridLanguageModel, Mode};
 use std::collections::HashSet;
 
-pub const MAX_QUICK_CHARACTERS: usize = 6;
 /// Maximum relative log-probability deficit allowed for a candidate compared to the best
 /// candidate of the same character count before being pruned as very low probability.
 /// 8.0 log points corresponds to relative probability ~ e^-8 ≈ 0.033%.
@@ -102,6 +101,21 @@ impl QuickDictionary {
             .unwrap_or(&[])
     }
 }
+/// A compact representation of every dictionary-compatible phrase. Edges keep
+/// the shared dictionary entries, so generation needs no LM or Cartesian expansion.
+pub struct QuickCandidateLattice {
+    version: u32,
+    code: String,
+    dictionary: QuickDictionary,
+    transitions: Vec<Vec<(usize, usize)>>, // end position -> (start, dictionary index)
+}
+impl QuickCandidateLattice {
+    fn source(&self, start: usize, end: usize) -> &[String] {
+        self.transitions[end].iter().find(|(s, _)| *s == start)
+            .map(|(_, index)| self.dictionary.codes[*index].as_slice()).unwrap_or(&[])
+    }
+}
+
 pub struct QuickEngine {
     three: QuickDictionary,
     five: QuickDictionary,
@@ -110,26 +124,49 @@ pub struct QuickEngine {
     distribution_cache: Option<(Vec<usize>, Vec<f32>)>,
 }
 impl QuickEngine {
-    /// Bounded first paint: one greedy character path, with alternatives at
-    /// its last segment. Full beam search and bilingual ranking refine it later.
-    pub fn preview_composition(&mut self, version: u32, code: &str, left: &str, right: &str)
+    pub fn generate_lattice(&self, version: u32, code: &str) -> Result<QuickCandidateLattice, String> {
+        let dictionary = match version { 3 => self.three.clone(), 5 => self.five.clone(), _ => return Err("Unknown Quick version".into()) };
+        let code = code.to_ascii_lowercase();
+        let valid = code.bytes().all(|b| b.is_ascii_lowercase());
+        let mut transitions = vec![vec![]; code.len()+1];
+        if valid {
+            for end in 1..=code.len() {
+                crate::suggestion_request::check()?;
+                for size in 1..=2.min(end) {
+                    if end == 2 && size == 1 && code.len() <= 2 { continue; }
+                    let start = end-size;
+                    let index = QuickDictionary::code_index(&code[start..end]).unwrap();
+                    if !dictionary.codes[index].is_empty() { transitions[end].push((start,index)); }
+                }
+            }
+        }
+        Ok(QuickCandidateLattice { version, code, dictionary, transitions })
+    }
+
+    pub fn rank_preview_lattice(&mut self, lattice: &QuickCandidateLattice, left: &str, right: &str)
         -> Result<Vec<String>, String> {
-        if code.len() <= 2 { return self.preview_candidates(version, code, left, right); }
+        let code = &lattice.code;
+        if code.len() <= 2 { return self.rank_characters(lattice.source(0,code.len()),left,right); }
         if !code.bytes().all(|c| c.is_ascii_alphabetic()) { return Ok(vec![]); }
-        let code = &code[..code.len().min(12)];
         let mut prefix = String::new();
         for start in (0..code.len()).step_by(2) {
             crate::suggestion_request::check()?;
-            let end = (start + 2).min(code.len());
+            let end = (start+2).min(code.len());
             let context = format!("{left}{prefix}");
-            let choices = self.preview_candidates(version, &code[start..end], &context, right)?;
-            if end == code.len() {
-                return Ok(choices.into_iter().take(10).map(|s| format!("{prefix}{s}")).collect());
-            }
+            let choices = self.rank_characters(lattice.source(start,end), &context, right)?;
+            if end == code.len() { return Ok(choices.into_iter().take(10).map(|s|format!("{prefix}{s}")).collect()); }
             let Some(first) = choices.first() else { return Ok(vec![]); };
             prefix.push_str(first);
         }
         Ok(vec![])
+    }
+
+    /// Fast Chinese pool: one greedy character path over the complete input,
+    /// with alternatives at its last segment. Both stages then rank bilingually.
+    pub fn preview_composition(&mut self, version: u32, code: &str, left: &str, right: &str)
+        -> Result<Vec<String>, String> {
+        let lattice = self.generate_lattice(version, code)?;
+        self.rank_preview_lattice(&lattice, left, right)
     }
 
     /// First paint for short codes: rank modeled characters with one distribution,
@@ -137,13 +174,12 @@ impl QuickEngine {
     /// Full sequence ranking follows asynchronously and remains authoritative.
     pub fn preview_candidates(&mut self, version: u32, code: &str, left: &str, right: &str)
         -> Result<Vec<String>, String> {
-        let dictionary = match version {
-            3 => &self.three,
-            5 => &self.five,
-            _ => return Err("Unknown Quick version".into()),
-        };
-        if QuickDictionary::code_index(code).is_none() { return Ok(Vec::new()); }
-        let source = dictionary.candidates(code);
+        let lattice = self.generate_lattice(version, code)?;
+        if code.len() > 2 { return Ok(vec![]); }
+        self.rank_characters(lattice.source(0,code.len()),left,right)
+    }
+
+    fn rank_characters(&mut self, source: &[String], left: &str, right: &str) -> Result<Vec<String>,String> {
         if source.is_empty() { return Ok(Vec::new()); }
         if self.lm.mode(left, right) != Mode::Neural {
             let order = self.lm.rank(left, right, source)?;
@@ -181,8 +217,8 @@ impl QuickEngine {
     /// code, then retain the best matching transitions. Never truncate the
     /// global vocabulary or dictionary before applying the code constraint.
     pub fn collect_candidates(&mut self, version:u32, code:&str, left:&str, right:&str)->Result<Vec<String>,String> {
-        if code.len()<=2 {return self.preview_candidates(version,code,left,right);}
-        self.candidates_impl(version,code,left,right,true)
+        let lattice = self.generate_lattice(version,code)?;
+        self.rank_lattice(&lattice,left,right,true)
     }
 
     pub fn candidates(
@@ -195,18 +231,16 @@ impl QuickEngine {
         self.candidates_impl(version,code,left,right,false)
     }
     fn candidates_impl(&mut self,version:u32,code:&str,left:&str,right:&str,joined:bool)->Result<Vec<String>,String> {
-        let dictionary = match version {
-            3 => &self.three,
-            5 => &self.five,
-            _ => return Err("Unknown Quick version".into()),
-        };
-        let code = code.to_ascii_lowercase();
-        if code.is_empty()
-            || code.len() > MAX_QUICK_CHARACTERS * 2
-            || !code.bytes().all(|b| b.is_ascii_lowercase())
-        {
-            return Ok(Vec::new());
-        }
+        let lattice = self.generate_lattice(version,code)?;
+        self.rank_lattice(&lattice,left,right,joined)
+    }
+
+    pub fn rank_lattice(&mut self, lattice: &QuickCandidateLattice, left: &str, right: &str, joined: bool) -> Result<Vec<String>,String> {
+        let version = lattice.version;
+        let dictionary = &lattice.dictionary;
+        let code = &lattice.code;
+        if code.is_empty() || !code.bytes().all(|b| b.is_ascii_lowercase()) { return Ok(vec![]); }
+        if joined && code.len() <= 2 { return self.rank_characters(lattice.source(0,code.len()),left,right); }
         if self
             .cache
             .as_ref()
@@ -244,38 +278,22 @@ impl QuickEngine {
             .count();
         cache.positions.truncate(common + 1);
         // Each position considers both a root code and a two-letter Quick code.
-        // Keep separate beams by character count so one-letter codes cannot crowd
-        // out longer codes that are needed to stay within the six-character cap.
+        // Keep separate beams by character count so root-only and two-key
+        // segmentations remain available for the complete composition.
         for end in cache.positions.len()..=code.len() {
             crate::suggestion_request::check()?;
             let mut paths = Vec::new();
-            for size in 1..=2.min(end) {
-                // In Quick, when the user has typed only 2 letters, it represents a single
-                // 2-letter character code. Expanding size=1 (two 1-letter root keys) wastes
-                // ~20 neural forward passes to find 2-character root phrases that are never
-                // displayed ahead of the 2-letter character candidates.
-                if end == 2 && size == 1 && code.len() <= 2 {
-                    continue;
-                }
-                let start = end - size;
-                let source = dictionary.candidates(&code[start..end]);
-                if source.is_empty() {
-                    continue;
-                }
+            for &(start, index) in &lattice.transitions[end] {
+                let source = lattice.dictionary.codes[index].as_slice();
                 // ARM mobile optimization: dictionary candidates are ordered by frequency.
                 let source_slice = if !joined && source.len() > MAX_SEGMENT_CANDIDATES { &source[..MAX_SEGMENT_CANDIDATES] } else { source };
                 let best_prefix_score = cache.positions[start].first().map(|p| p.score).unwrap_or(0.0);
-                for prefix in &cache.positions[start] {
+                let prefixes:Vec<_>=cache.positions[start].iter().filter(|prefix|
+                    prefix.characters==0 || prefix.score>=best_prefix_score-PREFIX_PRUNE_DELTA).collect();
+                let contexts:Vec<_>=prefixes.iter().map(|p|format!("{left}{}",p.text)).collect();
+                let all_scores=sequence_scores_many(&mut self.lm,&mut self.distribution_cache,&contexts,right,source_slice)?;
+                for (prefix,scores) in prefixes.into_iter().zip(all_scores) {
                     crate::suggestion_request::check()?;
-                    if prefix.characters == MAX_QUICK_CHARACTERS {
-                        continue;
-                    }
-                    // Prune prefixes that have very low probability compared to best at this position
-                    if prefix.characters > 0 && prefix.score < best_prefix_score - PREFIX_PRUNE_DELTA {
-                        continue;
-                    }
-                    let context = format!("{left}{}", prefix.text);
-                    let scores = sequence_scores(&mut self.lm, &mut self.distribution_cache, &context, right, source_slice)?;
                     let mut matching:Vec<_>=(0..source_slice.len()).collect();
                     if joined {
                         matching.sort_by(|&a,&b|scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
@@ -306,14 +324,14 @@ impl QuickEngine {
             // Intelligent probability pruning:
             // 1. Find best score overall and per character-count.
             let best_score = paths.first().map(|p| p.score).unwrap_or(0.0);
-            let mut best_by_chars = [f32::NEG_INFINITY; MAX_QUICK_CHARACTERS + 1];
+            let mut best_by_chars = vec![f32::NEG_INFINITY; end + 1];
             for p in &paths {
                 if p.score > best_by_chars[p.characters] {
                     best_by_chars[p.characters] = p.score;
                 }
             }
 
-            let mut counts = [0; MAX_QUICK_CHARACTERS + 1];
+            let mut counts = vec![0; end + 1];
             let mut seen = HashSet::new();
             paths.retain(|p| {
                 // Prune beams when they become very low probability:
@@ -481,6 +499,22 @@ pub fn rank_mixed(lm: &mut HybridLanguageModel, left: &str, right: &str, candida
 
 // Normalize over the full neural vocabulary. Normalizing only over one code's
 // matches would give a one-letter root with one match an unfair probability of 1.
+fn sequence_scores_many(lm:&mut HybridLanguageModel, distribution_cache:&mut Option<(Vec<usize>,Vec<f32>)>,
+    contexts:&[String],right:&str,source:&[String])->Result<Vec<Vec<f32>>,String> {
+    if matches!(lm.neural,Some(crate::NeuralLanguageModel::Cnn(_))) {
+        let neural=lm.neural.as_mut().unwrap();
+        let ids_by_candidate:Vec<_>=source.iter().map(|text|neural.token_id(text)).collect();
+        let targets:Vec<_>=ids_by_candidate.iter().filter_map(|&id|id).collect();
+        let requests:Vec<_>=contexts.iter().map(|left|(neural.context(left,right),targets.clone())).collect();
+        return Ok(neural.log_probabilities_for_many(&requests)?.into_iter().map(|scores| {
+            let mut scores=scores.into_iter();
+            ids_by_candidate.iter().enumerate().map(|(i,id)|id.and_then(|_|scores.next())
+                .filter(|v|v.is_finite()).unwrap_or(-20.-(i as f32+1.).ln())).collect()
+        }).collect());
+    }
+    contexts.iter().map(|left|sequence_scores(lm,distribution_cache,left,right,source)).collect()
+}
+
 fn sequence_scores(
     lm: &mut HybridLanguageModel,
     distribution_cache: &mut Option<(Vec<usize>, Vec<f32>)>,
@@ -491,6 +525,16 @@ fn sequence_scores(
     if lm.mode(left, right) == Mode::Neural {
         let neural = lm.neural.as_mut().unwrap();
         let ids = neural.context(left, right);
+        if matches!(neural, crate::NeuralLanguageModel::Cnn(_)) {
+            let ids_by_candidate: Vec<_> = source.iter().map(|text| neural.token_id(text)).collect();
+            let targets: Vec<_> = ids_by_candidate.iter().filter_map(|&id| id).collect();
+            let scores = neural.log_probabilities_for(&ids, &targets)?;
+            let mut scores = scores.into_iter();
+            return Ok(ids_by_candidate.into_iter().enumerate().map(|(i, id)| {
+                id.and_then(|_| scores.next()).filter(|v| v.is_finite())
+                    .unwrap_or(-20. - (i as f32 + 1.).ln())
+            }).collect());
+        }
         let hit = distribution_cache.as_ref().map(|(cached_ids, _)| cached_ids == &ids).unwrap_or(false);
         if !hit {
             let values = neural.log_probabilities(&ids)?;
@@ -521,6 +565,29 @@ fn sequence_scores(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn candidate_lattice_retains_all_dictionary_edges_without_inference() {
+        let engine=engine();
+        for version in [3,5] {
+            for code in ["hi","hion","qhion","hionhionhionhion"] {
+                crate::suggestion_request::run(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),|| {
+                    let graph=engine.generate_lattice(version,code)?;
+                    assert_eq!(graph.transitions.len(),code.len()+1);
+                    for end in 1..=code.len() {
+                        for &(start,index) in &graph.transitions[end] {
+                            assert_eq!(graph.source(start,end),graph.dictionary.codes[index]);
+                            assert_eq!(Some(index),QuickDictionary::code_index(&code[start..end]));
+                        }
+                    }
+                    assert_eq!(crate::suggestion_request::stats().forwards,0);
+                    Ok(())
+                }).unwrap();
+            }
+            let graph=engine.generate_lattice(version,&"hion".repeat(70)).unwrap();
+            assert_eq!(graph.transitions.len(),281);
+        }
+    }
+
     #[test]
     fn language_evidence_requires_a_model_and_strong_chinese_support() {
         assert!(engine().language_evidence("qqqqqq", "", "", "手手手手手手").unwrap().is_none());
@@ -615,18 +682,20 @@ mod tests {
     }
 
     #[test]
-    fn cap_counts_characters_and_cache_handles_edits_and_context_changes() {
+    fn unlimited_composition_and_cache_handle_edits_and_context_changes() {
         let mut engine = engine();
-        for code in ["qqqqqq", "hionhionhion", "qhionqhion"] {
-            let phrases = engine.candidates(3, code, "", "").unwrap();
-            assert!(!phrases.is_empty());
-            assert!(phrases.iter().all(|p| p.chars().count() <= 6));
+        for version in [3, 5] {
+            for count in [6, 7, 13, 24] {
+                let code = "q".repeat(count);
+                let expected = "手".repeat(count);
+                assert_eq!(engine.candidates(version, &code, "", "").unwrap(), [expected.clone()]);
+            }
+            let code = "hion".repeat(4);
+            assert!(!engine.collect_candidates(version, &code, "", "").unwrap().is_empty());
+            let preview = engine.preview_composition(version, &code, "", "").unwrap();
+            assert!(!preview.is_empty());
+            assert!(preview.iter().all(|p| p.chars().count() == 8));
         }
-        assert!(engine.candidates(3, "qqqqqqq", "", "").unwrap().is_empty());
-        assert!(engine
-            .candidates(3, "hionhionhionhi", "", "")
-            .unwrap()
-            .is_empty());
         assert!(engine.candidates(3, "hi!", "", "").unwrap().is_empty());
         for (code, left, right) in [
             ("hion", "", ""),

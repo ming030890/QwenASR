@@ -2,9 +2,9 @@
 
 #[derive(serde::Deserialize)]
 struct AcceptancePolicy {
-    means: [f64; 20],
-    scales: [f64; 20],
-    w1: [[f64; 20]; 24],
+    means: Vec<f64>,
+    scales: Vec<f64>,
+    w1: Vec<Vec<f64>>,
     b1: [f64; 24],
     w2: [f64; 24],
     b2: f64,
@@ -16,7 +16,7 @@ struct AcceptancePolicy {
 }
 
 /// 2-layer FFN acceptance policy trained on real and synthetic typo data with
-/// learned edit costs and length interactions.
+/// learned edit costs, length interactions and optional dictionary evidence.
 pub fn accept(
     typed: &str,
     known: bool,
@@ -28,8 +28,20 @@ pub fn accept(
     literal: Option<f32>,
 ) -> bool {
     static POLICY: std::sync::OnceLock<AcceptancePolicy> = std::sync::OnceLock::new();
-    let policy = POLICY.get_or_init(|| serde_json::from_str(include_str!("english_acceptance.json"))
-        .expect("Invalid compiled English acceptance policy"));
+    let policy = POLICY.get_or_init(|| {
+        let policy: AcceptancePolicy = serde_json::from_str(include_str!("english_acceptance.json"))
+            .expect("Invalid compiled English acceptance policy");
+        let inputs = policy.means.len();
+        assert!(matches!(inputs, 20 | 22) && policy.scales.len() == inputs &&
+            policy.w1.len() == 24 && policy.w1.iter().all(|row| row.len() == inputs) &&
+            policy.scales.iter().all(|v| v.is_finite() && *v > 0.0),
+            "Invalid compiled acceptance feature dimensions");
+        policy
+    });
+    if word.eq_ignore_ascii_case(typed) && word != typed {
+        return true;
+    }
+
     if (known && (policy.preserve_known_words || literal.is_none())) ||
         typed.len() < policy.minimum_observed_length || word.len() < policy.minimum_candidate_length {
         return false;
@@ -122,11 +134,16 @@ pub fn accept(
         is_space_split,
         apostrophe_feat,
         completed_feat,
+        if policy.means.len() == 22 && dictionary_contains(&typed.replace('’', "'").to_ascii_lowercase()) { 1.0 } else { 0.0 },
+        if policy.means.len() == 22 && {
+            let lower = word.to_ascii_lowercase();
+            if is_split { lower.split(' ').all(dictionary_contains) } else { dictionary_contains(&lower) }
+        } { 1.0 } else { 0.0 },
     ];
 
     let mut hidden = policy.b1;
     for i in 0..24 {
-        for j in 0..20 {
+        for j in 0..policy.means.len() {
             hidden[i] += policy.w1[i][j] * (values[j] - policy.means[j]) / policy.scales[j];
         }
         if hidden[i] < 0.0 {
@@ -135,6 +152,14 @@ pub fn accept(
     }
     let logit = policy.b2 + (0..24).map(|i| hidden[i] * policy.w2[i]).sum::<f64>();
     1.0 / (1.0 + (-logit).exp()) >= policy.threshold
+}
+
+/// A spelling feature, never a blanket veto or an automatic replacement rule.
+/// Pinned SCOWL-derived forms and their notices are bundled with the policy.
+pub fn dictionary_contains(word: &str) -> bool {
+    static WORDS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    WORDS.get_or_init(|| include_str!("english_valid_words.txt").lines().collect())
+        .binary_search(&word).is_ok()
 }
 
 pub fn canonical(word: &str) -> Option<String> {
@@ -167,7 +192,7 @@ pub fn accept_apostrophe(features: [f64; 3]) -> bool {
 /// Optimal string alignment: insertion, deletion, substitution, adjacent swap.
 pub fn distance(input: &[u8], word: &[u8], radius: usize) -> Option<u8> {
     let len_diff = input.len().abs_diff(word.len());
-    if input.is_empty() || input.len() > 32 || word.len() > 32 || len_diff > 1 || len_diff > radius {
+    if input.is_empty() || input.len() > 32 || word.len() > 32 || len_diff > radius {
         return None;
     }
     let mut previous = [0u8; 33];
@@ -191,6 +216,9 @@ pub fn distance(input: &[u8], word: &[u8], radius: usize) -> Option<u8> {
 }
 
 pub fn qwerty_adjacent(a: u8, b: u8) -> bool {
+    if a == b { return false; }
+    if a == b' ' { return matches!(b, b'c' | b'v' | b'b' | b'n' | b'm'); }
+    if b == b' ' { return matches!(a, b'c' | b'v' | b'b' | b'n' | b'm'); }
     const ROWS: [&[u8]; 3] = [b"qwertyuiop", b"asdfghjkl", b"zxcvbnm"];
     let pos = |c: u8| -> Option<(usize, usize)> {
         for (r, row) in ROWS.iter().enumerate() {
@@ -253,6 +281,19 @@ pub fn edit_penalty(input: &[u8], word: &[u8], edits: u8) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dictionary_feature_is_sorted_and_supports_affixed_spelling_evidence() {
+        let words: Vec<_> = include_str!("english_valid_words.txt").lines().collect();
+        assert!(words.len() > 100_000);
+        assert!(words.windows(2).all(|pair| pair[0] < pair[1]));
+        for word in ["keyboard", "keyboards", "is", "typo"] {
+            assert!(dictionary_contains(word), "{word}");
+        }
+        for input in ["", "keyboarrdds", "report_v2.csv", "name@example.com"] {
+            assert!(!dictionary_contains(input), "{input}");
+        }
+    }
+
     #[test]
     fn restores_only_attested_missing_apostrophes_with_calibrated_evidence() {
         let input = canonical("DONT").unwrap();

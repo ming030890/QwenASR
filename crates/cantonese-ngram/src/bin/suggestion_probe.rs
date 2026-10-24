@@ -1,4 +1,4 @@
-//! Host comparison of the old composing pipeline and joined distribution filtering.
+//! Host probe of joined candidate generation, ranking, and inference counters.
 use cantonese_engine::{
     hybrid::HybridLanguageModel,
     quick::{QuickDictionary, QuickEngine},
@@ -36,8 +36,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let started = std::time::Instant::now();
         let mut output = if input["preview"].as_bool().unwrap_or(false) {
             suggestion_request::run(Arc::new(AtomicBool::new(false)), || {
-                serde_json::to_value(suggestions::preview(&mut quick, version, code, left, right, true)?)
-                    .map_err(|e| e.to_string())
+                let mut result = serde_json::to_value(suggestions::preview(&mut quick, version, code, left, right, true)?)
+                    .map_err(|e| e.to_string())?;
+                result["scoring"] = serde_json::to_value(suggestion_request::stats()).map_err(|e| e.to_string())?;
+                Ok(result)
             })?
         } else if legacy {
             let chinese = if version == 0 {

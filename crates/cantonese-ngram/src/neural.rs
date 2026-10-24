@@ -123,11 +123,26 @@ impl NeuralLanguageModel {
     pub fn completions(&mut self,left:&str,prefix:&str,limit:usize)->Result<Vec<TokenPrediction>,String> {
         match self {Self::Cnn(m)=>m.completions(left,prefix,limit),_=>Err("Shared CNN required for completions".into())}
     }
+    pub fn generate_english_candidates(&self, typed: &str) -> Result<Option<crate::cnn::EnglishCandidatePool>,String> {
+        match self { Self::Cnn(model) => model.generate_english_candidates(typed), _ => Err("Shared CNN required for spelling suggestions".into()) }
+    }
+    pub fn rank_english_candidates(&mut self, left: &str, pool: Option<crate::cnn::EnglishCandidatePool>, limit: usize) -> Result<crate::cnn::EnglishSuggestions,String> {
+        match self { Self::Cnn(model) => model.rank_english_candidates(left,pool,limit,None), _ => Err("Shared CNN required for spelling suggestions".into()) }
+    }
     pub fn english_suggestions(&mut self,left:&str,typed:&str,limit:usize)->Result<crate::cnn::EnglishSuggestions,String> {
         match self {Self::Cnn(m)=>m.english_suggestions(left,typed,limit),_=>Err("Shared CNN required for spelling suggestions".into())}
     }
     pub fn english_suggestions_with_touch(&mut self,left:&str,typed:&str,limit:usize,touch:Option<&crate::touch::TouchScorer>)->Result<crate::cnn::EnglishSuggestions,String> {
         match self {Self::Cnn(m)=>m.english_suggestions_with_touch(left,typed,limit,touch),_=>Err("Shared CNN required for spelling suggestions".into())}
+    }
+    pub fn log_probabilities_for_many(&mut self, requests: &[(Vec<usize>,Vec<usize>)]) -> Result<Vec<Vec<f32>>,String> {
+        if let Self::Cnn(model)=self { return model.log_probabilities_for_many(requests); }
+        requests.iter().map(|(ids,targets)|self.log_probabilities_for(ids,targets)).collect()
+    }
+    pub fn log_probabilities_for(&mut self, ids: &[usize], targets: &[usize]) -> Result<Vec<f32>, String> {
+        if let Self::Cnn(model) = self { return model.log_probabilities_for(ids, targets); }
+        let values = self.log_probabilities(ids)?;
+        Ok(targets.iter().map(|&id| values[id]).collect())
     }
     pub fn log_probabilities(&mut self,ids:&[usize])->Result<Vec<f32>,String> {
         if let Self::Cnn(m)=self {return m.log_probabilities(ids);}
@@ -207,10 +222,19 @@ pub fn score_sequences(model:&mut NeuralLanguageModel,left:&str,right:&str,candi
             logical_units,cohesion_log_probability:0.,tokens:tokens.len(),supported,spelling_log_probability:None,spelling_characters:None});
     }
     let mut independent_distribution = None;
+    let mut requests=vec![];let mut mappings=vec![];
     for (context,targets) in groups {
-        let scores=model.log_probabilities(&context)?;
-        if context == initial { independent_distribution = Some(scores.clone()); }
-        for (candidate,position,token) in targets {paths[candidate][position]=scores[token];}
+        if context==initial {
+            let scores=model.log_probabilities(&context)?;
+            for (candidate,position,token) in targets { paths[candidate][position]=scores[token]; }
+            independent_distribution=Some(scores);
+        } else {
+            let tokens=targets.iter().map(|&(_,_,token)|token).collect();
+            requests.push((context,tokens));mappings.push(targets);
+        }
+    }
+    for (targets,scores) in mappings.into_iter().zip(model.log_probabilities_for_many(&requests)?) {
+        for ((candidate,position,_),score) in targets.into_iter().zip(scores) { paths[candidate][position]=score; }
     }
     for ((row,path),text) in result.iter_mut().zip(paths).zip(candidates) {
         if row.supported {
