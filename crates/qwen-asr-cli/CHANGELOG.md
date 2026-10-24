@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.8.0](https://github.com/ming030890/QwenASR/compare/qwen-asr-cli-v0.7.0...qwen-asr-cli-v0.8.0) (2026-10-24)
+
+
+### Features
+
+* add Android (arm64-v8a) build support via cargo-ndk ([bced854](https://github.com/ming030890/QwenASR/commit/bced854ed7459defa211895fa9ba9d70161925bf))
+* add missing parameter to qwen asr offline model ([f56e8b1](https://github.com/ming030890/QwenASR/commit/f56e8b1e58731344fad92a7ed38c59a9f09267f6))
+* add missing parameter to qwen asr offline model ([6d1e38d](https://github.com/ming030890/QwenASR/commit/6d1e38da19cbae46c2afe2e1af03a5d437679ef8))
+* **asr:** add offline-packed KleidiAI inference ([ad7be66](https://github.com/ming030890/QwenASR/commit/ad7be668b60ec467a6f013ea7a841b350b0dbaf9))
+* **asr:** optimize quantized inference latency ([18391d6](https://github.com/ming030890/QwenASR/commit/18391d69addf19f8fffa8e124856740263c3dfc2))
+* **asr:** reduce Qwen INT8 inference memory ([fe1d46a](https://github.com/ming030890/QwenASR/commit/fe1d46a8b50d25ff80c47b89ca95478babdc54f5))
+* document benchmarked ASR performance ([f3b33a0](https://github.com/ming030890/QwenASR/commit/f3b33a0863c815fedbdac18650e2b673af53efbe))
+* improve the live stream performace on macos ([ba47230](https://github.com/ming030890/QwenASR/commit/ba47230403f897bde2486b3235cfd3f5ca24e293))
+* overhaul streaming ASR inference ([f158494](https://github.com/ming030890/QwenASR/commit/f158494dd12893d0245a080617f93c2da4be9c29))
+* publish qwen-asr-cli binary to crates.io ([31ae992](https://github.com/ming030890/QwenASR/commit/31ae99221d71fdcd6c40b6cfe4d77e7f67642b76))
+* support live from blackhold for macos for qwen-asr-cli ([724ead1](https://github.com/ming030890/QwenASR/commit/724ead1fe121d0ed0a0f7ef874142f665e7d0da3))
+* **yue-tools:** add score subcommand to analyze token-by-token ASR and pure LM log probabilities ([7dce552](https://github.com/ming030890/QwenASR/commit/7dce55250ebe13428423fac79020bf476321b950))
+
+
+### Bug Fixes
+
+* bump qwen-asr dependency version for cli ([efec6b1](https://github.com/ming030890/QwenASR/commit/efec6b14dfb07934c7e6cbb459d26573dcfe5912))
+* clean up the code ([346d112](https://github.com/ming030890/QwenASR/commit/346d112595c0d93f58c54339a7f32ca6e1e648d8))
+* publish 0.2.3 with tag-driven flow ([3637ec8](https://github.com/ming030890/QwenASR/commit/3637ec80f5519ecbd0a034f6c1f23f78156cd0fe))
+* publish 0.2.3 with tag-driven flow ([e7bbd18](https://github.com/ming030890/QwenASR/commit/e7bbd18dc009c3bd87f32e2346c196f65c618b19))
+* **qwen-asr-cli:** add homepage metadata to trigger release ([642c6a2](https://github.com/ming030890/QwenASR/commit/642c6a2dbdcd01c4351d6a56dfdf2c6b99fa5488))
+* **qwen-asr-cli:** update qwen-asr dependency to v0.4.2 ([d9915ea](https://github.com/ming030890/QwenASR/commit/d9915ea8eba41f3a7a129d0ea5c6cea939a33c6d))
+* **qwen-asr-cli:** use workspace dependency to keep qwen-asr version in sync ([5ac7e01](https://github.com/ming030890/QwenASR/commit/5ac7e01bdaf95b3026eec7a12f04e9f5d78d0f3b))
+* release flow for cli ([8dfc4b7](https://github.com/ming030890/QwenASR/commit/8dfc4b7820ceef98efd992974ab3a0b7fcdd9b10))
+* trigger patch release 0.2.1 for flutter ([b5785f9](https://github.com/ming030890/QwenASR/commit/b5785f9e0a6e4cab3a4796bbd1bd401876ea5926))
+* update the release flow to support PAT ([2b9be6c](https://github.com/ming030890/QwenASR/commit/2b9be6c21b7e74e51bf1d1f15e6959679db70542))
+
+
+### Performance Improvements
+
+* **asr:** reusable activation scratch buffer, thread count tuning, and logit probing ([97348a4](https://github.com/ming030890/QwenASR/commit/97348a40680fd6dbee1d71a2aac48b6f0fd7209e))
+
 ## [0.7.0](https://github.com/huanglizhuo/QwenASR/compare/qwen-asr-cli-v0.6.0...qwen-asr-cli-v0.7.0) (2026-05-10)
 
 
