@@ -717,5 +717,11 @@
     "trial_id": "dictionary22-lr0.001-new0.75-e60",
     "teacher_action_labels": true,
     "teacher_touch_conditioned": true
+  },
+  "dictionary": {
+    "source": "SCOWL revision 2020.12.07 size 70 + local connectives",
+    "filtered_sorted_sha256": "84d3368de928b6f03f7cafb030ebcee14b04a65b88ffe82563e33dfa93abcd73",
+    "notice_sha256": "168b4c01cb841f766a72f310b065c04d09cff46376c37a81d799593ce751c371",
+    "words": 108399
   }
 }
