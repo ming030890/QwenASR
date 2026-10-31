@@ -396,11 +396,14 @@ impl CnnLanguageModel {
             if word==&input {
                 known=true;
                 literal_ids=ids.clone();
-                let has_canonical_casing = ids.iter().any(|&id| {
+                // Preserve the calibrated lexical neighborhood. Exact-spelling
+                // case variants (including internal capitals) are resolved from
+                // literal_ids after the lexical decision, not pruned here.
+                let has_initial_case_variant = ids.iter().any(|&id| {
                     let t = &self.weights.tokens[id];
                     t != &input && (t.chars().next().is_some_and(|c| c.is_ascii_uppercase()) || t == "I")
                 });
-                if !has_canonical_casing {
+                if !has_initial_case_variant {
                     continue;
                 }
             }
@@ -619,8 +622,70 @@ impl CnnLanguageModel {
                     edits:crate::cnn_spelling::distance(input.as_bytes(),word.as_bytes(),4).unwrap_or(4),completed_chars:0});
             }
         }
-        let correction = restored.or(channel).or(correction);
+        // Resolve surfaces after lexical acceptance: changing case before that
+        // step changes dictionary/edit features and can alter spelling decisions.
+        // Use the model's winning token for every retained lexical spelling,
+        // including exact known words omitted from the spelling neighborhood.
+        let sentence_start = left.trim().is_empty() || is_sentence_start ||
+            left.trim_end_matches([' ', '\t']).ends_with('\n');
+        let surface = |word: &str| {
+            let mut result = crate::cnn_spelling::canonical(word)
+                .and_then(|key| self.weights.spellings.binary_search_by(|(w, _)| w.cmp(&key)).ok())
+                .and_then(|index| self.weights.spellings[index].1.iter().copied()
+                    .max_by(|&a, &b| logp[a].total_cmp(&logp[b]).then(b.cmp(&a))))
+                .map(|id| {
+                    let token = &self.weights.tokens[id];
+                    // One-letter spellings can use byte fallback IDs. Their
+                    // vocabulary labels are metadata, never candidate text.
+                    token.strip_prefix("[byte:").and_then(|s| s.strip_suffix(']'))
+                        .and_then(|s| u8::from_str_radix(s, 16).ok())
+                        .filter(u8::is_ascii_alphabetic)
+                        .map(|byte| char::from(byte).to_string())
+                        .unwrap_or_else(|| token.clone())
+                })
+                .unwrap_or_else(|| word.to_owned());
+            // Preserve learned internal capitals at sentence starts. Explicit
+            // initial Shift still owns the first letter, as before.
+            let internal_capitals = result.chars().skip(1).any(|c| c.is_ascii_uppercase());
+            if (cap1 || (sentence_start && !internal_capitals)) &&
+                result.as_bytes().first().is_some_and(u8::is_ascii_lowercase) {
+                result[..1].make_ascii_uppercase();
+            }
+            result
+        };
+        let mut correction = restored.or(channel).or(correction).map(|word| surface(&word));
+        // Restore an exact word's case automatically only when its model
+        // score is at least as strong as the best edit-penalized alternative.
+        // Otherwise a typo that happens to match an unlikely acronym could
+        // change the context and spoil a later spelling correction.
+        let literal_is_competitive = literal_score.is_some_and(|score|
+            ranked.first().is_none_or(|best| score >= best.score));
+        // Existing user capitalization supplies a case cue without choosing a
+        // different spelling (a stronger completion must not expand the word).
+        if correction.is_none() && known && (cap1 || literal_is_competitive) {
+            let cased = surface(&input);
+            if cased != original && cased.eq_ignore_ascii_case(&original) {
+                correction = Some(cased);
+            }
+        }
+        // Sentence-start capitalization is independent of uncertain model case.
+        // Retain the literal spelling rather than promoting a weak acronym.
+        if correction.is_none() && known && sentence_start &&
+            original.as_bytes().first().is_some_and(u8::is_ascii_lowercase) &&
+            !original.chars().skip(1).any(|c| c.is_ascii_uppercase()) {
+            let mut cased = original.clone();
+            cased[..1].make_ascii_uppercase();
+            correction = Some(cased);
+        }
         ranked.truncate(limit);
+        for row in &mut ranked { row.word = surface(&row.word); }
+        if let Some(word) = &correction {
+            if !ranked.iter().any(|r| &r.word == word) {
+                ranked.insert(0, EnglishSuggestion { word: word.clone(),
+                    score: literal_score.unwrap_or(0.), edits: 0, completed_chars: 0 });
+                ranked.truncate(limit);
+            }
+        }
         Ok(EnglishSuggestions {candidates:ranked,correction,known,literal_score,apostrophe_evidence})
     }
     fn suggest(&mut self,left:&str,prefix:&str,limit:usize,english_only:bool)->Result<Vec<crate::TokenPrediction>,String> {
