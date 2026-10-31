@@ -6,6 +6,7 @@ pub mod counts;
 pub mod cnn;
 mod cnn_spelling;
 mod spelling_index;
+mod english_channel;
 pub mod touch;
 pub mod hwr;
 pub mod hybrid;

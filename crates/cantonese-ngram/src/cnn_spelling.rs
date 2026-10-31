@@ -84,9 +84,11 @@ pub fn accept(
         let mut a_adj = 0.0;
         let mut a_non_adj = 0.0;
         for (&a, &b) in typed_b.iter().zip(word_b.iter()) {
-            if a != b {
+            let al = a.to_ascii_lowercase();
+            let bl = b.to_ascii_lowercase();
+            if al != bl {
                 diff_count += 1;
-                if qwerty_adjacent(a, b) {
+                if qwerty_adjacent(al, bl) {
                     a_adj += 1.0;
                 } else {
                     a_non_adj += 1.0;
@@ -216,6 +218,8 @@ pub fn distance(input: &[u8], word: &[u8], radius: usize) -> Option<u8> {
 }
 
 pub fn qwerty_adjacent(a: u8, b: u8) -> bool {
+    let a = a.to_ascii_lowercase();
+    let b = b.to_ascii_lowercase();
     if a == b { return false; }
     if a == b' ' { return matches!(b, b'c' | b'v' | b'b' | b'n' | b'm'); }
     if b == b' ' { return matches!(a, b'c' | b'v' | b'b' | b'n' | b'm'); }

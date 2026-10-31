@@ -46,6 +46,7 @@ pub struct EnglishSuggestions {
 /// Eligible spellings and split forms, enumerated without inference.
 pub struct EnglishCandidatePool {
     input: String,
+    original: String,
     pool: Vec<(String, Vec<usize>, u8, usize)>,
     known: bool,
     literal_ids: Vec<usize>,
@@ -57,6 +58,7 @@ struct Weights {
     raw: Box<[u8]>, tokens: Vec<String>, ids: HashMap<String,usize>, english: Regex,
     spellings: Vec<(String, Vec<usize>)>, spelling_index: crate::spelling_index::SpellingIndex, words: HashSet<usize>, embedding: usize, ffn: usize, dilations: Vec<usize>,
     tensors: HashMap<String,Tensor>,
+    channel: crate::english_channel::Decoder,
 }
 static SHARED: OnceLock<Mutex<Weak<Weights>>> = OnceLock::new();
 
@@ -144,11 +146,16 @@ impl CnnLanguageModel {
                 spellings.entry(word).or_default().push(id);
             }
         }
+        if let Some(&id) = ids.get("[byte:61]") { spellings.entry("a".into()).or_default().push(id); }
+        if let Some(&id) = ids.get("[byte:41]") { spellings.entry("a".into()).or_default().push(id); }
+        if let Some(&id) = ids.get("[byte:69]") { spellings.entry("i".into()).or_default().push(id); }
+        if let Some(&id) = ids.get("[byte:49]") { spellings.entry("i".into()).or_default().push(id); }
         let spellings: Vec<_> = spellings.into_iter().collect();
         let spelling_index = crate::spelling_index::SpellingIndex::new(spellings.iter().map(|(w,_)|w.as_str()));
+        let channel = crate::english_channel::Decoder::new(&spellings, &meta.english_word_ids);
         Ok(Weights {raw:bytes.into(),tokens:meta.tokens,ids,spellings,spelling_index,words:meta.english_word_ids.into_iter().collect(),
             english:Regex::new(r"^[A-Za-z0-9]+(?:['’\-][A-Za-z0-9]+)*").unwrap(),
-            embedding:meta.embed_dim,ffn:meta.ffn_dim,dilations:meta.dilations,tensors})
+            embedding:meta.embed_dim,ffn:meta.ffn_dim,dilations:meta.dilations,tensors,channel})
     }
     pub fn token(&self,id:usize)->Option<&str>{self.weights.tokens.get(id).map(String::as_str)}
     pub fn token_id(&self,text:&str)->Option<usize>{self.weights.ids.get(text).copied()}
@@ -391,7 +398,7 @@ impl CnnLanguageModel {
                 literal_ids=ids.clone();
                 let has_canonical_casing = ids.iter().any(|&id| {
                     let t = &self.weights.tokens[id];
-                    t != &input && ((t.len() > 1 && t[1..].chars().any(|c| c.is_ascii_uppercase())) || t == "I")
+                    t != &input && (t.chars().next().is_some_and(|c| c.is_ascii_uppercase()) || t == "I")
                 });
                 if !has_canonical_casing {
                     continue;
@@ -401,55 +408,46 @@ impl CnnLanguageModel {
             pool.push((word.clone(),ids.clone(),edits,if completion {word.len()-input.len()}else{0}));
         }
         let mut merge_splits = Vec::new();
-        if !known && input.len() >= 4 {
-            let valid_len = |w: &str| w.len() >= 2 || matches!(w, "a" | "i");
+        if !known && input.len() >= 3 {
+            let is_short_word = |w: &str| matches!(w, "a" | "i" | "am" | "an" | "as" | "at" | "be" | "by" | "do" | "go" | "he" | "if" | "in" | "is" | "it" | "me" | "my" | "no" | "of" | "on" | "or" | "so" | "to" | "up" | "us" | "we");
             let is_word = |w: &str| -> Option<usize> {
-                if valid_len(w) {
-                    self.weights.spellings.binary_search_by(|(cand, _)| cand.as_str().cmp(w)).ok()
-                } else {
-                    None
-                }
+                self.weights.spellings.binary_search_by(|(cand, _)| cand.as_str().cmp(w)).ok()
             };
+            let is_head_word = |w: &str| matches!(w,
+                "a" | "i" | "am" | "an" | "as" | "at" | "be" | "by" | "do" | "go" |
+                "he" | "if" | "in" | "is" | "it" | "me" | "my" | "no" | "of" | "on" |
+                "or" | "so" | "to" | "up" | "us" | "we" | "the" | "you" | "and" |
+                "for" | "how" | "now" | "not" | "all" | "are" | "can" | "see" |
+                "had" | "has" | "was" | "one" | "who" | "did" | "with" | "this" | "that"
+            );
             // 1. Direct split (omitted space), e.g. yousupport -> you support, alot -> a lot
             for k in 1..input.len() {
                 let w1 = &input[..k];
                 let w2 = &input[k..];
-                if valid_len(w1) && valid_len(w2) {
-                    let o1 = is_word(w1);
-                    let o2 = is_word(w2);
-                    if let (Some(idx1), Some(idx2)) = (o1, o2) {
+                let cap2 = typed.chars().nth(k).is_some_and(|c| c.is_ascii_uppercase());
+                let eligible = cap2 || (w1.len() >= 3 && w2.len() >= 3) || is_head_word(w1);
+                let valid_w1 = w1.len() >= 3 || is_short_word(w1);
+                let valid_w2 = w2.len() >= 3 || (w2.len() == 2 && is_short_word(w2));
+                if eligible && valid_w1 && valid_w2 {
+                    if let (Some(idx1), Some(idx2)) = (is_word(w1), is_word(w2)) {
                         merge_splits.push((idx1, idx2));
-                    } else if let (Some(idx1), None) = (o1, o2) {
-                        for (idx2, _) in self.weights.spelling_index.matches(w2, 1, false)? {
-                            merge_splits.push((idx1, idx2));
-                        }
-                    } else if let (None, Some(idx2)) = (o1, o2) {
-                        for (idx1, _) in self.weights.spelling_index.matches(w1, 1, false)? {
-                            merge_splits.push((idx1, idx2));
-                        }
                     }
                 }
             }
-            // 2. Space-adjacent key mistap (b, n, v, c, m), e.g. youbsupport -> you support, isbfien -> is fine
+            // 2. Space-adjacent key mistap (b, n, v, c, m), e.g. youbsupport -> you support
             if input.len() >= 5 {
                 for k in 1..input.len() - 1 {
                     let ch = input.as_bytes()[k];
                     if matches!(ch, b'b' | b'n' | b'v' | b'c' | b'm') {
                         let w1 = &input[..k];
                         let w2 = &input[k + 1..];
-                        if valid_len(w1) && valid_len(w2) {
-                            let o1 = is_word(w1);
-                            let o2 = is_word(w2);
-                            if let (Some(idx1), Some(idx2)) = (o1, o2) {
+                        let cap2 = typed.chars().nth(k + 1).is_some_and(|c| c.is_ascii_uppercase());
+                        let eligible = cap2 || (w1.len() >= 3 && w2.len() >= 3) || is_head_word(w1);
+                        let valid_w1 = w1.len() >= 3 || is_short_word(w1);
+                        let valid_w2 = w2.len() >= 3 || (w2.len() == 2 && is_short_word(w2));
+                        if eligible && valid_w1 && valid_w2 {
+                            if let (Some(idx1), Some(idx2)) = (is_word(w1), is_word(w2)) {
                                 merge_splits.push((idx1, idx2));
-                            } else if let (Some(idx1), None) = (o1, o2) {
-                                for (idx2, _) in self.weights.spelling_index.matches(w2, 1, false)? {
-                            merge_splits.push((idx1, idx2));
-                        }
-                            } else if let (None, Some(idx2)) = (o1, o2) {
-                                for (idx1, _) in self.weights.spelling_index.matches(w1, 1, false)? {
-                            merge_splits.push((idx1, idx2));
-                        }
                             }
                         }
                     }
@@ -459,12 +457,12 @@ impl CnnLanguageModel {
             merge_splits.dedup();
         }
         let apostrophes = crate::cnn_spelling::apostrophe_forms(&input).collect();
-        Ok(Some(EnglishCandidatePool { input, pool, known, literal_ids, merge_splits, apostrophes }))
+        Ok(Some(EnglishCandidatePool { input, original:typed.to_owned(), pool, known, literal_ids, merge_splits, apostrophes }))
     }
 
     pub fn rank_english_candidates(&mut self, left: &str, pool: Option<EnglishCandidatePool>, limit: usize,
         touch: Option<&crate::touch::TouchScorer>) -> Result<EnglishSuggestions,String> {
-        let Some(EnglishCandidatePool { input, pool, known, literal_ids, merge_splits, apostrophes }) = pool else {
+        let Some(EnglishCandidatePool { input, original, pool, known, literal_ids, merge_splits, apostrophes }) = pool else {
             return Ok(EnglishSuggestions {candidates:vec![],correction:None,known:false,literal_score:None,apostrophe_evidence:vec![]});
         };
         let context=self.context(left);
@@ -472,7 +470,16 @@ impl CnnLanguageModel {
         // Reuse the same distribution as candidate ranking; no extra CNN pass.
         let literal_score=literal_ids.into_iter().map(|id|logp[id]).max_by(f32::total_cmp);
         let input_is_lower = input.bytes().all(|b| b.is_ascii_lowercase());
+        let cap1 = original.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+        let is_sentence_start = {
+            let t = left.trim_end();
+            t.ends_with('.') || t.ends_with('?') || t.ends_with('!') || t.ends_with('\n')
+        };
+        let should_cap = cap1 || (is_sentence_start && !input.is_empty());
         let mut ranked:Vec<_>=pool.into_iter().map(|(word,ids,edits,completed_chars)| {
+            let has_lower_token = ids.iter().any(|&i| {
+                self.weights.tokens[i].chars().next().is_some_and(|c| c.is_ascii_lowercase())
+            });
             let id = ids.into_iter().max_by(|&a,&b| logp[a].total_cmp(&logp[b]).then(b.cmp(&a))).unwrap();
             let penalty = if completed_chars > 0 {
                 // A partial word is not an insertion error. Let the contextual
@@ -482,7 +489,17 @@ impl CnnLanguageModel {
                 crate::cnn_spelling::edit_penalty(input.as_bytes(), word.as_bytes(), edits)
             };
             let token_str = &self.weights.tokens[id];
-            let word_str = if (token_str.len() > 1 && token_str[1..].chars().any(|c| c.is_ascii_uppercase())) || token_str == "I" {
+            let word_str = if should_cap {
+                let mut s = token_str.clone();
+                if let Some(first) = s.chars().next() {
+                    if first.is_ascii_lowercase() {
+                        s[..1].make_ascii_uppercase();
+                    }
+                }
+                s
+            } else if (token_str.len() > 1 && token_str[1..].chars().any(|c| c.is_ascii_uppercase())) || token_str == "I" {
+                token_str.clone()
+            } else if !has_lower_token && token_str.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && !token_str.starts_with('[') && token_str.is_ascii() {
                 token_str.clone()
             } else if input_is_lower {
                 word
@@ -492,24 +509,46 @@ impl CnnLanguageModel {
             EnglishSuggestion {word:word_str, score:logp[id]-penalty,
                 edits,completed_chars}
         }).collect();
-            for (idx1, idx2) in merge_splits {
-                let (w1, ids1) = &self.weights.spellings[idx1];
-                let (w2, ids2) = &self.weights.spellings[idx2];
-                let id1 = ids1.iter().copied().max_by(|&a,&b| logp[a].total_cmp(&logp[b]).then(b.cmp(&a))).unwrap();
-                let id2 = ids2.iter().copied().max_by(|&a,&b| logp[a].total_cmp(&logp[b]).then(b.cmp(&a))).unwrap();
-                let text1 = if input_is_lower { w1.as_str() } else { self.weights.tokens[id1].as_str() };
-                let text2 = if input_is_lower { w2.as_str() } else { self.weights.tokens[id2].as_str() };
-                let combined_word = format!("{text1} {text2}");
-                let edits = crate::cnn_spelling::distance(input.as_bytes(), combined_word.as_bytes(), 3).unwrap_or(2);
-                let penalty = crate::cnn_spelling::edit_penalty(input.as_bytes(), combined_word.as_bytes(), edits);
-                let score = logp[id1] + logp[id2] * 0.5 - penalty;
-                ranked.push(EnglishSuggestion {
-                    word: combined_word,
-                    score,
-                    edits,
-                    completed_chars: 0,
-                });
-            }
+        for (idx1, idx2) in merge_splits {
+            let (w1, ids1) = &self.weights.spellings[idx1];
+            let (w2, ids2) = &self.weights.spellings[idx2];
+            let id1 = ids1.iter().copied().max_by(|&a,&b| logp[a].total_cmp(&logp[b]).then(b.cmp(&a))).unwrap();
+            let id2 = ids2.iter().copied().max_by(|&a,&b| logp[a].total_cmp(&logp[b]).then(b.cmp(&a))).unwrap();
+            let cap2 = original.chars().nth(w1.len()).is_some_and(|c| c.is_ascii_uppercase());
+            let format_tok = |w: &str, token: &str, cap: bool| -> String {
+                if w == "i" {
+                    "I".to_string()
+                } else if !cap {
+                    w.to_string()
+                } else if token.starts_with('[') || !token.is_ascii() {
+                    let mut s = w.to_string();
+                    s[..1].make_ascii_uppercase();
+                    s
+                } else if token.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
+                    let mut s = token.to_string();
+                    s[..1].make_ascii_uppercase();
+                    s
+                } else {
+                    token.to_string()
+                }
+            };
+            let combined_word = format!("{} {}", format_tok(w1, &self.weights.tokens[id1], cap1), format_tok(w2, &self.weights.tokens[id2], cap2));
+            let is_exact = (w1.len() + w2.len() == input.len()) && input.starts_with(w1) && input.ends_with(w2);
+            let combined_raw = format!("{w1} {w2}");
+            let edits = if is_exact { 1 } else { crate::cnn_spelling::distance(input.as_bytes(), combined_raw.as_bytes(), 3).unwrap_or(2) };
+            let score = if is_exact {
+                logp[id1] + logp[id2] * 0.5 - 1.5
+            } else {
+                let pen = crate::cnn_spelling::edit_penalty(input.as_bytes(), combined_raw.as_bytes(), edits);
+                logp[id1] + logp[id2] * 0.5 - pen
+            };
+            ranked.push(EnglishSuggestion {
+                word: combined_word,
+                score,
+                edits,
+                completed_chars: 0,
+            });
+        }
         // Restore punctuation using the same CNN's byte fallback. Word-token and
         // byte-sequence scores have different units, so restoration is calibrated
         // separately on TRAIN instead of treating a byte average as a word score.
@@ -542,10 +581,13 @@ impl CnnLanguageModel {
             // punctuation decision passes, otherwise retain the word decision.
         }
         ranked.sort_by(|a,b|b.score.total_cmp(&a.score).then(a.word.cmp(&b.word)));
-        let correction=ranked.first().filter(|best|
+        let correction=ranked.first().filter(|best| {
+            if cap1 && best.edits >= 2 && !known {
+                return false;
+            }
             crate::cnn_spelling::accept(&input, known, &best.word, best.completed_chars,
-                best.score, best.edits, ranked.get(1).map(|r|(r.score, r.edits, r.completed_chars, r.word.as_str())), literal_score))
-            .map(|best|best.word.clone());
+                best.score, best.edits, ranked.get(1).map(|r|(r.score, r.edits, r.completed_chars, r.word.as_str())), literal_score)
+        }).map(|best|best.word.clone());
         for evidence in &apostrophe_evidence {
             ranked.insert(0, EnglishSuggestion { word: evidence.word.clone(),
                 score: evidence.score, edits: 1, completed_chars: 0 });
@@ -554,7 +596,30 @@ impl CnnLanguageModel {
         if let Some(word) = &restored {
             if let Some(index) = ranked.iter().position(|r| &r.word == word) { ranked[..=index].rotate_right(1); }
         }
-        let correction = restored.or(correction);
+        let case_restoration=correction.as_ref().is_some_and(|w|w.eq_ignore_ascii_case(&original));
+        let channel=if restored.is_none() && !case_restoration && original.replace('’',"'").eq_ignore_ascii_case(&input) {
+            self.weights.channel.correction(left,&input,&logp)?
+        } else {None};
+        let channel = channel.map(|mut w| {
+            if should_cap {
+                if let Some(first) = w.chars().next() {
+                    if first.is_ascii_lowercase() {
+                        w[..1].make_ascii_uppercase();
+                    }
+                }
+            }
+            w
+        });
+        if let Some(word)=&channel {
+            // The Kotlin boundary accepts only corrections present in the visible
+            // candidate list. Keep a new dictionary proposal through truncation.
+            let score=ranked.first().map(|r|r.score).unwrap_or(0.);
+            if let Some(index)=ranked.iter().position(|r|&r.word==word) {ranked[..=index].rotate_right(1);} else {
+                ranked.insert(0,EnglishSuggestion {word:word.clone(),score,
+                    edits:crate::cnn_spelling::distance(input.as_bytes(),word.as_bytes(),4).unwrap_or(4),completed_chars:0});
+            }
+        }
+        let correction = restored.or(channel).or(correction);
         ranked.truncate(limit);
         Ok(EnglishSuggestions {candidates:ranked,correction,known,literal_score,apostrophe_evidence})
     }

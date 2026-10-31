@@ -1,0 +1,9 @@
+{
+  "beta": 1.0,
+  "tau": 1.0,
+  "unknown_floor": 0.001,
+  "prefix_weight": 0.0,
+  "proper_multiplier": 1.0,
+  "mode": "replace",
+  "cutoff": 5.478294541583238
+}
