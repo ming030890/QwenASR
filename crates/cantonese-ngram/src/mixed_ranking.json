@@ -11,7 +11,7 @@
     "cohesion_log_probability",
     "english_key_edit_distance"
   ],
-  "model_sha256": "915bc80d53d225469e8bfe90d328ac1565647181e485cb3f0e9c32f47c946322",
+  "model_sha256": "dc1fa55ec341067cd752e1ee799cbb255e42d4e96eb17dd7a149da7d17f2d8e1",
   "cohort_sha256": "1166a375f244134b06593820c5b7ce6a5469f37c87ecbe09a1a4c6233da9c9db",
   "seed": "mixed-ranking-20261021-v1",
   "fit_rows": 150,

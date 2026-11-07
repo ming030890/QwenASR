@@ -102,21 +102,44 @@ fn finish(engine: &mut QuickEngine, version: u32, code: &str, left: &str, right:
         words.extend(english.candidates.iter().map(|r| case(&r.word)));
     }
     let mut pool = chinese.clone();
-    pool.extend(words);
+    pool.extend(words.clone());
     let mut seen = std::collections::HashSet::new();
     pool.retain(|s| seen.insert(s.clone()));
-    let display = if version == 0 {
+    let display = if version == 0 || code.len() == 2 || !english_enabled {
+        // Complete two-letter codes and Chinese-only requests retain rank_lattice order directly.
         pool
-    } else if code.len() == 2 {
-        // Complete two-letter codes retain all Chinese matches ahead of English.
-        pool
-    } else {
+    } else if chinese.is_empty() {
         let order = crate::quick::rank_mixed(&mut engine.lm, left, right, &pool, code)?;
-        let mut ranked: Vec<_> = order.into_iter().map(|i| pool[i].clone()).collect();
-        for word in &chinese {
-            if seen.insert(word.clone()) {
-                ranked.push(word.clone());
+        order.into_iter().map(|i| pool[i].clone()).collect()
+    } else {
+        let head_len = if code.len() > 2 {
+            chinese.iter().take_while(|s| s.chars().count() > 1).count().clamp(1, 16)
+        } else {
+            chinese.len().min(16)
+        };
+        let mut mixed_pool = chinese[..head_len].to_vec();
+        let mut mixed_seen: std::collections::HashSet<_> = chinese.iter().cloned().collect();
+        for w in words {
+            if mixed_seen.insert(w.clone()) {
+                mixed_pool.push(w);
             }
+        }
+        let order = crate::quick::rank_mixed(&mut engine.lm, left, right, &mixed_pool, code)?;
+        let mut ranked = Vec::with_capacity(pool.len());
+        let mut next_chinese = 0;
+        for i in order {
+            if i < head_len {
+                if next_chinese < chinese.len() {
+                    ranked.push(chinese[next_chinese].clone());
+                    next_chinese += 1;
+                }
+            } else {
+                ranked.push(mixed_pool[i].clone());
+            }
+        }
+        while next_chinese < chinese.len() {
+            ranked.push(chinese[next_chinese].clone());
+            next_chinese += 1;
         }
         ranked
     };
@@ -132,16 +155,7 @@ fn finish(engine: &mut QuickEngine, version: u32, code: &str, left: &str, right:
             }
         })
         .collect::<Vec<_>>();
-    // Composition bookkeeping follows the final Chinese ordering.
-    if code.len() != 2 && version != 0 {
-        let order: std::collections::HashMap<_, _> = display
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.clone(), i))
-            .collect();
-        chinese.sort_by_key(|s| order.get(s).copied().unwrap_or(usize::MAX));
-        chinese.truncate(100);
-    }
+    chinese.truncate(100);
     Ok(JoinedSuggestions {
         chinese,
         display,

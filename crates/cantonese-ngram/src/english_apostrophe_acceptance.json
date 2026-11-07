@@ -23,7 +23,7 @@
     "surface_logp_minus_best_word_edit_score",
     "log1p_surface_count_minus_log1p_bare_count"
   ],
-  "model_sha256": "915bc80d53d225469e8bfe90d328ac1565647181e485cb3f0e9c32f47c946322",
+  "model_sha256": "dc1fa55ec341067cd752e1ee799cbb255e42d4e96eb17dd7a149da7d17f2d8e1",
   "forms_sha256": "610b016b874e823de73b41a1c9fb62705e7af15a463f6e3a5542e3102cdbc9a8",
   "training_rows": 112,
   "calibration_rows": 20,

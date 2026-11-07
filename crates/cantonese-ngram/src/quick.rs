@@ -4,26 +4,27 @@ use std::collections::HashSet;
 
 /// Maximum relative log-probability deficit allowed for a candidate compared to the best
 /// candidate of the same character count before being pruned as very low probability.
-/// 8.0 log points corresponds to relative probability ~ e^-8 ≈ 0.033%.
-const CHAR_COUNT_PRUNE_DELTA: f32 = 8.0;
+const CHAR_COUNT_PRUNE_DELTA: f32 = 11.0;
 
-/// Maximum relative log-probability deficit allowed for any candidate compared to the
-/// global best candidate across all character counts at this position.
-/// 12.0 log points corresponds to relative probability ~ e^-12 ≈ 0.0006%.
-const GLOBAL_PRUNE_DELTA: f32 = 12.0;
+/// Maximum relative log-probability deficit allowed compared to the best overall path
+/// at the same lattice position across all character counts.
+const GLOBAL_PRUNE_DELTA: f32 = 14.0;
 
 /// Prune prior prefixes before expansion if their score is more than this delta behind
-/// the best prefix at the start position. Prevents running expensive LM evaluations on dead beams.
-const PREFIX_PRUNE_DELTA: f32 = 8.0;
+/// the best prefix of the same character count at the start position.
+const PREFIX_PRUNE_DELTA: f32 = 10.0;
 
 /// Minimum step transition score. Tokens with log-probability below this threshold
 /// (such as unsupported byte fallback or sentinel values <= -20.0) are discarded.
-const MIN_STEP_TRANSITION_SCORE: f32 = -15.0;
+const MIN_STEP_TRANSITION_SCORE: f32 = -15.5;
 
 /// Maximum beam caps per character count to bound worst-case memory and branching.
-const MAX_UNIGRAM_BEAM: usize = 20;
-const MAX_PHRASE_BEAM: usize = 12;
+const MAX_UNIGRAM_BEAM: usize = 24;
+const MAX_PHRASE_BEAM: usize = 16;
+const MAX_ONE_RADICAL_BEAM: usize = 4;
+const MAX_TWO_RADICAL_BEAM: usize = 2;
 const MAX_SEGMENT_CANDIDATES: usize = 32;
+const EXTRA_RADICAL_PENALTY: f32 = 1.5;
 
 /// Relative LM evidence for the two input interpretations, not a trained language classifier.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -261,14 +262,6 @@ impl QuickEngine {
                 }]],
             });
         }
-        // One background distribution lets final phrase ranking measure internal
-        // association without another pass for each candidate. Short previews and
-        // single-code ordering keep their existing path.
-        let background = if code.len()>2 && !joined {
-            if let Some(model)=self.lm.neural.as_mut().filter(|m|m.has_byte_fallback()) {
-                let ids=model.context(left,right); Some(model.log_probabilities(&ids)?)
-            } else {None}
-        } else {None};
         let cache = self.cache.as_mut().unwrap();
         let common = cache
             .code
@@ -282,39 +275,45 @@ impl QuickEngine {
         // segmentations remain available for the complete composition.
         for end in cache.positions.len()..=code.len() {
             crate::suggestion_request::check()?;
+            let min_radicals = end & 1;
             let mut paths = Vec::new();
             for &(start, index) in &lattice.transitions[end] {
                 let source = lattice.dictionary.codes[index].as_slice();
-                // ARM mobile optimization: dictionary candidates are ordered by frequency.
-                let source_slice = if !joined && source.len() > MAX_SEGMENT_CANDIDATES { &source[..MAX_SEGMENT_CANDIDATES] } else { source };
                 let best_prefix_score = cache.positions[start].first().map(|p| p.score).unwrap_or(0.0);
+                let expand_cap = if start == 0 {
+                    1
+                } else if start == 2 {
+                    10
+                } else if start & 1 == 0 {
+                    8
+                } else {
+                    4
+                };
                 let prefixes:Vec<_>=cache.positions[start].iter().filter(|prefix|
-                    prefix.characters==0 || prefix.score>=best_prefix_score-PREFIX_PRUNE_DELTA).collect();
+                    prefix.characters==0 || prefix.score>=best_prefix_score-PREFIX_PRUNE_DELTA)
+                    .take(expand_cap).collect();
                 let contexts:Vec<_>=prefixes.iter().map(|p|format!("{left}{}",p.text)).collect();
-                let all_scores=sequence_scores_many(&mut self.lm,&mut self.distribution_cache,&contexts,right,source_slice)?;
+                let all_scores=sequence_scores_many(&mut self.lm,&mut self.distribution_cache,&contexts,right,source)?;
                 for (prefix,scores) in prefixes.into_iter().zip(all_scores) {
                     crate::suggestion_request::check()?;
-                    let mut matching:Vec<_>=(0..source_slice.len()).collect();
-                    if joined {
-                        matching.sort_by(|&a,&b|scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
-                        matching.truncate(MAX_SEGMENT_CANDIDATES);
-                    }
+                    let mut matching:Vec<_>=(0..source.len()).collect();
+                    matching.sort_by(|&a,&b|scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+                    matching.truncate(MAX_SEGMENT_CANDIDATES);
                     for index in matching {
-                        let text=&source_slice[index];let score=scores[index];
+                        let text=&source[index];let score=scores[index];
                         // Skip impossible / unsupported transitions with negligible probability
                         if !score.is_finite() || (prefix.characters > 0 && score < MIN_STEP_TRANSITION_SCORE) {
                             continue;
                         }
-                        let boost = if prefix.characters > 0 && score > -5.0 {
-                            (score + 5.0) * 0.5
-                        } else {
-                            0.0
-                        };
+                        let characters = prefix.characters + 1;
+                        let radicals = (2 * characters).saturating_sub(end);
+                        let extra_radicals = radicals.saturating_sub(min_radicals) as f32;
+                        let joint = prefix.joint + score;
                         paths.push(Phrase {
                             text: format!("{}{text}", prefix.text),
-                            score: prefix.score + score + boost,
-                            joint: prefix.joint + score,
-                            characters: prefix.characters + 1,
+                            score: joint - extra_radicals * EXTRA_RADICAL_PENALTY,
+                            joint,
+                            characters,
                         });
                     }
                 }
@@ -322,8 +321,8 @@ impl QuickEngine {
             paths.sort_by(|a, b| b.score.total_cmp(&a.score));
 
             // Intelligent probability pruning:
-            // 1. Find best score overall and per character-count.
-            let best_score = paths.first().map(|p| p.score).unwrap_or(0.0);
+            // 1. Track best score overall and per character-count at this lattice position
+            let global_best = paths.first().map(|p| p.score).unwrap_or(f32::NEG_INFINITY);
             let mut best_by_chars = vec![f32::NEG_INFINITY; end + 1];
             for p in &paths {
                 if p.score > best_by_chars[p.characters] {
@@ -334,14 +333,23 @@ impl QuickEngine {
             let mut counts = vec![0; end + 1];
             let mut seen = HashSet::new();
             paths.retain(|p| {
-                // Prune beams when they become very low probability:
-                // - worse than best score for this character count by more than CHAR_COUNT_PRUNE_DELTA
-                // - or worse than overall best score by more than GLOBAL_PRUNE_DELTA
+                // Prune paths with negligible relative probability compared to top paths
                 let char_best = best_by_chars[p.characters];
-                if p.score < char_best - CHAR_COUNT_PRUNE_DELTA || p.score < best_score - GLOBAL_PRUNE_DELTA {
+                if p.score < char_best - CHAR_COUNT_PRUNE_DELTA || p.score < global_best - GLOBAL_PRUNE_DELTA {
                     return false;
                 }
-                let cap = if p.characters <= 1 { MAX_UNIGRAM_BEAM } else { MAX_PHRASE_BEAM };
+                let radicals = (2 * p.characters).saturating_sub(end);
+                let cap = if radicals == 0 {
+                    if p.characters <= 1 { MAX_UNIGRAM_BEAM } else { MAX_PHRASE_BEAM }
+                } else if radicals == 1 {
+                    MAX_ONE_RADICAL_BEAM
+                } else if radicals == 2 {
+                    MAX_TWO_RADICAL_BEAM
+                } else if p.characters == end {
+                    1
+                } else {
+                    0
+                };
                 if counts[p.characters] >= cap || !seen.insert(p.text.clone()) {
                     return false;
                 }
@@ -367,18 +375,7 @@ impl QuickEngine {
         } else {
             // This is the generated pool. The joined request ranks it once with English.
             if joined {return Ok(phrases.iter().map(|p|p.text.clone()).collect());}
-            let mut order: Vec<_> = (0..phrases.len()).collect();
-            if let Some(background) = &background {
-                let model = self.lm.neural.as_ref().unwrap();
-                let scores: Vec<_> = phrases.iter().map(|p| {
-                    let independent: Option<Vec<_>> = p.text.chars().map(|c| model.token_id(&c.to_string())
-                        .map(|id|background[id])).collect();
-                    let cohesion = independent.map(|v|p.joint-v.iter().sum::<f32>()).unwrap_or(0.);
-                    mixed_score([p.joint as f64,(p.joint/p.characters as f32) as f64,cohesion as f64,0.])
-                }).collect();
-                order.sort_by(|&a,&b|scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
-            }
-            Ok(order.into_iter().take(100).map(|i|phrases[i].text.clone()).collect())
+            Ok(phrases.iter().take(100).map(|p| p.text.clone()).collect())
         }
     }
 
@@ -458,7 +455,9 @@ fn english_prefix_cost(typed: &str, token: &str) -> Option<f32> {
 /// Key likelihood is exact for generated Quick candidates, and edit distance for
 /// English alternatives. It is evidence for calibration, not a language priority.
 pub fn mixed_features(e: &crate::neural::SequenceEvidence, text: &str, observed: &str) -> [f64; 4] {
-    let cost = if observed.is_empty() || text.chars().any(crate::tokenizer::is_han) { 0. } else {
+    let cost = if observed.is_empty() { 0. } else if text.chars().any(crate::tokenizer::is_han) {
+        observed.len().saturating_sub(2 * e.logical_units) as f64 * 4.0
+    } else {
         let a = observed.to_ascii_lowercase(); let b = text.to_ascii_lowercase();
         let a = a.as_bytes(); let b = b.as_bytes();
         let mut before = vec![0; b.len()+1];

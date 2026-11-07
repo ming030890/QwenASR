@@ -1,6 +1,6 @@
 {
   "schema": "shared-english-acceptance-v4-dictionary-ffn",
-  "model_sha256": "915bc80d53d225469e8bfe90d328ac1565647181e485cb3f0e9c32f47c946322",
+  "model_sha256": "dc1fa55ec341067cd752e1ee799cbb255e42d4e96eb17dd7a149da7d17f2d8e1",
   "architecture": "22-24-1-relu",
   "features": [
     "raw_lm_score",
